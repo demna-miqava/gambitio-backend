@@ -4,6 +4,21 @@ import type { User, UserResponse, CreateUserData } from "../models/User.js";
 export class UserRepository {
   constructor(private fastify: FastifyInstance) {}
 
+  async findById(id: number): Promise<UserResponse | null> {
+    const client = await this.fastify.pg.connect();
+    try {
+      const { rows } = await client.query<UserResponse>(
+        `SELECT id, username, "createdAt", "rapidRating", "blitzRating", "bulletRating",
+                "highestRapidRating", "highestBlitzRating", "highestBulletRating"
+         FROM users WHERE id = $1`,
+        [id]
+      );
+      return rows[0] || null;
+    } finally {
+      client.release();
+    }
+  }
+
   async findByEmail(email: string): Promise<User | null> {
     const client = await this.fastify.pg.connect();
     try {

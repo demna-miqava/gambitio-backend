@@ -3,7 +3,6 @@ import type {
   UserResponse,
   SignupRequest,
   SigninRequest,
-  SigninResponse,
 } from "../models/User.js";
 import { UserRepository } from "../repositories/userRepository.js";
 import bcrypt from "bcrypt";
@@ -14,6 +13,10 @@ export class UserService {
 
   constructor(fastify: FastifyInstance) {
     this.userRepository = new UserRepository(fastify);
+  }
+
+  async getUserById(id: number): Promise<UserResponse | null> {
+    return await this.userRepository.findById(id);
   }
 
   async signup(signupData: SignupRequest): Promise<UserResponse> {
@@ -52,10 +55,11 @@ export class UserService {
       highestBulletRating: rating,
     });
 
+    // Return user data
     return newUser;
   }
 
-  async signin(signinData: SigninRequest): Promise<SigninResponse> {
+  async signin(signinData: SigninRequest): Promise<UserResponse> {
     // Find user by email or username
     const user = await this.userRepository.findByEmailOrUsername(
       signinData.emailOrUsername
@@ -75,21 +79,17 @@ export class UserService {
       throw new Error("Invalid credentials");
     }
 
-    // Return success with user data (excluding password and status)
+    // Return user data (excluding password and status)
     return {
-      success: true,
-      message: "Signin successful",
-      user: {
-        id: user.id,
-        username: user.username,
-        createdAt: user.createdAt,
-        rapidRating: user.rapidRating,
-        blitzRating: user.blitzRating,
-        bulletRating: user.bulletRating,
-        highestRapidRating: user.highestRapidRating,
-        highestBlitzRating: user.highestBlitzRating,
-        highestBulletRating: user.highestBulletRating,
-      },
+      id: user.id,
+      username: user.username,
+      createdAt: user.createdAt,
+      rapidRating: user.rapidRating,
+      blitzRating: user.blitzRating,
+      bulletRating: user.bulletRating,
+      highestRapidRating: user.highestRapidRating,
+      highestBlitzRating: user.highestBlitzRating,
+      highestBulletRating: user.highestBulletRating,
     };
   }
 }

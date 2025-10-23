@@ -2,6 +2,8 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { UserService } from "../services/userService.js";
 import { signupSchema, signinSchema } from "../schemas/userSchemas.js";
 import { ZodError } from "zod";
+import { generateAccessToken, generateRefreshToken, setAuthCookies } from "../utils/jwtHelpers.js";
+import { authMiddleware } from "../middleware/auth.js";
 
 export async function userRoutes(fastify: FastifyInstance) {
   const userService = new UserService(fastify);
@@ -14,11 +16,23 @@ export async function userRoutes(fastify: FastifyInstance) {
         // Validate request body with Zod
         const validatedData = signupSchema.parse(request.body);
         // Create user
-        const newUser = await userService.signup(validatedData);
+        const user = await userService.signup(validatedData);
+
+        // Generate JWT tokens
+        const jwtPayload = {
+          userId: user.id,
+          username: user.username,
+          authMethod: "email" as const,
+        };
+        const accessToken = generateAccessToken(jwtPayload);
+        const refreshToken = generateRefreshToken(jwtPayload);
+
+        // Set tokens as httpOnly cookies
+        setAuthCookies(reply, { accessToken, refreshToken });
 
         return reply.status(201).send({
           message: "User created successfully",
-          user: newUser,
+          user,
         });
       } catch (error) {
         // Handle Zod validation errors
@@ -56,9 +70,24 @@ export async function userRoutes(fastify: FastifyInstance) {
         const validatedData = signinSchema.parse(request.body);
 
         // Authenticate user
-        const result = await userService.signin(validatedData);
+        const user = await userService.signin(validatedData);
 
-        return reply.status(200).send(result);
+        // Generate JWT tokens
+        const jwtPayload = {
+          userId: user.id,
+          username: user.username,
+          authMethod: "email" as const,
+        };
+        const accessToken = generateAccessToken(jwtPayload);
+        const refreshToken = generateRefreshToken(jwtPayload);
+
+        // Set tokens as httpOnly cookies
+        setAuthCookies(reply, { accessToken, refreshToken });
+
+        return reply.status(200).send({
+          message: "Signin successful",
+          user,
+        });
       } catch (error) {
         // Handle Zod validation errors
         if (error instanceof ZodError) {
@@ -75,6 +104,46 @@ export async function userRoutes(fastify: FastifyInstance) {
 
         fastify.log.error(error);
         return reply.status(500).send({ message: "Failed to sign in" });
+      }
+    }
+  );
+
+  // POST /users/logout - Logout user
+  fastify.post("/users/logout", async (_request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      // Clear both cookies
+      reply.clearCookie("accessToken", { path: "/" });
+      reply.clearCookie("refreshToken", { path: "/" });
+
+      return reply.status(200).send({ message: "Logout successful" });
+    } catch (error) {
+      fastify.log.error(error);
+      return reply.status(500).send({ error: "Failed to logout" });
+    }
+  });
+
+  // GET /users/me - Get current authenticated user (protected route example)
+  fastify.get(
+    "/users/me",
+    { preHandler: authMiddleware },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        // request.user is populated by authMiddleware
+        if (!request.user) {
+          return reply.status(401).send({ error: "Not authenticated" });
+        }
+
+        // Fetch full user details
+        const user = await userService.getUserById(request.user.userId);
+
+        if (!user) {
+          return reply.status(404).send({ error: "User not found" });
+        }
+
+        return reply.status(200).send({ user });
+      } catch (error) {
+        fastify.log.error(error);
+        return reply.status(500).send({ error: "Failed to fetch user" });
       }
     }
   );
