@@ -24,7 +24,6 @@ export class MatchmakingHandler {
     time: number,
     increment: number | null
   ): Promise<void> {
-
     // Determine time control and get appropriate rating
     const timeControl = getTimeControl(time);
     const rating =
@@ -160,6 +159,7 @@ export class MatchmakingHandler {
           opponentId: opponentUserId,
           opponentUsername: opponent.username,
           opponentRating: opponent.rating,
+          rating: currentUserRating,
           time,
           increment,
           color: isCurrentUserWhite ? "white" : "black",
@@ -180,7 +180,10 @@ export class MatchmakingHandler {
           color: isCurrentUserWhite ? "black" : "white",
         },
       };
-      wsConnectionManager.sendToUser(opponentUserId, JSON.stringify(opponentMsg));
+      wsConnectionManager.sendToUser(
+        opponentUserId,
+        JSON.stringify(opponentMsg)
+      );
     } finally {
       client.release();
     }

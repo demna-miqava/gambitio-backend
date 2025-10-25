@@ -1,12 +1,54 @@
 import type { FastifyInstance } from "fastify";
-import type { GameResponse, PaginatedGamesResponse } from "../models/Game.js";
+import type {
+  GameResponse,
+  PaginatedGamesResponse,
+  Game,
+} from "../models/Game.js";
 import { GameRepository } from "../repositories/gameRepository.js";
+import { getTimeControl } from "../models/common.js";
 
 export class GameService {
   private gameRepository: GameRepository;
 
   constructor(fastify: FastifyInstance) {
     this.gameRepository = new GameRepository(fastify);
+  }
+
+  /**
+   * Get game by ID
+   */
+  async getGameById(gameId: number): Promise<Game | null> {
+    return await this.gameRepository.findById(gameId);
+  }
+
+  /**
+   * Update game with new move
+   */
+  async updateMove(
+    gameId: number,
+    fen: string,
+    pgn: string,
+    numMoves: number
+  ): Promise<void> {
+    await this.gameRepository.updateMove(gameId, fen, pgn, numMoves);
+  }
+
+  /**
+   * End game
+   */
+  async endGame(
+    gameId: number,
+    winnerId: number | null,
+    status: "finished" | "abandoned" = "finished"
+  ): Promise<void> {
+    await this.gameRepository.endGame(gameId, winnerId, status);
+  }
+
+  /**
+   * Delete game (for abort)
+   */
+  async deleteGame(gameId: number): Promise<void> {
+    await this.gameRepository.deleteById(gameId);
   }
 
   async getGamesByUsername(
@@ -35,6 +77,7 @@ export class GameService {
       numMoves: game.numMoves,
       time: game.time,
       increment: game.increment,
+      type: getTimeControl(game.time),
       status: game.status,
       whitePlayer: {
         id: game.whiteId,
@@ -54,7 +97,7 @@ export class GameService {
     const totalPages = Math.ceil(total / normalizedLimit);
 
     return {
-      games: gameResponses,
+      data: gameResponses,
       pagination: {
         page: normalizedPage,
         limit: normalizedLimit,

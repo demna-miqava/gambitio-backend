@@ -1,4 +1,6 @@
-export type GameStatus = "in_progress" | "completed";
+import type { TimeControl } from "./common.js";
+
+export type GameStatus = "in_progress" | "finished";
 
 export interface Game {
   id: number;
@@ -29,6 +31,7 @@ export interface GameResponse {
   numMoves: number | null;
   time: number;
   increment: number | null;
+  type: TimeControl;
   status: GameStatus;
   whitePlayer: {
     id: number | null;
@@ -45,7 +48,7 @@ export interface GameResponse {
 }
 
 export interface PaginatedGamesResponse {
-  games: GameResponse[];
+  data: GameResponse[];
   pagination: {
     page: number;
     limit: number;
