@@ -10,7 +10,6 @@ import type {
   RematchRequestMessage,
   RematchResponseMessage,
   RematchDeclinedMessage,
-  CancelRematchMessage,
   GameEndedMessage,
   InitialGameStateMessage,
   ErrorMessage,
@@ -85,6 +84,7 @@ export class GameHandler {
         increment: game.increment,
         status: game.status,
         numMoves: game.numMoves,
+        isFinished: game.status === "finished",
       },
     };
 

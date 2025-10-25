@@ -111,6 +111,7 @@ export type InitialGameStateMessage = {
     increment: number | null;
     status: string;
     numMoves: number | null;
+    isFinished: boolean;
   };
 };
 
