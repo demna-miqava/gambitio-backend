@@ -41,7 +41,6 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
     socket.on("message", async (rawMessage: Buffer) => {
       try {
         const message: GameWebSocketMessage = JSON.parse(rawMessage.toString());
-        console.log("MESSAGE", message);
         await gameHandler.handleMessage(message, gameId, userId);
       } catch (error) {
         fastify.log.error({ error }, "Error handling game message");

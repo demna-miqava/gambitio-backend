@@ -7,10 +7,15 @@ import type {
   DrawOfferMessage,
   DrawResponseMessage,
   CheckmateMessage,
+  RematchRequestMessage,
+  RematchResponseMessage,
+  RematchDeclinedMessage,
+  CancelRematchMessage,
   GameEndedMessage,
   InitialGameStateMessage,
   ErrorMessage,
 } from "../models/GameWebSocket.js";
+import type { MatchmakingMessage } from "../models/Matchmaking.js";
 import { wsConnectionManager } from "../utils/wsConnectionManager.js";
 
 // Track draw offers: gameId -> userId who offered
@@ -118,6 +123,15 @@ export class GameHandler {
         break;
       case "stalemate":
         await this.handleStalemate(gameId);
+        break;
+      case "rematch_request":
+        await this.handleRematchRequest(gameId, userId);
+        break;
+      case "rematch_response":
+        await this.handleRematchResponse(message, gameId, userId);
+        break;
+      case "cancel_rematch":
+        await this.handleCancelRematch(gameId, userId);
         break;
     }
   }
@@ -323,6 +337,165 @@ export class GameHandler {
     await this.broadcastToAll(gameId, JSON.stringify(gameEndedMsg));
     // Delete game from database
     await this.gameService.deleteGame(gameId);
+  }
+
+  /**
+   * Handle rematch request
+   */
+  private async handleRematchRequest(
+    gameId: number,
+    userId: number
+  ): Promise<void> {
+    const game = await this.gameService.getGameById(gameId);
+    if (!game) return;
+
+    // Determine opponent
+    const opponentId = userId === game.whiteId ? game.blackId : game.whiteId;
+    if (!opponentId) return;
+
+    // Check if opponent is in another game (has active connection elsewhere)
+    // For now, just send the rematch request to opponent
+    const rematchRequestMsg: RematchRequestMessage = {
+      type: "rematch_request",
+      data: {},
+    };
+    wsConnectionManager.sendToUser(
+      opponentId,
+      JSON.stringify(rematchRequestMsg)
+    );
+  }
+
+  /**
+   * Handle rematch response
+   */
+  private async handleRematchResponse(
+    message: RematchResponseMessage,
+    gameId: number,
+    userId: number
+  ): Promise<void> {
+    const game = await this.gameService.getGameById(gameId);
+    if (!game) return;
+
+    // Determine who sent the original request (the opponent)
+    const requesterId = userId === game.whiteId ? game.blackId : game.whiteId;
+    if (!requesterId) return;
+
+    if (message.data.accepted) {
+      // Create new game with swapped colors
+      const client = await this.fastify.pg.connect();
+      try {
+        // Swap colors for rematch
+        const newWhiteId = game.blackId;
+        const newBlackId = game.whiteId;
+        const newWhiteUsername = game.blackUsername;
+        const newBlackUsername = game.whiteUsername;
+        const newWhiteRating = game.blackRating;
+        const newBlackRating = game.whiteRating;
+        const newWhiteAvatarUrl = game.blackAvatarUrl;
+        const newBlackAvatarUrl = game.whiteAvatarUrl;
+
+        // Create new game
+        const { rows: gameRows } = await client.query(
+          `INSERT INTO games (
+            "whiteId", "blackId", "whiteUsername", "blackUsername",
+            "whiteRating", "blackRating", "whiteAvatarUrl", "blackAvatarUrl",
+            time, increment, status
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'in_progress')
+          RETURNING id`,
+          [
+            newWhiteId,
+            newBlackId,
+            newWhiteUsername,
+            newBlackUsername,
+            newWhiteRating,
+            newBlackRating,
+            newWhiteAvatarUrl,
+            newBlackAvatarUrl,
+            game.time,
+            game.increment,
+          ]
+        );
+        const newGameId = gameRows[0].id;
+
+        // Notify requester with match_found message
+        const requesterColor = newBlackId === requesterId ? "black" : "white";
+        const requesterMsg: MatchmakingMessage = {
+          type: "match_found",
+          data: {
+            gameId: newGameId,
+            opponentId: userId,
+            opponentUsername:
+              requesterColor === "black" ? newWhiteUsername : newBlackUsername,
+            opponentRating:
+              requesterColor === "black" ? newWhiteRating : newBlackRating,
+            rating:
+              requesterColor === "black" ? newBlackRating : newWhiteRating,
+            time: game.time,
+            increment: game.increment,
+            color: requesterColor,
+          },
+        };
+        wsConnectionManager.sendToUser(
+          requesterId,
+          JSON.stringify(requesterMsg)
+        );
+
+        // Notify responder with match_found message
+        const responderColor = newWhiteId === userId ? "white" : "black";
+        const responderMsg: MatchmakingMessage = {
+          type: "match_found",
+          data: {
+            gameId: newGameId,
+            opponentId: requesterId,
+            opponentUsername:
+              responderColor === "white" ? newBlackUsername : newWhiteUsername,
+            opponentRating:
+              responderColor === "white" ? newBlackRating : newWhiteRating,
+            rating:
+              responderColor === "white" ? newWhiteRating : newBlackRating,
+            time: game.time,
+            increment: game.increment,
+            color: responderColor,
+          },
+        };
+        wsConnectionManager.sendToUser(userId, JSON.stringify(responderMsg));
+      } finally {
+        client.release();
+      }
+    } else {
+      // Rematch declined
+      const declinedMsg: RematchDeclinedMessage = {
+        type: "rematch_response",
+        data: {
+          accepted: false,
+        },
+      };
+      wsConnectionManager.sendToUser(requesterId, JSON.stringify(declinedMsg));
+    }
+  }
+
+  /**
+   * Handle cancel rematch
+   */
+  private async handleCancelRematch(
+    gameId: number,
+    userId: number
+  ): Promise<void> {
+    const game = await this.gameService.getGameById(gameId);
+    if (!game) return;
+
+    // Determine opponent
+    const opponentId = userId === game.whiteId ? game.blackId : game.whiteId;
+    if (!opponentId) return;
+
+    // Notify opponent that rematch was canceled
+    const canceledMsg = {
+      type: "rematch_canceled",
+      data: {
+        reason: "opponent_disconnected" as const,
+      },
+    };
+    wsConnectionManager.sendToUser(opponentId, JSON.stringify(canceledMsg));
   }
 
   /**

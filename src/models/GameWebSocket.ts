@@ -44,6 +44,37 @@ export type StalemateMessage = {
   type: "stalemate";
 };
 
+export type RematchRequestMessage = {
+  type: "rematch_request";
+  data: {};
+};
+
+export type RematchResponseMessage = {
+  type: "rematch_response";
+  data: {
+    accepted: boolean;
+  };
+};
+
+export type RematchDeclinedMessage = {
+  type: "rematch_response";
+  data: {
+    accepted: false;
+  };
+};
+
+export type RematchCanceledMessage = {
+  type: "rematch_canceled";
+  data: {
+    reason: "opponent_in_game" | "opponent_disconnected";
+  };
+};
+
+export type CancelRematchMessage = {
+  type: "cancel_rematch";
+  data: {};
+};
+
 export type MoveMessage = {
   type: "move";
   move: {
@@ -97,6 +128,11 @@ export type GameWebSocketMessage =
   | TimeoutMessage
   | CheckmateMessage
   | StalemateMessage
+  | RematchRequestMessage
+  | RematchResponseMessage
+  | RematchDeclinedMessage
+  | RematchCanceledMessage
+  | CancelRematchMessage
   | MoveMessage
   | InitialGameStateMessage
   | ErrorMessage;
