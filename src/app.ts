@@ -7,6 +7,8 @@ import { registerPostgres } from "./plugins/postgres.js";
 import { userRoutes } from "./routes/users.js";
 import { gameRoutes } from "./routes/games.js";
 import { webSocketRoutes } from "./routes/ws/index.js";
+import { friendsRoutes } from "./routes/friends.js";
+import { friendRequestsRoutes } from "./routes/friendRequests.js";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = fastify({
@@ -21,6 +23,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(cors, {
     origin: true,
     credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   });
 
   await app.register(websocket);
@@ -29,6 +32,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(userRoutes, { prefix: "/api" });
   await app.register(gameRoutes, { prefix: "/api" });
   await app.register(webSocketRoutes, { prefix: "/api" });
+  await app.register(friendsRoutes, { prefix: "/api" });
+  await app.register(friendRequestsRoutes, { prefix: "/api" });
 
   return app;
 }

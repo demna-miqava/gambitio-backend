@@ -9,6 +9,7 @@ export interface JWTPayload {
   userId: number;
   username: string;
   authMethod: "email" | "google";
+  avatarUrl?: string | null;
 }
 
 export interface DecodedToken extends JWTPayload {
