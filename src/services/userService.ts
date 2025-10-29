@@ -101,7 +101,7 @@ export class UserService {
 
   async changePassword(
     userId: number,
-    currentPassword: string,
+    oldPassword: string,
     newPassword: string
   ): Promise<void> {
     // Get current password hash
@@ -115,7 +115,7 @@ export class UserService {
 
     // Verify old password
     const isPasswordValid = await bcrypt.compare(
-      currentPassword,
+      oldPassword,
       currentPasswordHash
     );
 
@@ -129,5 +129,17 @@ export class UserService {
 
     // Update password
     await this.userRepository.updatePassword(userId, newPasswordHash);
+  }
+
+  async changeEmail(userId: number, newEmail: string): Promise<void> {
+    // Check if new email already exists
+    const existingUser = await this.userRepository.findByEmail(newEmail);
+
+    if (existingUser && existingUser.id !== userId) {
+      throw new Error("Email already in use");
+    }
+
+    // Update email
+    await this.userRepository.updateEmail(userId, newEmail);
   }
 }

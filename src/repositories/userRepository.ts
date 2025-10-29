@@ -117,4 +117,16 @@ export class UserRepository {
       client.release();
     }
   }
+
+  async updateEmail(userId: number, newEmail: string): Promise<void> {
+    const client = await this.fastify.pg.connect();
+    try {
+      await client.query(
+        `UPDATE users SET email = $1 WHERE id = $2`,
+        [newEmail, userId]
+      );
+    } finally {
+      client.release();
+    }
+  }
 }

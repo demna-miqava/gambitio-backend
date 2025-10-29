@@ -20,8 +20,14 @@ export const signinSchema = z.object({
 export type SigninSchemaType = z.infer<typeof signinSchema>;
 
 export const changePasswordSchema = z.object({
-  currentPassword: z.string().min(1, "Old password is required"),
+  oldPassword: z.string().min(1, "Old password is required"),
   newPassword: z.string().min(8, "New password must be at least 8 characters"),
 });
 
 export type ChangePasswordSchemaType = z.infer<typeof changePasswordSchema>;
+
+export const changeEmailSchema = z.object({
+  newEmail: z.string().email("Invalid email address"),
+});
+
+export type ChangeEmailSchemaType = z.infer<typeof changeEmailSchema>;

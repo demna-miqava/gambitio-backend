@@ -4,6 +4,7 @@ import {
   signupSchema,
   signinSchema,
   changePasswordSchema,
+  changeEmailSchema,
 } from "../schemas/userSchemas.js";
 import { ZodError } from "zod";
 import {
@@ -176,7 +177,7 @@ export async function userRoutes(fastify: FastifyInstance) {
         // Change password
         await userService.changePassword(
           request.user.userId,
-          validatedData.currentPassword,
+          validatedData.oldPassword,
           validatedData.newPassword
         );
 
@@ -208,6 +209,48 @@ export async function userRoutes(fastify: FastifyInstance) {
 
         fastify.log.error(error);
         return reply.status(500).send({ message: "Failed to change password" });
+      }
+    }
+  );
+
+  // PUT /users/change-email - Change user email
+  fastify.put<{ Body: unknown }>(
+    "/users/change-email",
+    { preHandler: authMiddleware },
+    async (request: FastifyRequest<{ Body: unknown }>, reply: FastifyReply) => {
+      try {
+        if (!request.user) {
+          return reply.status(401).send({ error: "Not authenticated" });
+        }
+
+        // Validate request body with Zod
+        const validatedData = changeEmailSchema.parse(request.body);
+
+        // Change email
+        await userService.changeEmail(
+          request.user.userId,
+          validatedData.newEmail
+        );
+
+        return reply
+          .status(200)
+          .send({ message: "Email changed successfully" });
+      } catch (error) {
+        // Handle Zod validation errors
+        if (error instanceof ZodError) {
+          return reply.status(400).send({
+            error: "Validation error",
+            details: error.issues,
+          });
+        }
+
+        // Handle email already in use error
+        if (error instanceof Error && error.message === "Email already in use") {
+          return reply.status(409).send({ message: "Email already in use" });
+        }
+
+        fastify.log.error(error);
+        return reply.status(500).send({ message: "Failed to change email" });
       }
     }
   );
