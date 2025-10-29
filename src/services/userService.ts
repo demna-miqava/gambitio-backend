@@ -5,14 +5,17 @@ import type {
   SigninRequest,
 } from "../models/User.js";
 import { UserRepository } from "../repositories/userRepository.js";
+import { SettingsRepository } from "../repositories/settingsRepository.js";
 import bcrypt from "bcrypt";
 import { getRatingsBySkill } from "../utils/ratingHelpers.js";
 
 export class UserService {
   private userRepository: UserRepository;
+  private settingsRepository: SettingsRepository;
 
   constructor(fastify: FastifyInstance) {
     this.userRepository = new UserRepository(fastify);
+    this.settingsRepository = new SettingsRepository(fastify);
   }
 
   async getUserById(id: number): Promise<UserResponse | null> {
@@ -55,6 +58,9 @@ export class UserService {
       highestBulletRating: rating,
     });
 
+    // Create default settings for the new user
+    await this.settingsRepository.createDefaultSettings(newUser.id);
+
     // Return user data
     return newUser;
   }
@@ -91,5 +97,35 @@ export class UserService {
       highestBlitzRating: user.highestBlitzRating,
       highestBulletRating: user.highestBulletRating,
     };
+  }
+
+  async changePassword(
+    userId: number,
+    oldPassword: string,
+    newPassword: string
+  ): Promise<void> {
+    // Get current password hash
+    const currentPasswordHash = await this.userRepository.getPasswordHash(userId);
+
+    if (!currentPasswordHash) {
+      throw new Error("User not found");
+    }
+
+    // Verify old password
+    const isPasswordValid = await bcrypt.compare(
+      oldPassword,
+      currentPasswordHash
+    );
+
+    if (!isPasswordValid) {
+      throw new Error("Invalid old password");
+    }
+
+    // Hash new password
+    const salt = await bcrypt.genSalt(10);
+    const newPasswordHash = await bcrypt.hash(newPassword, salt);
+
+    // Update password
+    await this.userRepository.updatePassword(userId, newPasswordHash);
   }
 }

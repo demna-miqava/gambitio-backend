@@ -1,8 +1,16 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { UserService } from "../services/userService.js";
-import { signupSchema, signinSchema } from "../schemas/userSchemas.js";
+import {
+  signupSchema,
+  signinSchema,
+  changePasswordSchema,
+} from "../schemas/userSchemas.js";
 import { ZodError } from "zod";
-import { generateAccessToken, generateRefreshToken, setAuthCookies } from "../utils/jwtHelpers.js";
+import {
+  generateAccessToken,
+  generateRefreshToken,
+  setAuthCookies,
+} from "../utils/jwtHelpers.js";
 import { authMiddleware } from "../middleware/auth.js";
 
 export async function userRoutes(fastify: FastifyInstance) {
@@ -35,6 +43,7 @@ export async function userRoutes(fastify: FastifyInstance) {
           user,
         });
       } catch (error) {
+        console.log("error", error);
         // Handle Zod validation errors
         if (error instanceof ZodError) {
           return reply.status(400).send({
@@ -109,18 +118,21 @@ export async function userRoutes(fastify: FastifyInstance) {
   );
 
   // POST /users/logout - Logout user
-  fastify.post("/users/logout", async (_request: FastifyRequest, reply: FastifyReply) => {
-    try {
-      // Clear both cookies
-      reply.clearCookie("accessToken", { path: "/" });
-      reply.clearCookie("refreshToken", { path: "/" });
+  fastify.post(
+    "/users/logout",
+    async (_request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        // Clear both cookies
+        reply.clearCookie("accessToken", { path: "/" });
+        reply.clearCookie("refreshToken", { path: "/" });
 
-      return reply.status(200).send({ message: "Logout successful" });
-    } catch (error) {
-      fastify.log.error(error);
-      return reply.status(500).send({ error: "Failed to logout" });
+        return reply.status(200).send({ message: "Logout successful" });
+      } catch (error) {
+        fastify.log.error(error);
+        return reply.status(500).send({ error: "Failed to logout" });
+      }
     }
-  });
+  );
 
   // GET /users/me - Get current authenticated user (protected route example)
   fastify.get(
@@ -144,6 +156,57 @@ export async function userRoutes(fastify: FastifyInstance) {
       } catch (error) {
         fastify.log.error(error);
         return reply.status(500).send({ error: "Failed to fetch user" });
+      }
+    }
+  );
+
+  // PATCH /users/password - Change user password
+  fastify.patch<{ Body: unknown }>(
+    "/users/password",
+    { preHandler: authMiddleware },
+    async (request: FastifyRequest<{ Body: unknown }>, reply: FastifyReply) => {
+      try {
+        if (!request.user) {
+          return reply.status(401).send({ error: "Not authenticated" });
+        }
+
+        // Validate request body with Zod
+        const validatedData = changePasswordSchema.parse(request.body);
+
+        // Change password
+        await userService.changePassword(
+          request.user.userId,
+          validatedData.oldPassword,
+          validatedData.newPassword
+        );
+
+        return reply
+          .status(200)
+          .send({ message: "Password changed successfully" });
+      } catch (error) {
+        // Handle Zod validation errors
+        if (error instanceof ZodError) {
+          return reply.status(400).send({
+            error: "Validation error",
+            details: error.issues,
+          });
+        }
+
+        // Handle invalid old password error
+        if (
+          error instanceof Error &&
+          error.message === "Invalid old password"
+        ) {
+          return reply.status(400).send({ error: "Invalid old password" });
+        }
+
+        // Handle user not found error
+        if (error instanceof Error && error.message === "User not found") {
+          return reply.status(404).send({ error: "User not found" });
+        }
+
+        fastify.log.error(error);
+        return reply.status(500).send({ error: "Failed to change password" });
       }
     }
   );

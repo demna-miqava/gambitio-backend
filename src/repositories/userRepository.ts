@@ -92,4 +92,29 @@ export class UserRepository {
       client.release();
     }
   }
+
+  async updatePassword(userId: number, newPasswordHash: string): Promise<void> {
+    const client = await this.fastify.pg.connect();
+    try {
+      await client.query(
+        `UPDATE users SET password = $1 WHERE id = $2`,
+        [newPasswordHash, userId]
+      );
+    } finally {
+      client.release();
+    }
+  }
+
+  async getPasswordHash(userId: number): Promise<string | null> {
+    const client = await this.fastify.pg.connect();
+    try {
+      const { rows } = await client.query<{ password: string }>(
+        `SELECT password FROM users WHERE id = $1`,
+        [userId]
+      );
+      return rows[0]?.password || null;
+    } finally {
+      client.release();
+    }
+  }
 }

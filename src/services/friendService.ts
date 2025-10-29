@@ -63,31 +63,26 @@ export class FriendService {
     searchQuery?: string
   ): Promise<PaginatedFriendsResponse> {
     const offset = (page - 1) * limit;
-    console.log("searchQuery", searchQuery);
-    try {
-      const { suggestions: friends, total } =
-        await this.friendRepository.getFriends(
-          userId,
-          limit,
-          offset,
-          searchQuery
-        );
-
-      const totalPages = Math.ceil(total / limit);
-
-      return {
-        data: friends,
-        pagination: {
-          page,
-          limit,
-          total,
-          totalPages,
-        },
-      };
-    } catch (err) {
-      console.log("error", err);
-    }
     // Return user's friends list
+    const { suggestions: friends, total } =
+      await this.friendRepository.getFriends(
+        userId,
+        limit,
+        offset,
+        searchQuery
+      );
+
+    const totalPages = Math.ceil(total / limit);
+
+    return {
+      data: friends,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages,
+      },
+    };
   }
 
   /**
