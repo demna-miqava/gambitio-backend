@@ -161,8 +161,8 @@ export async function userRoutes(fastify: FastifyInstance) {
   );
 
   // PATCH /users/password - Change user password
-  fastify.patch<{ Body: unknown }>(
-    "/users/password",
+  fastify.put<{ Body: unknown }>(
+    "/users/change-password",
     { preHandler: authMiddleware },
     async (request: FastifyRequest<{ Body: unknown }>, reply: FastifyReply) => {
       try {
@@ -172,11 +172,11 @@ export async function userRoutes(fastify: FastifyInstance) {
 
         // Validate request body with Zod
         const validatedData = changePasswordSchema.parse(request.body);
-
+        console.log("validatedData", validatedData);
         // Change password
         await userService.changePassword(
           request.user.userId,
-          validatedData.oldPassword,
+          validatedData.currentPassword,
           validatedData.newPassword
         );
 
@@ -184,6 +184,7 @@ export async function userRoutes(fastify: FastifyInstance) {
           .status(200)
           .send({ message: "Password changed successfully" });
       } catch (error) {
+        console.log("ERROR", error);
         // Handle Zod validation errors
         if (error instanceof ZodError) {
           return reply.status(400).send({
@@ -197,16 +198,16 @@ export async function userRoutes(fastify: FastifyInstance) {
           error instanceof Error &&
           error.message === "Invalid old password"
         ) {
-          return reply.status(400).send({ error: "Invalid old password" });
+          return reply.status(400).send({ message: "Invalid old password" });
         }
 
         // Handle user not found error
         if (error instanceof Error && error.message === "User not found") {
-          return reply.status(404).send({ error: "User not found" });
+          return reply.status(404).send({ message: "User not found" });
         }
 
         fastify.log.error(error);
-        return reply.status(500).send({ error: "Failed to change password" });
+        return reply.status(500).send({ message: "Failed to change password" });
       }
     }
   );

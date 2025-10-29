@@ -101,11 +101,13 @@ export class UserService {
 
   async changePassword(
     userId: number,
-    oldPassword: string,
+    currentPassword: string,
     newPassword: string
   ): Promise<void> {
     // Get current password hash
-    const currentPasswordHash = await this.userRepository.getPasswordHash(userId);
+    const currentPasswordHash = await this.userRepository.getPasswordHash(
+      userId
+    );
 
     if (!currentPasswordHash) {
       throw new Error("User not found");
@@ -113,7 +115,7 @@ export class UserService {
 
     // Verify old password
     const isPasswordValid = await bcrypt.compare(
-      oldPassword,
+      currentPassword,
       currentPasswordHash
     );
 

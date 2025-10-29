@@ -20,7 +20,7 @@ export const signinSchema = z.object({
 export type SigninSchemaType = z.infer<typeof signinSchema>;
 
 export const changePasswordSchema = z.object({
-  oldPassword: z.string().min(1, "Old password is required"),
+  currentPassword: z.string().min(1, "Old password is required"),
   newPassword: z.string().min(8, "New password must be at least 8 characters"),
 });
 
