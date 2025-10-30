@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { authenticateWebSocket } from "../../middleware/wsAuth.js";
 import { GameHandler } from "../../handlers/gameHandler.js";
-import { wsConnectionManager } from "../../utils/wsConnectionManager.js";
+import { gameConnectionManager } from "../../utils/wsConnectionManager.js";
 import type { GameWebSocketMessage } from "../../models/GameWebSocket.js";
 
 export async function gameWebSocketRoute(fastify: FastifyInstance) {
@@ -32,7 +32,7 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
     }
 
     // Register connection
-    wsConnectionManager.addConnection(userId, socket);
+    gameConnectionManager.addConnection(userId, socket);
 
     // Send initial game state
     await gameHandler.sendInitialGameState(socket, gameId);
@@ -55,7 +55,7 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
     // Handle disconnect
     socket.on("close", async () => {
       try {
-        wsConnectionManager.removeConnection(userId);
+        gameConnectionManager.removeConnection(userId);
       } catch (error) {
         fastify.log.error({ error }, "Error handling disconnect");
       }

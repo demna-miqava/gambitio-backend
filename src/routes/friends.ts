@@ -73,7 +73,6 @@ export async function friendsRoutes(fastify: FastifyInstance) {
           limitNum,
           q
         );
-        console.log("results", results);
 
         return reply.send(results);
       } catch (error) {

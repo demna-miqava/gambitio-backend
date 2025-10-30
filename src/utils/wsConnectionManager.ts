@@ -1,7 +1,8 @@
 import type { WebSocket } from "ws";
 
 /**
- * Manages active WebSocket connections
+ * Base class for managing WebSocket connections
+ * Each WebSocket type (notifications, matchmaking, game) should have its own instance
  */
 class WebSocketConnectionManager {
   private connections: Map<number, WebSocket> = new Map();
@@ -52,5 +53,20 @@ class WebSocketConnectionManager {
   }
 }
 
-// Singleton instance
-export const wsConnectionManager = new WebSocketConnectionManager();
+/**
+ * Notification Connection Manager
+ * Manages long-lived connections for challenges, friend requests, etc.
+ */
+export const notificationConnectionManager = new WebSocketConnectionManager();
+
+/**
+ * Matchmaking Connection Manager
+ * Manages connections during the matchmaking process
+ */
+export const matchmakingConnectionManager = new WebSocketConnectionManager();
+
+/**
+ * Game Connection Manager
+ * Manages connections during active games
+ */
+export const gameConnectionManager = new WebSocketConnectionManager();

@@ -44,7 +44,6 @@ export async function userRoutes(fastify: FastifyInstance) {
           user,
         });
       } catch (error) {
-        console.log("error", error);
         // Handle Zod validation errors
         if (error instanceof ZodError) {
           return reply.status(400).send({
@@ -173,7 +172,6 @@ export async function userRoutes(fastify: FastifyInstance) {
 
         // Validate request body with Zod
         const validatedData = changePasswordSchema.parse(request.body);
-        console.log("validatedData", validatedData);
         // Change password
         await userService.changePassword(
           request.user.userId,
@@ -185,7 +183,6 @@ export async function userRoutes(fastify: FastifyInstance) {
           .status(200)
           .send({ message: "Password changed successfully" });
       } catch (error) {
-        console.log("ERROR", error);
         // Handle Zod validation errors
         if (error instanceof ZodError) {
           return reply.status(400).send({
@@ -245,7 +242,10 @@ export async function userRoutes(fastify: FastifyInstance) {
         }
 
         // Handle email already in use error
-        if (error instanceof Error && error.message === "Email already in use") {
+        if (
+          error instanceof Error &&
+          error.message === "Email already in use"
+        ) {
           return reply.status(409).send({ message: "Email already in use" });
         }
 

@@ -15,7 +15,7 @@ import type {
   ErrorMessage,
 } from "../models/GameWebSocket.js";
 import type { MatchmakingMessage } from "../models/Matchmaking.js";
-import { wsConnectionManager } from "../utils/wsConnectionManager.js";
+import { gameConnectionManager } from "../utils/wsConnectionManager.js";
 
 // Track draw offers: gameId -> userId who offered
 const pendingDrawOffers = new Map<number, number>();
@@ -41,7 +41,7 @@ export class GameHandler {
     const opponentId =
       currentUserId === game.whiteId ? game.blackId : game.whiteId;
     if (opponentId) {
-      wsConnectionManager.sendToUser(opponentId, message);
+      gameConnectionManager.sendToUser(opponentId, message);
     }
   }
 
@@ -219,7 +219,7 @@ export class GameHandler {
         accepted: false,
         userId,
       };
-      wsConnectionManager.sendToUser(offererId, JSON.stringify(responseMsg));
+      gameConnectionManager.sendToUser(offererId, JSON.stringify(responseMsg));
     }
   }
 
@@ -359,7 +359,7 @@ export class GameHandler {
       type: "rematch_request",
       data: {},
     };
-    wsConnectionManager.sendToUser(
+    gameConnectionManager.sendToUser(
       opponentId,
       JSON.stringify(rematchRequestMsg)
     );
@@ -435,7 +435,7 @@ export class GameHandler {
             color: requesterColor,
           },
         };
-        wsConnectionManager.sendToUser(
+        gameConnectionManager.sendToUser(
           requesterId,
           JSON.stringify(requesterMsg)
         );
@@ -458,7 +458,7 @@ export class GameHandler {
             color: responderColor,
           },
         };
-        wsConnectionManager.sendToUser(userId, JSON.stringify(responderMsg));
+        gameConnectionManager.sendToUser(userId, JSON.stringify(responderMsg));
       } finally {
         client.release();
       }
@@ -470,7 +470,7 @@ export class GameHandler {
           accepted: false,
         },
       };
-      wsConnectionManager.sendToUser(requesterId, JSON.stringify(declinedMsg));
+      gameConnectionManager.sendToUser(requesterId, JSON.stringify(declinedMsg));
     }
   }
 
@@ -495,7 +495,7 @@ export class GameHandler {
         reason: "opponent_disconnected" as const,
       },
     };
-    wsConnectionManager.sendToUser(opponentId, JSON.stringify(canceledMsg));
+    gameConnectionManager.sendToUser(opponentId, JSON.stringify(canceledMsg));
   }
 
   /**
@@ -506,10 +506,10 @@ export class GameHandler {
     if (!game) return;
 
     if (game.whiteId) {
-      wsConnectionManager.sendToUser(game.whiteId, message);
+      gameConnectionManager.sendToUser(game.whiteId, message);
     }
     if (game.blackId) {
-      wsConnectionManager.sendToUser(game.blackId, message);
+      gameConnectionManager.sendToUser(game.blackId, message);
     }
   }
 }

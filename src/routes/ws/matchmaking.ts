@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { authenticateWebSocket } from "../../middleware/wsAuth.js";
 import { MatchmakingHandler } from "../../handlers/matchmakingHandler.js";
-import { wsConnectionManager } from "../../utils/wsConnectionManager.js";
+import { matchmakingConnectionManager } from "../../utils/wsConnectionManager.js";
 import type { MatchmakingMessage } from "../../models/Matchmaking.js";
 
 export async function matchmakingWebSocketRoute(fastify: FastifyInstance) {
@@ -80,7 +80,7 @@ export async function matchmakingWebSocketRoute(fastify: FastifyInstance) {
     }
 
     // Register connection
-    wsConnectionManager.addConnection(userId, socket);
+    matchmakingConnectionManager.addConnection(userId, socket);
 
     // Immediately start matchmaking with the provided time and increment
     try {

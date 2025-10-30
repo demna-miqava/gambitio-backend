@@ -3,7 +3,7 @@ import type { WebSocket } from "ws";
 import { MatchmakingService } from "../services/matchmakingService.js";
 import type { MatchmakingMessage } from "../models/Matchmaking.js";
 import { getTimeControl } from "../models/Matchmaking.js";
-import { wsConnectionManager } from "../utils/wsConnectionManager.js";
+import { matchmakingConnectionManager } from "../utils/wsConnectionManager.js";
 
 export class MatchmakingHandler {
   private matchmakingService: MatchmakingService;
@@ -180,7 +180,7 @@ export class MatchmakingHandler {
           color: isCurrentUserWhite ? "black" : "white",
         },
       };
-      wsConnectionManager.sendToUser(
+      matchmakingConnectionManager.sendToUser(
         opponentUserId,
         JSON.stringify(opponentMsg)
       );
@@ -194,6 +194,6 @@ export class MatchmakingHandler {
    */
   async handleDisconnect(userId: number): Promise<void> {
     await this.matchmakingService.cancelMatchmaking(userId);
-    wsConnectionManager.removeConnection(userId);
+    matchmakingConnectionManager.removeConnection(userId);
   }
 }
