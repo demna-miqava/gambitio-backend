@@ -10,6 +10,7 @@ import { webSocketRoutes } from "./routes/ws/index.js";
 import { friendsRoutes } from "./routes/friends.js";
 import { friendRequestsRoutes } from "./routes/friendRequests.js";
 import { settingsRoutes } from "./routes/settings.js";
+import { challengeRoutes } from "./routes/challenges.js";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = fastify({
@@ -36,6 +37,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(friendsRoutes, { prefix: "/api" });
   await app.register(friendRequestsRoutes, { prefix: "/api" });
   await app.register(settingsRoutes, { prefix: "/api" });
+  await app.register(challengeRoutes, { prefix: "/api" });
 
   return app;
 }

@@ -1,15 +1,18 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { WebSocket } from "ws";
 import { MatchmakingService } from "../services/matchmakingService.js";
+import { ChallengeService } from "../services/challengeService.js";
 import type { MatchmakingMessage } from "../models/Matchmaking.js";
 import { getTimeControl } from "../models/Matchmaking.js";
 import { matchmakingConnectionManager } from "../utils/wsConnectionManager.js";
 
 export class MatchmakingHandler {
   private matchmakingService: MatchmakingService;
+  private challengeService: ChallengeService;
 
   constructor(private fastify: FastifyInstance) {
     this.matchmakingService = new MatchmakingService(fastify);
+    this.challengeService = new ChallengeService(fastify);
   }
 
   /**
@@ -150,6 +153,10 @@ export class MatchmakingHandler {
 
       // Remove matchmaking request
       await this.matchmakingService.deleteMatchmakingRequest(matchmakingId);
+
+      // Delete all challenges for both users (they're starting a game)
+      await this.challengeService.deleteAllUserChallenges(currentUserId);
+      await this.challengeService.deleteAllUserChallenges(opponentUserId);
 
       // Send match found to current user
       const currentUserMsg: MatchmakingMessage = {

@@ -3,6 +3,7 @@ import {
   notificationConnectionManager,
   gameConnectionManager,
 } from "../utils/wsConnectionManager.js";
+import { ChallengeService } from "../services/challengeService.js";
 import type {
   ChallengeSentData,
   ChallengeDeclinedData,
@@ -12,7 +13,11 @@ import type {
 import { getTimeControl } from "../models/Matchmaking.js";
 
 export class ChallengeHandler {
-  constructor(private fastify: FastifyInstance) {}
+  private challengeService: ChallengeService;
+
+  constructor(private fastify: FastifyInstance) {
+    this.challengeService = new ChallengeService(fastify);
+  }
 
   async handleChallengeSent(
     challengerId: number,
@@ -98,11 +103,12 @@ export class ChallengeHandler {
       }
 
       // Step 5: Store challenge in database with resolved color preference
-      await client.query(
+      const { rows: insertedChallenge } = await client.query(
         `INSERT INTO challenges (
           "challengerId", "challengedId", "challengerUsername", "challengedUsername",
           "challengerAvatarUrl", "challengedAvatarUrl", time, increment, "challengerColor"
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING "createdAt"`,
         [
           challengerId,
           challengedId,
@@ -125,6 +131,7 @@ export class ChallengeHandler {
           avatarUrl: challengerAvatarUrl,
           time,
           increment,
+          createdAt: insertedChallenge[0].createdAt.toISOString(),
         },
       };
       notificationConnectionManager.sendToUser(
@@ -172,7 +179,36 @@ export class ChallengeHandler {
 
     const client = await this.fastify.pg.connect();
     try {
-      // Step 1: Get the challenge from database
+      // Step 1: Check if challenger is available (not in game and connected to notifications)
+      const challengerInGame =
+        gameConnectionManager.getConnection(challengerId);
+      const challengerSocket =
+        notificationConnectionManager.getConnection(challengerId);
+      const isChallengerAvailable =
+        (!challengerInGame || challengerInGame.readyState !== 1) &&
+        challengerSocket &&
+        challengerSocket.readyState === 1;
+
+      if (!isChallengerAvailable) {
+        // Challenger is not available (in game or offline)
+        // Delete the challenge from database since it's no longer valid
+        await client.query(
+          `DELETE FROM challenges
+           WHERE "challengerId" = $1 AND "challengedId" = $2`,
+          [challengerId, challengedId]
+        );
+
+        const unavailableMsg: NotificationMessage = {
+          type: "opponent_unavailable",
+        };
+        notificationConnectionManager.sendToUser(
+          challengedId,
+          JSON.stringify(unavailableMsg)
+        );
+        return;
+      }
+
+      // Step 2: Get the challenge from database
       const { rows: challengeRows } = await client.query(
         `SELECT * FROM challenges
          WHERE "challengerId" = $1 AND "challengedId" = $2`,
@@ -203,7 +239,7 @@ export class ChallengeHandler {
         challengedAvatarUrl,
       } = challenge;
 
-      // Step 2: Get both users' ratings from database
+      // Step 3: Get both users' ratings from database
       const { rows: userRows } = await client.query<{
         id: number;
         bulletRating: number;
@@ -230,7 +266,7 @@ export class ChallengeHandler {
         return;
       }
 
-      // Step 3: Determine time control and get appropriate ratings
+      // Step 4: Determine time control and get appropriate ratings
       const timeControl = getTimeControl(time);
       const challengerRating =
         timeControl === "bullet"
@@ -246,8 +282,7 @@ export class ChallengeHandler {
           ? challengedData.blitzRating
           : challengedData.rapidRating;
 
-      // Step 4: Assign colors based on challenge preference from database
-      // Note: challengerColor is already resolved (random was converted to white/black when challenge was created)
+      // Step 5: Assign colors based on challenge preference from database
       const finalChallengerColor: "white" | "black" = challengerColor as
         | "white"
         | "black";
@@ -283,7 +318,7 @@ export class ChallengeHandler {
         blackAvatarUrl = challengerAvatarUrl || "";
       }
 
-      // Step 5: Create game in database
+      // Step 6: Create game in database
       const { rows: gameRows } = await client.query(
         `INSERT INTO games (
           "whiteId", "blackId", "whiteUsername", "blackUsername",
@@ -306,12 +341,11 @@ export class ChallengeHandler {
       );
       const gameId = gameRows[0].id;
 
-      // Step 6: Delete the challenge from database
-      await client.query(`DELETE FROM challenges WHERE id = $1`, [
-        challenge.id,
-      ]);
+      // Step 7: Delete all challenges for both users (they're starting a game)
+      await this.challengeService.deleteAllUserChallenges(challengerId);
+      await this.challengeService.deleteAllUserChallenges(challengedId);
 
-      // Step 7: Send match_created to challenger
+      // Step 8: Send match_created to challenger
       const challengerMsg: NotificationMessage = {
         type: "match_created",
         data: {
@@ -330,7 +364,7 @@ export class ChallengeHandler {
         JSON.stringify(challengerMsg)
       );
 
-      // Step 8: Send match_created to challenged user
+      // Step 9: Send match_created to challenged user
       const challengedMsg: NotificationMessage = {
         type: "match_created",
         data: {

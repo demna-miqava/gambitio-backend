@@ -16,6 +16,7 @@ export interface ChallengeReceivedData {
   avatarUrl: string;
   time: number;
   increment: number;
+  createdAt: string;
 }
 
 export interface ChallengeDeclinedData {
