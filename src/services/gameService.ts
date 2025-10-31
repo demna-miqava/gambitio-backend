@@ -6,11 +6,15 @@ import type {
 } from "../models/Game.js";
 import { GameRepository } from "../repositories/gameRepository.js";
 import { getTimeControl } from "../models/common.js";
+import type { TimeControl } from "../models/common.js";
+import { calculateRatingChanges } from "../utils/ratingHelpers.js";
 
 export class GameService {
   private gameRepository: GameRepository;
+  private fastify: FastifyInstance;
 
   constructor(fastify: FastifyInstance) {
+    this.fastify = fastify;
     this.gameRepository = new GameRepository(fastify);
   }
 
@@ -34,14 +38,49 @@ export class GameService {
   }
 
   /**
-   * End game
+   * End game with rating updates
    */
   async endGame(
     gameId: number,
     winnerId: number | null,
-    status: "finished" | "abandoned" = "finished"
-  ): Promise<void> {
+    status: "finished" | "abandoned" = "finished",
+    result?: "white_win" | "black_win" | "draw" | "aborted"
+  ): Promise<{
+    whiteRatingChange: number;
+    blackRatingChange: number;
+    whiteNewRating: number;
+    blackNewRating: number;
+  } | null> {
+    // Get game info before ending it
+    const game = await this.gameRepository.findById(gameId);
+    if (!game) return null;
+
+    // Calculate rating changes if result is provided
+    let ratingChanges = null;
+    if (result) {
+      ratingChanges = calculateRatingChanges(
+        game.whiteRating,
+        game.blackRating,
+        result
+      );
+
+      // Update ratings in database (only if not aborted)
+      if (result !== "aborted" && game.whiteId && game.blackId) {
+        const timeControl = getTimeControl(game.time);
+        await this.updatePlayerRatings(
+          game.whiteId,
+          game.blackId,
+          timeControl,
+          ratingChanges.whiteNewRating,
+          ratingChanges.blackNewRating
+        );
+      }
+    }
+
+    // End game in database
     await this.gameRepository.endGame(gameId, winnerId, status);
+
+    return ratingChanges;
   }
 
   /**
@@ -49,6 +88,39 @@ export class GameService {
    */
   async deleteGame(gameId: number): Promise<void> {
     await this.gameRepository.deleteById(gameId);
+  }
+
+  /**
+   * Update player ratings in the database
+   */
+  async updatePlayerRatings(
+    whiteId: number,
+    blackId: number,
+    timeControl: TimeControl,
+    whiteNewRating: number,
+    blackNewRating: number
+  ): Promise<void> {
+    const client = await this.fastify.pg.connect();
+    try {
+      const ratingColumn =
+        timeControl === "bullet"
+          ? "bulletRating"
+          : timeControl === "blitz"
+          ? "blitzRating"
+          : "rapidRating";
+
+      await client.query(
+        `UPDATE users SET "${ratingColumn}" = $1 WHERE id = $2`,
+        [whiteNewRating, whiteId]
+      );
+
+      await client.query(
+        `UPDATE users SET "${ratingColumn}" = $1 WHERE id = $2`,
+        [blackNewRating, blackId]
+      );
+    } finally {
+      client.release();
+    }
   }
 
   async getGamesByUsername(

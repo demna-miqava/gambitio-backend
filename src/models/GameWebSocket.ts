@@ -11,7 +11,7 @@ export type DrawResponseMessage = {
 export type GameEndedMessage = {
   type: "game_ended";
   winnerId?: number | null;
-  result: "white_win" | "black_win" | "draw";
+  result: "white_win" | "black_win" | "draw" | "aborted";
   reason:
     | "checkmate"
     | "resignation"
@@ -19,6 +19,12 @@ export type GameEndedMessage = {
     | "stalemate"
     | "timeout"
     | "aborted";
+  ratingChanges?: {
+    whiteRatingChange: number;
+    blackRatingChange: number;
+    whiteNewRating: number;
+    blackNewRating: number;
+  };
 };
 
 export type ResignMessage = {

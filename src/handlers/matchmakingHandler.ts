@@ -182,6 +182,7 @@ export class MatchmakingHandler {
           opponentId: currentUserId,
           opponentUsername: currentUsername,
           opponentRating: currentUserRating,
+          rating: opponent.rating,
           time,
           increment,
           color: isCurrentUserWhite ? "black" : "white",

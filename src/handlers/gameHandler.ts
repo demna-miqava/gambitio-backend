@@ -199,9 +199,14 @@ export class GameHandler {
     if (!offererId) return;
 
     if (message.accepted) {
-      // End game as draw
-      await this.gameService.endGame(gameId, null, "finished");
+      // End game as draw with rating updates
       pendingDrawOffers.delete(gameId);
+      const ratingChanges = await this.gameService.endGame(
+        gameId,
+        null,
+        "finished",
+        "draw"
+      );
 
       // Notify both players
       const gameEndedMsg: GameEndedMessage = {
@@ -209,6 +214,7 @@ export class GameHandler {
         winnerId: null,
         result: "draw",
         reason: "draw_agreement",
+        ...(ratingChanges && { ratingChanges }),
       };
       await this.broadcastToAll(gameId, JSON.stringify(gameEndedMsg));
     } else {
@@ -232,16 +238,23 @@ export class GameHandler {
 
     // Determine winner (opponent of resigner)
     const winnerId = userId === game.whiteId ? game.blackId : game.whiteId;
+    const result = winnerId === game.whiteId ? "white_win" : "black_win";
 
-    // End game
-    await this.gameService.endGame(gameId, winnerId, "finished");
+    // End game with rating updates
+    const ratingChanges = await this.gameService.endGame(
+      gameId,
+      winnerId,
+      "finished",
+      result
+    );
 
     // Notify both players
     const gameEndedMsg: GameEndedMessage = {
       type: "game_ended",
       winnerId,
-      result: winnerId === game.whiteId ? "white_win" : "black_win",
+      result,
       reason: "resignation",
+      ...(ratingChanges && { ratingChanges }),
     };
     await this.broadcastToAll(gameId, JSON.stringify(gameEndedMsg));
   }
@@ -255,16 +268,23 @@ export class GameHandler {
 
     // Determine winner (opponent of player who timed out)
     const winnerId = userId === game.whiteId ? game.blackId : game.whiteId;
+    const result = winnerId === game.whiteId ? "white_win" : "black_win";
 
-    // End game
-    await this.gameService.endGame(gameId, winnerId, "finished");
+    // End game with rating updates
+    const ratingChanges = await this.gameService.endGame(
+      gameId,
+      winnerId,
+      "finished",
+      result
+    );
 
     // Notify both players
     const gameEndedMsg: GameEndedMessage = {
       type: "game_ended",
       winnerId,
-      result: winnerId === game.whiteId ? "white_win" : "black_win",
+      result,
       reason: "timeout",
+      ...(ratingChanges && { ratingChanges }),
     };
     await this.broadcastToAll(gameId, JSON.stringify(gameEndedMsg));
   }
@@ -280,16 +300,23 @@ export class GameHandler {
     if (!game) return;
 
     const winnerId = message.winnerId;
+    const result = winnerId === game.whiteId ? "white_win" : "black_win";
 
-    // End game
-    await this.gameService.endGame(gameId, winnerId, "finished");
+    // End game with rating updates
+    const ratingChanges = await this.gameService.endGame(
+      gameId,
+      winnerId,
+      "finished",
+      result
+    );
 
     // Notify both players
     const gameEndedMsg: GameEndedMessage = {
       type: "game_ended",
       winnerId,
-      result: winnerId === game.whiteId ? "white_win" : "black_win",
+      result,
       reason: "checkmate",
+      ...(ratingChanges && { ratingChanges }),
     };
     await this.broadcastToAll(gameId, JSON.stringify(gameEndedMsg));
   }
@@ -301,8 +328,13 @@ export class GameHandler {
     const game = await this.gameService.getGameById(gameId);
     if (!game) return;
 
-    // End game as draw
-    await this.gameService.endGame(gameId, null, "finished");
+    // End game as draw with rating updates
+    const ratingChanges = await this.gameService.endGame(
+      gameId,
+      null,
+      "finished",
+      "draw"
+    );
 
     // Notify both players
     const gameEndedMsg: GameEndedMessage = {
@@ -310,6 +342,7 @@ export class GameHandler {
       winnerId: null,
       result: "draw",
       reason: "stalemate",
+      ...(ratingChanges && { ratingChanges }),
     };
     await this.broadcastToAll(gameId, JSON.stringify(gameEndedMsg));
   }
@@ -335,6 +368,7 @@ export class GameHandler {
       reason: "aborted",
     };
     await this.broadcastToAll(gameId, JSON.stringify(gameEndedMsg));
+
     // Delete game from database
     await this.gameService.deleteGame(gameId);
   }
@@ -470,7 +504,10 @@ export class GameHandler {
           accepted: false,
         },
       };
-      gameConnectionManager.sendToUser(requesterId, JSON.stringify(declinedMsg));
+      gameConnectionManager.sendToUser(
+        requesterId,
+        JSON.stringify(declinedMsg)
+      );
     }
   }
 
