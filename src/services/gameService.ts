@@ -19,10 +19,43 @@ export class GameService {
   }
 
   /**
-   * Get game by ID
+   * Get game by ID (internal use)
    */
   async getGameById(gameId: number): Promise<Game | null> {
     return await this.gameRepository.findById(gameId);
+  }
+
+  /**
+   * Get game by ID formatted for API response
+   */
+  async getGameByIdFormatted(gameId: number): Promise<GameResponse | null> {
+    const game = await this.gameRepository.findById(gameId);
+    if (!game) return null;
+
+    return {
+      id: game.id,
+      createdAt: game.createdAt,
+      pgn: game.pgn,
+      fen: game.fen,
+      winnerId: game.winnerId,
+      numMoves: game.numMoves,
+      time: game.time,
+      increment: game.increment,
+      type: getTimeControl(game.time),
+      status: game.status,
+      whitePlayer: {
+        id: game.whiteId,
+        username: game.whiteUsername,
+        rating: game.whiteRating,
+        avatarUrl: game.whiteAvatarUrl,
+      },
+      blackPlayer: {
+        id: game.blackId,
+        username: game.blackUsername,
+        rating: game.blackRating,
+        avatarUrl: game.blackAvatarUrl,
+      },
+    };
   }
 
   /**
