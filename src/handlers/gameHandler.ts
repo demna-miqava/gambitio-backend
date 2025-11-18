@@ -16,6 +16,12 @@ import type {
 } from "../models/GameWebSocket.js";
 import type { MatchmakingMessage } from "../models/Matchmaking.js";
 import { gameConnectionManager } from "../utils/wsConnectionManager.js";
+import {
+  initializeGameTime,
+  updateGameTime,
+  getCurrentTimeLeft,
+  deleteGameTime,
+} from "../utils/gameTimeTracking.js";
 
 // Track draw offers: gameId -> userId who offered
 const pendingDrawOffers = new Map<number, number>();
@@ -60,6 +66,9 @@ export class GameHandler {
       return;
     }
 
+    // Get current time left for both players
+    const timeLeft = await getCurrentTimeLeft(this.fastify.redis, gameId);
+
     const initialState: InitialGameStateMessage = {
       type: "initial_game_state",
       data: {
@@ -85,6 +94,10 @@ export class GameHandler {
         status: game.status,
         numMoves: game.numMoves,
         isFinished: game.status === "finished",
+        ...(timeLeft && {
+          whiteTimeLeft: timeLeft.whiteTimeLeft,
+          blackTimeLeft: timeLeft.blackTimeLeft,
+        }),
       },
     };
 
@@ -156,7 +169,19 @@ export class GameHandler {
       message.moveNumber
     );
 
-    // Broadcast move to opponent
+    // Get game to access increment
+    const game = await this.gameService.getGameById(gameId);
+    if (!game) return;
+
+    // Update time tracking in Redis
+    const updatedTime = await updateGameTime(
+      this.fastify.redis,
+      gameId,
+      game.increment,
+      message.moveNumber
+    );
+
+    // Broadcast move to opponent with updated time
     const moveMsg: MoveMessage = {
       type: "move",
       move: message.move,
@@ -164,9 +189,13 @@ export class GameHandler {
       pgn: message.pgn,
       userId,
       moveNumber: message.moveNumber,
+      ...(updatedTime && {
+        whiteTimeLeft: updatedTime.whiteTimeLeft,
+        blackTimeLeft: updatedTime.blackTimeLeft,
+      }),
     };
 
-    await this.broadcastToOpponent(gameId, userId, JSON.stringify(moveMsg));
+    await this.broadcastToAll(gameId, JSON.stringify(moveMsg));
   }
 
   /**
@@ -208,6 +237,9 @@ export class GameHandler {
         "draw"
       );
 
+      // Clean up time tracking data
+      await deleteGameTime(this.fastify.redis, gameId);
+
       // Notify both players
       const gameEndedMsg: GameEndedMessage = {
         type: "game_ended",
@@ -248,6 +280,9 @@ export class GameHandler {
       result
     );
 
+    // Clean up time tracking data
+    await deleteGameTime(this.fastify.redis, gameId);
+
     // Notify both players
     const gameEndedMsg: GameEndedMessage = {
       type: "game_ended",
@@ -277,6 +312,9 @@ export class GameHandler {
       "finished",
       result
     );
+
+    // Clean up time tracking data
+    await deleteGameTime(this.fastify.redis, gameId);
 
     // Notify both players
     const gameEndedMsg: GameEndedMessage = {
@@ -310,6 +348,9 @@ export class GameHandler {
       result
     );
 
+    // Clean up time tracking data
+    await deleteGameTime(this.fastify.redis, gameId);
+
     // Notify both players
     const gameEndedMsg: GameEndedMessage = {
       type: "game_ended",
@@ -336,6 +377,9 @@ export class GameHandler {
       "draw"
     );
 
+    // Clean up time tracking data
+    await deleteGameTime(this.fastify.redis, gameId);
+
     // Notify both players
     const gameEndedMsg: GameEndedMessage = {
       type: "game_ended",
@@ -359,6 +403,9 @@ export class GameHandler {
       // Cannot abort after moves have been made
       return;
     }
+
+    // Clean up time tracking data
+    await deleteGameTime(this.fastify.redis, gameId);
 
     // Notify both players
     const gameEndedMsg: GameEndedMessage = {
@@ -450,6 +497,9 @@ export class GameHandler {
           ]
         );
         const newGameId = gameRows[0].id;
+
+        // Initialize time tracking in Redis for new game
+        await initializeGameTime(this.fastify.redis, newGameId, game.time);
 
         // Notify requester with match_found message
         const requesterColor = newBlackId === requesterId ? "black" : "white";

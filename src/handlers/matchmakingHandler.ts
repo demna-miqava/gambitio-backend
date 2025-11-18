@@ -5,6 +5,7 @@ import { ChallengeService } from "../services/challengeService.js";
 import type { MatchmakingMessage } from "../models/Matchmaking.js";
 import { getTimeControl } from "../models/Matchmaking.js";
 import { matchmakingConnectionManager } from "../utils/wsConnectionManager.js";
+import { initializeGameTime } from "../utils/gameTimeTracking.js";
 
 export class MatchmakingHandler {
   private matchmakingService: MatchmakingService;
@@ -150,6 +151,9 @@ export class MatchmakingHandler {
         ]
       );
       const gameId = gameRows[0].id;
+
+      // Initialize time tracking in Redis
+      await initializeGameTime(this.fastify.redis, gameId, time);
 
       // Remove matchmaking request
       await this.matchmakingService.deleteMatchmakingRequest(matchmakingId);

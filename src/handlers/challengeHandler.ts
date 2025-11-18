@@ -11,6 +11,7 @@ import type {
   NotificationMessage,
 } from "../models/NotificationWebSocket.js";
 import { getTimeControl } from "../models/Matchmaking.js";
+import { initializeGameTime } from "../utils/gameTimeTracking.js";
 
 export class ChallengeHandler {
   private challengeService: ChallengeService;
@@ -340,6 +341,9 @@ export class ChallengeHandler {
         ]
       );
       const gameId = gameRows[0].id;
+
+      // Initialize time tracking in Redis
+      await initializeGameTime(this.fastify.redis, gameId, time);
 
       // Step 7: Delete all challenges for both users (they're starting a game)
       await this.challengeService.deleteAllUserChallenges(challengerId);

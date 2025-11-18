@@ -4,6 +4,7 @@ import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
 import { registerPostgres } from "./plugins/postgres.js";
+import { registerRedis } from "./plugins/redis.js";
 import { userRoutes } from "./routes/users.js";
 import { gameRoutes } from "./routes/games.js";
 import { webSocketRoutes } from "./routes/ws/index.js";
@@ -21,11 +22,12 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(cookie);
 
   await registerPostgres(app);
+  await registerRedis(app);
 
   await app.register(cors, {
     origin: true,
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   });
 
   await app.register(websocket);

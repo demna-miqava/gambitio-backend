@@ -93,6 +93,8 @@ export type MoveMessage = {
   fen?: string;
   pgn?: string;
   moveNumber?: number;
+  whiteTimeLeft?: number; // in milliseconds
+  blackTimeLeft?: number; // in milliseconds
 };
 
 export type InitialGameStateMessage = {
@@ -118,6 +120,8 @@ export type InitialGameStateMessage = {
     status: string;
     numMoves: number | null;
     isFinished: boolean;
+    whiteTimeLeft?: number; // in milliseconds
+    blackTimeLeft?: number; // in milliseconds
   };
 };
 
