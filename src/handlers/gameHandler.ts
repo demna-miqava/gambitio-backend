@@ -181,7 +181,7 @@ export class GameHandler {
       message.moveNumber
     );
 
-    // Broadcast move to opponent with updated time
+    // Broadcast move to both players with updated time
     const moveMsg: MoveMessage = {
       type: "move",
       move: message.move,
