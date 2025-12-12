@@ -14,7 +14,7 @@ export async function matchmakingWebSocketRoute(fastify: FastifyInstance) {
     const decoded = await authenticateWebSocket(request, socket);
     if (!decoded) return;
 
-    const userId = decoded.userId;
+    const userId = decoded.id;
     const username = decoded.username;
 
     // Parse query parameters

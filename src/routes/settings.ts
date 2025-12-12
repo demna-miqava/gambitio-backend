@@ -15,7 +15,7 @@ export async function settingsRoutes(fastify: FastifyInstance) {
           return reply.status(401).send({ error: "Not authenticated" });
         }
 
-        const settings = await settingsService.getSettings(request.user.userId);
+        const settings = await settingsService.getSettings(request.user.id);
         return reply.status(200).send({ data: settings });
       } catch (error) {
         fastify.log.error(error);
@@ -42,7 +42,7 @@ export async function settingsRoutes(fastify: FastifyInstance) {
         }
 
         const updatedSettings = await settingsService.updateSettings(
-          request.user.userId,
+          request.user.id,
           validation.data
         );
 

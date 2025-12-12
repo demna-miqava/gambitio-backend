@@ -4,9 +4,9 @@ export type UserSkill = "new" | "beginner" | "intermediate" | "advanced";
 
 export interface User {
   id: number;
+  clerkId: string; // Clerk user ID (e.g., "user_2NNE...")
   username: string;
   email: string;
-  password: string;
   createdAt: Date;
   rapidRating: number;
   blitzRating: number;
@@ -15,10 +15,12 @@ export interface User {
   highestBlitzRating: number;
   highestBulletRating: number;
   status: UserStatus;
+  avatarUrl?: string | null;
 }
 
 export interface UserResponse {
   id: number;
+  clerkId: string;
   username: string;
   createdAt: Date;
   rapidRating: number;
@@ -29,17 +31,11 @@ export interface UserResponse {
   highestBulletRating: number;
 }
 
-export interface SignupRequest {
+// Data needed to create a new user from Clerk
+export interface CreateClerkUserData {
+  clerkId: string;
   email: string;
   username: string;
-  password: string;
-  skill: UserSkill;
-}
-
-export interface CreateUserData {
-  email: string;
-  username: string;
-  password_hash: string;
   rapidRating: number;
   blitzRating: number;
   bulletRating: number;
@@ -48,13 +44,8 @@ export interface CreateUserData {
   highestBulletRating: number;
 }
 
-export interface SigninRequest {
-  emailOrUsername: string;
-  password: string;
-}
-
-export interface SigninResponse {
-  success: boolean;
-  message: string;
-  user?: UserResponse;
+// Request to sync/create user from Clerk (called after Clerk auth)
+export interface SyncUserRequest {
+  username: string;
+  skill: UserSkill;
 }

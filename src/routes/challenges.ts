@@ -17,7 +17,7 @@ export async function challengeRoutes(fastify: FastifyInstance) {
     { preHandler: authMiddleware },
     async (request, reply) => {
       try {
-        const userId = request.user!.userId;
+        const userId = request.user!.id;
 
         const challenges = await challengeService.getChallengesReceivedByUser(
           userId

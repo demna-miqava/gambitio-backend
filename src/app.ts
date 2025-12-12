@@ -12,11 +12,15 @@ import { friendsRoutes } from "./routes/friends.js";
 import { friendRequestsRoutes } from "./routes/friendRequests.js";
 import { settingsRoutes } from "./routes/settings.js";
 import { challengeRoutes } from "./routes/challenges.js";
+import { clerkPlugin } from "@clerk/fastify";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = fastify({
     logger: true,
   });
+
+  // Register Clerk plugin first
+  await app.register(clerkPlugin);
 
   // Register plugins
   await app.register(cookie);
@@ -25,7 +29,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await registerRedis(app);
 
   await app.register(cors, {
-    origin: true,
+    origin: process.env.FRONTEND_URL || "http://localhost:3000",
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   });

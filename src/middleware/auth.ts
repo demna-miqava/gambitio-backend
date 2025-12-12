@@ -1,101 +1,91 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
-import {
-  verifyToken,
-  generateAccessToken,
-  generateRefreshToken,
-  isTokenExpiringSoon,
-  TOKEN_REFRESH_THRESHOLDS,
-  setAuthCookies,
-  type DecodedToken,
-} from "../utils/jwtHelpers.js";
+import { getAuth } from "@clerk/fastify";
+
+// User data attached to request after authentication
+export interface AuthUser {
+  id: number; // Local database ID
+  clerkId: string; // Clerk user ID
+  username: string;
+}
 
 // Extend FastifyRequest to include user property
 declare module "fastify" {
   interface FastifyRequest {
-    user?: DecodedToken;
+    user?: AuthUser;
   }
 }
 
 /**
- * Authentication middleware with automatic token refresh
- * - Verifies access token
- * - Auto-refreshes access / refresh token if expiring soon
+ * Authentication middleware using Clerk
+ * - Verifies Clerk session
+ * - Looks up local user by Clerk ID
+ * - Attaches user data to request
  */
 export async function authMiddleware(
   request: FastifyRequest,
   reply: FastifyReply
 ) {
   try {
-    const accessToken = request.cookies.accessToken;
-    const refreshToken = request.cookies.refreshToken;
+    const { userId: clerkId } = getAuth(request);
 
-    // No access token provided
-    if (!accessToken) {
+    if (!clerkId) {
       return reply.status(401).send({ error: "Authentication required" });
     }
 
-    let decoded: DecodedToken;
-    let shouldRefreshAccess = false;
-    let shouldRefreshRefresh = false;
-
-    // Try to verify access token
+    // Look up local user by Clerk ID
+    const client = await request.server.pg.connect();
     try {
-      decoded = verifyToken(accessToken);
+      const { rows } = await client.query<{ id: number; username: string }>(
+        `SELECT id, username FROM users WHERE "clerkId" = $1`,
+        [clerkId]
+      );
 
-      // Check if access token is expiring soon
-      if (
-        isTokenExpiringSoon(accessToken, TOKEN_REFRESH_THRESHOLDS.ACCESS_TOKEN)
-      ) {
-        shouldRefreshAccess = true;
-      }
-    } catch (error) {
-      // Access token expired or invalid, try refresh token
-      if (!refreshToken) {
-        return reply
-          .status(401)
-          .send({ error: "Token expired, please sign in again" });
+      if (rows.length === 0) {
+        // User authenticated with Clerk but not yet synced to local DB
+        // This happens when user signs up via Clerk but hasn't completed profile setup
+        return reply.status(403).send({
+          error: "Profile setup required",
+          code: "PROFILE_SETUP_REQUIRED",
+        });
       }
 
-      try {
-        decoded = verifyToken(refreshToken);
-        shouldRefreshAccess = true; // Need new access token
-      } catch (refreshError) {
-        return reply
-          .status(401)
-          .send({ error: "Session expired, please sign in again" });
-      }
-    }
-
-    // Check if refresh token needs sliding refresh (within 7 days of expiry)
-    if (
-      refreshToken &&
-      isTokenExpiringSoon(refreshToken, TOKEN_REFRESH_THRESHOLDS.REFRESH_TOKEN)
-    ) {
-      shouldRefreshRefresh = true;
-    }
-
-    // Generate new tokens if needed
-    if (shouldRefreshAccess || shouldRefreshRefresh) {
-      const payload = {
-        userId: decoded.userId,
-        username: decoded.username,
-        authMethod: decoded.authMethod,
+      request.user = {
+        id: rows[0].id,
+        clerkId,
+        username: rows[0].username,
       };
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    request.server.log.error(error);
+    return reply.status(401).send({ error: "Authentication failed" });
+  }
+}
 
-      setAuthCookies(reply, {
-        accessToken: shouldRefreshAccess
-          ? generateAccessToken(payload)
-          : undefined,
-        refreshToken: shouldRefreshRefresh
-          ? generateRefreshToken(payload)
-          : undefined,
-      });
+/**
+ * Lightweight auth middleware that only checks Clerk session
+ * Use this for routes that don't need local user data (e.g., profile setup)
+ */
+export async function clerkAuthMiddleware(
+  request: FastifyRequest,
+  reply: FastifyReply
+) {
+  try {
+    const { userId: clerkId } = getAuth(request);
+
+    if (!clerkId) {
+      return reply.status(401).send({ error: "Authentication required" });
     }
 
-    // Attach user to request
-    request.user = decoded;
+    // Attach just the Clerk ID for routes that need it
+    request.user = {
+      id: 0, // Not known yet
+      clerkId,
+      username: "", // Not known yet
+    };
   } catch (error) {
-    request.log.error(error);
+    request.server.log.error(error);
     return reply.status(401).send({ error: "Authentication failed" });
   }
 }
