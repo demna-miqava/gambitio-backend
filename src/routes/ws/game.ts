@@ -14,7 +14,7 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
     const decoded = await authenticateWebSocket(request, socket);
     if (!decoded) return;
 
-    const userId = decoded.userId;
+    const userId = decoded.id;
 
     // Parse path parameter
     const gameIdParam = request.params.id;

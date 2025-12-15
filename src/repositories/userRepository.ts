@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import type { User, UserResponse, CreateUserData } from "../models/User.js";
+import type { User, UserResponse, CreateClerkUserData } from "../models/User.js";
 
 export class UserRepository {
   constructor(private fastify: FastifyInstance) {}
@@ -8,10 +8,38 @@ export class UserRepository {
     const client = await this.fastify.pg.connect();
     try {
       const { rows } = await client.query<UserResponse>(
-        `SELECT id, username, "createdAt", "rapidRating", "blitzRating", "bulletRating",
+        `SELECT id, "clerkId", username, "createdAt", "rapidRating", "blitzRating", "bulletRating",
                 "highestRapidRating", "highestBlitzRating", "highestBulletRating"
          FROM users WHERE id = $1`,
         [id]
+      );
+      return rows[0] || null;
+    } finally {
+      client.release();
+    }
+  }
+
+  async findByClerkId(clerkId: string): Promise<UserResponse | null> {
+    const client = await this.fastify.pg.connect();
+    try {
+      const { rows } = await client.query<UserResponse>(
+        `SELECT id, "clerkId", username, "createdAt", "rapidRating", "blitzRating", "bulletRating",
+                "highestRapidRating", "highestBlitzRating", "highestBulletRating"
+         FROM users WHERE "clerkId" = $1`,
+        [clerkId]
+      );
+      return rows[0] || null;
+    } finally {
+      client.release();
+    }
+  }
+
+  async findFullByClerkId(clerkId: string): Promise<User | null> {
+    const client = await this.fastify.pg.connect();
+    try {
+      const { rows } = await client.query<User>(
+        `SELECT * FROM users WHERE "clerkId" = $1`,
+        [clerkId]
       );
       return rows[0] || null;
     } finally {
@@ -45,27 +73,14 @@ export class UserRepository {
     }
   }
 
-  async findByEmailOrUsername(emailOrUsername: string): Promise<User | null> {
-    const client = await this.fastify.pg.connect();
-    try {
-      const { rows } = await client.query<User>(
-        `SELECT * FROM users WHERE email = $1 OR username = $1`,
-        [emailOrUsername]
-      );
-      return rows[0] || null;
-    } finally {
-      client.release();
-    }
-  }
-
-  async create(userData: CreateUserData): Promise<UserResponse> {
+  async create(userData: CreateClerkUserData): Promise<UserResponse> {
     const client = await this.fastify.pg.connect();
     try {
       const { rows } = await client.query<UserResponse>(
         `INSERT INTO users (
+          "clerkId",
           email,
           username,
-          password,
           "rapidRating",
           "blitzRating",
           "bulletRating",
@@ -73,12 +88,12 @@ export class UserRepository {
           "highestBlitzRating",
           "highestBulletRating"
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id, username, "createdAt", "rapidRating", "blitzRating", "bulletRating",
+        RETURNING id, "clerkId", username, "createdAt", "rapidRating", "blitzRating", "bulletRating",
                   "highestRapidRating", "highestBlitzRating", "highestBulletRating"`,
         [
+          userData.clerkId,
           userData.email,
           userData.username,
-          userData.password_hash,
           userData.rapidRating,
           userData.blitzRating,
           userData.bulletRating,
@@ -93,37 +108,24 @@ export class UserRepository {
     }
   }
 
-  async updatePassword(userId: number, newPasswordHash: string): Promise<void> {
+  async updateEmail(clerkId: string, newEmail: string): Promise<void> {
     const client = await this.fastify.pg.connect();
     try {
       await client.query(
-        `UPDATE users SET password = $1 WHERE id = $2`,
-        [newPasswordHash, userId]
+        `UPDATE users SET email = $1 WHERE "clerkId" = $2`,
+        [newEmail, clerkId]
       );
     } finally {
       client.release();
     }
   }
 
-  async getPasswordHash(userId: number): Promise<string | null> {
-    const client = await this.fastify.pg.connect();
-    try {
-      const { rows } = await client.query<{ password: string }>(
-        `SELECT password FROM users WHERE id = $1`,
-        [userId]
-      );
-      return rows[0]?.password || null;
-    } finally {
-      client.release();
-    }
-  }
-
-  async updateEmail(userId: number, newEmail: string): Promise<void> {
+  async updateUsername(clerkId: string, newUsername: string): Promise<void> {
     const client = await this.fastify.pg.connect();
     try {
       await client.query(
-        `UPDATE users SET email = $1 WHERE id = $2`,
-        [newEmail, userId]
+        `UPDATE users SET username = $1 WHERE "clerkId" = $2`,
+        [newUsername, clerkId]
       );
     } finally {
       client.release();

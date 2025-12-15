@@ -17,11 +17,12 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
    */
   fastify.post<{ Body: SendFriendRequest }>(
     "/friend-requests",
-    { onRequest: [authMiddleware] },
+    { preHandler: authMiddleware },
     async (request: FastifyRequest, reply: FastifyReply) => {
       try {
         // Validate request body
         const validation = sendFriendRequestSchema.safeParse(request.body);
+        console.log("VALIDATION", validation);
         if (!validation.success) {
           return reply.status(400).send({
             error: "Validation failed",
@@ -32,9 +33,9 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
         const { receiverId } = validation.data;
 
         const friendRequest = await friendService.sendFriendRequest(
-          request.user!.userId,
+          request.user!.id,
           request.user!.username,
-          request.user!.avatarUrl || null,
+          null, // avatarUrl - fetch from DB if needed
           receiverId
         );
 
@@ -61,11 +62,11 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
    */
   fastify.get(
     "/friend-requests/pending",
-    { onRequest: [authMiddleware] },
+    { preHandler: authMiddleware },
     async (request: FastifyRequest, reply: FastifyReply) => {
       try {
         const requests = await friendService.getPendingFriendRequests(
-          request.user!.userId
+          request.user!.id
         );
 
         return reply.send(requests);
@@ -81,7 +82,7 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
    */
   fastify.post<{ Params: RequestIdParam }>(
     "/friend-requests/:requestId/accept",
-    { onRequest: [authMiddleware] },
+    { preHandler: authMiddleware },
     async (request: FastifyRequest, reply: FastifyReply) => {
       try {
         // Validate path parameters
@@ -97,7 +98,7 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
 
         const friendship = await friendService.acceptFriendRequest(
           requestId,
-          request.user!.userId
+          request.user!.id
         );
 
         return reply.send({
@@ -124,7 +125,7 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
    */
   fastify.post<{ Params: RequestIdParam }>(
     "/friend-requests/:requestId/decline",
-    { onRequest: [authMiddleware] },
+    { preHandler: authMiddleware },
     async (request: FastifyRequest, reply: FastifyReply) => {
       try {
         // Validate path parameters
@@ -138,7 +139,7 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
 
         const requestId = parseInt(validation.data.requestId, 10);
 
-        await friendService.declineFriendRequest(requestId, request.user!.userId);
+        await friendService.declineFriendRequest(requestId, request.user!.id);
 
         return reply.send({ message: "Friend request declined" });
       } catch (error) {
@@ -161,7 +162,7 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
    */
   fastify.delete<{ Params: RequestIdParam }>(
     "/friend-requests/:requestId",
-    { onRequest: [authMiddleware] },
+    { preHandler: authMiddleware },
     async (request: FastifyRequest, reply: FastifyReply) => {
       try {
         // Validate path parameters
@@ -175,7 +176,7 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
 
         const requestId = parseInt(validation.data.requestId, 10);
 
-        await friendService.cancelFriendRequest(requestId, request.user!.userId);
+        await friendService.cancelFriendRequest(requestId, request.user!.id);
 
         return reply.send({ message: "Friend request canceled" });
       } catch (error) {

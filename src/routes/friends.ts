@@ -19,7 +19,7 @@ export async function friendsRoutes(fastify: FastifyInstance) {
    */
   fastify.get<{ Querystring: SuggestionsQuery }>(
     "/friends/suggestions",
-    { onRequest: [authMiddleware] },
+    { preHandler: authMiddleware },
     async (request: FastifyRequest, reply: FastifyReply) => {
       try {
         // Validate query parameters
@@ -34,7 +34,7 @@ export async function friendsRoutes(fastify: FastifyInstance) {
         const { q } = validation.data;
 
         const suggestions = await friendService.getFriendSuggestions(
-          request.user!.userId,
+          request.user!.id,
           q
         );
 
@@ -68,7 +68,7 @@ export async function friendsRoutes(fastify: FastifyInstance) {
         const limitNum = parseInt(limit, 10);
 
         const results = await friendService.getFriends(
-          request.user!.userId,
+          request.user!.id,
           pageNum,
           limitNum,
           q
@@ -101,7 +101,7 @@ export async function friendsRoutes(fastify: FastifyInstance) {
 
         const friendId = parseInt(validation.data.friendId, 10);
 
-        await friendService.deleteFriendship(request.user!.userId, friendId);
+        await friendService.deleteFriendship(request.user!.id, friendId);
 
         return reply.send({ message: "Friendship deleted successfully" });
       } catch (error) {

@@ -2,54 +2,79 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { UserService } from "../services/userService.js";
 import { FriendRepository } from "../repositories/friendRepository.js";
 import { GameService } from "../services/gameService.js";
-import {
-  signupSchema,
-  signinSchema,
-  changePasswordSchema,
-  changeEmailSchema,
-} from "../schemas/userSchemas.js";
-import { ZodError } from "zod";
-import {
-  generateAccessToken,
-  generateRefreshToken,
-  setAuthCookies,
-} from "../utils/jwtHelpers.js";
-import { authMiddleware } from "../middleware/auth.js";
+import { ZodError, z } from "zod";
+import { authMiddleware, clerkAuthMiddleware } from "../middleware/auth.js";
 import { paginationQuerySchema } from "../schemas/gameSchemas.js";
+import { getAuth } from "@clerk/fastify";
+import { createClerkClient } from "@clerk/backend";
+
+// Schema for syncing user profile after Clerk auth
+const syncUserSchema = z.object({
+  username: z
+    .string()
+    .min(3, "Username must be at least 3 characters")
+    .max(30, "Username must be at most 30 characters")
+    .regex(
+      /^[a-zA-Z0-9_]+$/,
+      "Username can only contain letters, numbers, and underscores"
+    ),
+  skill: z.enum(["new", "beginner", "intermediate", "advanced"]),
+});
+
+// Schema for checking username availability
+const checkUsernameSchema = z.object({
+  username: z.string().min(1, "Username is required"),
+});
 
 export async function userRoutes(fastify: FastifyInstance) {
   const userService = new UserService(fastify);
   const friendRepository = new FriendRepository(fastify);
   const gameService = new GameService(fastify);
 
-  // POST /users/signup - Create new user
+  /**
+   * POST /users/sync - Create/sync user profile after Clerk authentication
+   * Called when a user first signs up via Clerk to create their chess profile
+   */
   fastify.post<{ Body: unknown }>(
-    "/users/signup",
+    "/users/sync",
+    { preHandler: clerkAuthMiddleware },
     async (request: FastifyRequest<{ Body: unknown }>, reply: FastifyReply) => {
       try {
-        // Validate request body with Zod
-        const validatedData = signupSchema.parse(request.body);
-        // Create user
-        const user = await userService.signup(validatedData);
+        const { userId: clerkId } = getAuth(request);
 
-        // Generate JWT tokens
-        const jwtPayload = {
-          userId: user.id,
-          username: user.username,
-          authMethod: "email" as const,
-        };
-        const accessToken = generateAccessToken(jwtPayload);
-        const refreshToken = generateRefreshToken(jwtPayload);
+        if (!clerkId) {
+          return reply.status(401).send({ error: "Authentication required" });
+        }
 
-        // Set tokens as httpOnly cookies
-        setAuthCookies(reply, { accessToken, refreshToken });
+        // Fetch user email from Clerk API
+        const secretKey = process.env.CLERK_SECRET_KEY;
+        if (!secretKey) {
+          fastify.log.error("CLERK_SECRET_KEY not configured");
+          return reply.status(500).send({ error: "Server configuration error" });
+        }
+        const clerk = createClerkClient({ secretKey });
+        const clerkUser = await clerk.users.getUser(clerkId);
+        const email = clerkUser.emailAddresses.find(
+          (e) => e.id === clerkUser.primaryEmailAddressId
+        )?.emailAddress;
+
+        if (!email) {
+          return reply
+            .status(400)
+            .send({ error: "Email not found for user" });
+        }
+
+        // Validate request body
+        const validatedData = syncUserSchema.parse(request.body);
+
+        // Sync user
+        const user = await userService.syncUser(clerkId, email, validatedData);
 
         return reply.status(201).send({
-          message: "User created successfully",
+          message: "Profile created successfully",
           user,
         });
       } catch (error) {
-        // Handle Zod validation errors
         if (error instanceof ZodError) {
           return reply.status(400).send({
             error: "Validation error",
@@ -57,101 +82,63 @@ export async function userRoutes(fastify: FastifyInstance) {
           });
         }
 
-        // Handle duplicate email/username errors
-        if (error instanceof Error) {
-          if (
-            error.message === "Email already exists" ||
-            error.message === "Username already exists"
-          ) {
-            return reply
-              .status(409)
-              .send({ message: "This user already exists" });
-          }
+        if (
+          error instanceof Error &&
+          error.message === "Username already exists"
+        ) {
+          return reply.status(409).send({ error: "Username already taken" });
         }
 
         fastify.log.error(error);
-        return reply.status(500).send({ error: "Failed to create user" });
+        return reply.status(500).send({ error: "Failed to create profile" });
       }
     }
   );
 
-  // POST /users/signin - Authenticate user
-  fastify.post<{ Body: unknown }>(
-    "/users/signin",
-    async (request: FastifyRequest<{ Body: unknown }>, reply: FastifyReply) => {
+  /**
+   * GET /users/check-username?username=xxx - Check if username is available
+   * Public endpoint (but requires Clerk auth to prevent abuse)
+   */
+  fastify.get<{ Querystring: { username?: string } }>(
+    "/users/check-username",
+    { preHandler: clerkAuthMiddleware },
+    async (
+      request: FastifyRequest<{ Querystring: { username?: string } }>,
+      reply: FastifyReply
+    ) => {
       try {
-        // Validate request body with Zod
-        const validatedData = signinSchema.parse(request.body);
-
-        // Authenticate user
-        const user = await userService.signin(validatedData);
-
-        // Generate JWT tokens
-        const jwtPayload = {
-          userId: user.id,
-          username: user.username,
-          authMethod: "email" as const,
-        };
-        const accessToken = generateAccessToken(jwtPayload);
-        const refreshToken = generateRefreshToken(jwtPayload);
-
-        // Set tokens as httpOnly cookies
-        setAuthCookies(reply, { accessToken, refreshToken });
-
-        return reply.status(200).send({
-          message: "Signin successful",
-          user,
-        });
-      } catch (error) {
-        // Handle Zod validation errors
-        if (error instanceof ZodError) {
+        const validation = checkUsernameSchema.safeParse(request.query);
+        if (!validation.success) {
           return reply.status(400).send({
             error: "Validation error",
-            details: error.issues,
+            details: validation.error.issues,
           });
         }
 
-        // Handle invalid credentials error
-        if (error instanceof Error && error.message === "Invalid credentials") {
-          return reply.status(400).send({ message: "Invalid credentials" });
-        }
-
-        fastify.log.error(error);
-        return reply.status(500).send({ message: "Failed to sign in" });
-      }
-    }
-  );
-
-  // POST /users/logout - Logout user
-  fastify.post(
-    "/users/logout",
-    async (_request: FastifyRequest, reply: FastifyReply) => {
-      try {
-        // Clear both cookies
-        reply.clearCookie("accessToken", { path: "/" });
-        reply.clearCookie("refreshToken", { path: "/" });
-
-        return reply.status(200).send({ message: "Logout successful" });
+        const available = await userService.isUsernameAvailable(
+          validation.data.username
+        );
+        return reply.send({ available });
       } catch (error) {
         fastify.log.error(error);
-        return reply.status(500).send({ error: "Failed to logout" });
+        return reply.status(500).send({ error: "Failed to check username" });
       }
     }
   );
 
-  // GET /users/me - Get current authenticated user (protected route example)
+  /**
+   * GET /users/me - Get current authenticated user
+   */
   fastify.get(
     "/users/me",
     { preHandler: authMiddleware },
     async (request: FastifyRequest, reply: FastifyReply) => {
       try {
-        // request.user is populated by authMiddleware
         if (!request.user) {
           return reply.status(401).send({ error: "Not authenticated" });
         }
 
-        // Fetch full user details
-        const user = await userService.getUserById(request.user.userId);
+        const user = await userService.getUserById(request.user.id);
 
         if (!user) {
           return reply.status(404).send({ error: "User not found" });
@@ -165,110 +152,48 @@ export async function userRoutes(fastify: FastifyInstance) {
     }
   );
 
-  // PATCH /users/password - Change user password
-  fastify.put<{ Body: unknown }>(
-    "/users/change-password",
-    { preHandler: authMiddleware },
-    async (request: FastifyRequest<{ Body: unknown }>, reply: FastifyReply) => {
+  /**
+   * GET /users/status - Check if current Clerk user has a profile
+   * Returns profile status and user data if exists
+   */
+  fastify.get(
+    "/users/status",
+    { preHandler: clerkAuthMiddleware },
+    async (request: FastifyRequest, reply: FastifyReply) => {
       try {
-        if (!request.user) {
-          return reply.status(401).send({ error: "Not authenticated" });
+        const { userId: clerkId } = getAuth(request);
+
+        if (!clerkId) {
+          return reply.status(401).send({ error: "Authentication required" });
         }
 
-        // Validate request body with Zod
-        const validatedData = changePasswordSchema.parse(request.body);
-        // Change password
-        await userService.changePassword(
-          request.user.userId,
-          validatedData.oldPassword,
-          validatedData.newPassword
-        );
+        const user = await userService.getUserByClerkId(clerkId);
 
-        return reply
-          .status(200)
-          .send({ message: "Password changed successfully" });
-      } catch (error) {
-        // Handle Zod validation errors
-        if (error instanceof ZodError) {
-          return reply.status(400).send({
-            error: "Validation error",
-            details: error.issues,
+        if (!user) {
+          return reply.send({
+            hasProfile: false,
+            user: null,
           });
         }
 
-        // Handle invalid old password error
-        if (
-          error instanceof Error &&
-          error.message === "Invalid old password"
-        ) {
-          return reply.status(400).send({ message: "Invalid old password" });
-        }
-
-        // Handle user not found error
-        if (error instanceof Error && error.message === "User not found") {
-          return reply.status(404).send({ message: "User not found" });
-        }
-
+        return reply.send({
+          hasProfile: true,
+          user,
+        });
+      } catch (error) {
         fastify.log.error(error);
-        return reply.status(500).send({ message: "Failed to change password" });
+        return reply.status(500).send({ error: "Failed to check user status" });
       }
     }
   );
 
-  // PUT /users/change-email - Change user email
-  fastify.put<{ Body: unknown }>(
-    "/users/change-email",
-    { preHandler: authMiddleware },
-    async (request: FastifyRequest<{ Body: unknown }>, reply: FastifyReply) => {
-      try {
-        if (!request.user) {
-          return reply.status(401).send({ error: "Not authenticated" });
-        }
-
-        // Validate request body with Zod
-        const validatedData = changeEmailSchema.parse(request.body);
-
-        // Change email
-        await userService.changeEmail(
-          request.user.userId,
-          validatedData.newEmail
-        );
-
-        return reply
-          .status(200)
-          .send({ message: "Email changed successfully" });
-      } catch (error) {
-        // Handle Zod validation errors
-        if (error instanceof ZodError) {
-          return reply.status(400).send({
-            error: "Validation error",
-            details: error.issues,
-          });
-        }
-
-        // Handle email already in use error
-        if (
-          error instanceof Error &&
-          error.message === "Email already in use"
-        ) {
-          return reply.status(409).send({ message: "Email already in use" });
-        }
-
-        fastify.log.error(error);
-        return reply.status(500).send({ message: "Failed to change email" });
-      }
-    }
-  );
-
-  // GET /users/:userId - Get user profile by userId
-  fastify.get<{
-    Params: { userId: string };
-  }>(
+  /**
+   * GET /users/:userId - Get user profile by userId (public)
+   */
+  fastify.get<{ Params: { userId: string } }>(
     "/users/:userId",
     async (
-      request: FastifyRequest<{
-        Params: { userId: string };
-      }>,
+      request: FastifyRequest<{ Params: { userId: string } }>,
       reply: FastifyReply
     ) => {
       try {
@@ -300,12 +225,16 @@ export async function userRoutes(fastify: FastifyInstance) {
         });
       } catch (error) {
         fastify.log.error(error);
-        return reply.status(500).send({ error: "Failed to fetch user profile" });
+        return reply
+          .status(500)
+          .send({ error: "Failed to fetch user profile" });
       }
     }
   );
 
-  // GET /users/:userId/friends - Get friends list for a specific user
+  /**
+   * GET /users/:userId/friends - Get friends list for a specific user (public)
+   */
   fastify.get<{
     Params: { userId: string };
     Querystring: { page?: string; limit?: string; q?: string };
@@ -326,10 +255,8 @@ export async function userRoutes(fastify: FastifyInstance) {
           return reply.status(400).send({ error: "Invalid user ID" });
         }
 
-        // Validate query parameters
         const validatedQuery = paginationQuerySchema.parse(request.query);
 
-        // Fetch friends
         const result = await friendRepository.getFriends(
           userId,
           validatedQuery.limit,
@@ -337,7 +264,6 @@ export async function userRoutes(fastify: FastifyInstance) {
           searchQuery
         );
 
-        // Calculate total pages
         const totalPages = Math.ceil(result.total / validatedQuery.limit);
 
         return reply.status(200).send({
@@ -350,7 +276,6 @@ export async function userRoutes(fastify: FastifyInstance) {
           },
         });
       } catch (error) {
-        // Handle Zod validation errors
         if (error instanceof ZodError) {
           return reply.status(400).send({
             error: "Validation error",
@@ -364,7 +289,9 @@ export async function userRoutes(fastify: FastifyInstance) {
     }
   );
 
-  // GET /users/:userId/games - Get games for a specific user
+  /**
+   * GET /users/:userId/games - Get games for a specific user (public)
+   */
   fastify.get<{
     Params: { userId: string };
     Querystring: { page?: string; limit?: string };
@@ -384,10 +311,8 @@ export async function userRoutes(fastify: FastifyInstance) {
           return reply.status(400).send({ error: "Invalid user ID" });
         }
 
-        // Validate query parameters
         const validatedQuery = paginationQuerySchema.parse(request.query);
 
-        // Fetch games
         const result = await gameService.getGamesByUserId(
           userId,
           validatedQuery.page,
@@ -396,7 +321,6 @@ export async function userRoutes(fastify: FastifyInstance) {
 
         return reply.status(200).send(result);
       } catch (error) {
-        // Handle Zod validation errors
         if (error instanceof ZodError) {
           return reply.status(400).send({
             error: "Validation error",
