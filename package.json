@@ -32,17 +32,16 @@
   "devDependencies": {
     "@cloudflare/containers": "^0.3.7",
     "@cloudflare/workers-types": "^5.20261112.1",
-    "@tsconfig/node22": "^22.0.2",
-    "@types/node": "^24.9.1",
+    "@types/node": "^26.6.6",
     "@types/pg": "^8.23.1",
     "@types/ws": "^8.18.1",
     "nodemon": "^3.1.10",
-    "tsx": "^4.20.6",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "wrangler": "^4.161.0",
     "ws": "^8.22.2"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=26"
   }
 }

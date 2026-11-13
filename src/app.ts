@@ -15,7 +15,7 @@ import { ChallengeService } from "./services/challengeService.js";
 import { createJobs } from "./jobs.js";
 import { UserLookup } from "./plugins/userLookup.js";
 import { selectWsProtocol, wsHandshakeToken } from "./middleware/wsAuth.js";
-import { allowedOrigins, type Config } from "./config.js";
+import { originChecker, type Config } from "./config.js";
 import { userRoutes } from "./routes/users.js";
 import { gameRoutes } from "./routes/games.js";
 import { liveGameRoutes } from "./routes/liveGames.js";
@@ -149,11 +149,12 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
     return reply.status(500).send({ error: "Internal server error", code: "INTERNAL_ERROR" });
   });
 
+  const isAllowedOrigin = originChecker(config);
   app.decorate(
     "authProvider",
     options.authProvider ??
       // Only accept session tokens minted for our own frontend
-      clerkAuthProvider(config.CLERK_SECRET_KEY, allowedOrigins(config))
+      clerkAuthProvider(config.CLERK_SECRET_KEY, isAllowedOrigin)
   );
 
   await app.register(postgres, {
@@ -176,7 +177,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   app.decorate("users", new UserLookup(app.pg));
 
   await app.register(cors, {
-    origin: allowedOrigins(config),
+    origin: (origin, callback) => callback(null, origin !== undefined && isAllowedOrigin(origin)),
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   });
   // Per signed-in user (and IP), so a school or club behind one address

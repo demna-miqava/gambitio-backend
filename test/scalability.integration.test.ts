@@ -253,6 +253,28 @@ describe("scalability changes", { skip: !integrationEnabled && "TEST_POSTGRES_UR
     assert.equal((await patch({ boardCoordinatesEnabled: false })).json().data.soundsEnabled, false);
   });
 
+  test("the colour palette defaults to emerald and only takes known palettes", async () => {
+    const patch = (body: object) =>
+      app.inject({
+        method: "PATCH",
+        url: "/api/settings",
+        headers: { authorization: `Bearer ${white.clerkId}` },
+        payload: body,
+      });
+    const first = await patch({ soundsEnabled: true });
+    assert.equal(first.json().data.colorPalette, "emerald");
+    const changed = await patch({ colorPalette: "midnight" });
+    assert.equal(changed.statusCode, 200, changed.body);
+    assert.equal(changed.json().data.colorPalette, "midnight");
+    assert.equal((await patch({ colorPalette: "neon" })).statusCode, 400);
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/settings",
+      headers: { authorization: `Bearer ${white.clerkId}` },
+    });
+    assert.equal(res.json().data.colorPalette, "midnight");
+  });
+
   test("game history pages in order without pgn, with a correct total", async () => {
     const ids: number[] = [];
     for (let i = 0; i < 7; i++) {

@@ -14,7 +14,7 @@
 	"routes": [
 		{
 			// Replace with your domain (or a subdomain of it), without https://.
-			"pattern": "gambitio.example.com",
+			"pattern": "gambitio.mipupu.com",
 			"custom_domain": true,
 		},
 	],
@@ -39,6 +39,13 @@
 			"image": "./Dockerfile",
 			"instance_type": "basic",
 			"max_instances": 4,
+			// Next to the database and Redis (Neon and Upstash, both in
+			// Frankfurt): a move makes several round trips to them, which from
+			// another continent cost ~0.1s each. Without this Cloudflare may
+			// start the container anywhere (the first one ran in Ohio).
+			"constraints": {
+				"regions": ["WEUR"],
+			},
 		},
 	],
 	"durable_objects": {
@@ -58,7 +65,7 @@
 	"vars": {
 		// The site's address, with https://, matching routes[0].pattern. The
 		// backend uses it for CORS and to check Clerk session tokens.
-		"SITE_ORIGIN": "https://gambitio.example.com",
+		"SITE_ORIGIN": "https://gambitio.mipupu.com",
 		// Backend containers to run, 1 to max_instances. 1 keeps everyone on one
 		// server; raise it when one instance runs out of CPU. Each instance adds
 		// its own container cost and a Redis heartbeat.

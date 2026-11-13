@@ -273,7 +273,18 @@ export class LiveGameService {
     return this.positions.checkout(game.id, game.pgn, game.numMoves);
   }
 
-  async move(gameId: number, userId: number, input: MoveInput): Promise<void> {
+  /**
+   * Plays a move. `receivedAt` is when the move reached this server (taken
+   * before any database work, which shouldn't cost the player time) and
+   * `thinkMs` how long the player's own clock ran, if the client said (see
+   * MAX_LAG_COMPENSATION_MS).
+   */
+  async move(
+    gameId: number,
+    userId: number,
+    input: MoveInput,
+    timing: { receivedAt?: number; thinkMs?: number | undefined } = {}
+  ): Promise<void> {
     let rejected: { reason: string; fen: string; pgn: string } | null = null;
     // The position after the stored move, cached once the transaction commits
     let played: { chess: Chess; pgn: string; ply: number } | null = null;
@@ -284,7 +295,9 @@ export class LiveGameService {
       if (!color) throw notAPlayer();
 
       const state = clockOf(game);
-      const now = Date.now();
+      // Never before the previous move (whose time may have been taken later)
+      const now = Math.max(timing.receivedAt ?? Date.now(), state.lastMoveAt);
+      const { thinkMs } = timing;
       if (activeColor(state.ply) !== color) {
         rejected = { reason: "Not your turn", fen: game.fen ?? "", pgn: game.pgn ?? "" };
         return;
@@ -295,7 +308,7 @@ export class LiveGameService {
         return;
       }
       const chess = this.position(game);
-      if (isFlagged(state, now)) {
+      if (isFlagged(state, now, thinkMs)) {
         await this.end(tx, game, timeoutOutcome(chess, color), remainingAt(state, now), fx);
         return;
       }
@@ -308,7 +321,7 @@ export class LiveGameService {
         return;
       }
 
-      const clock = afterMove(state, now, game.increment * 1000);
+      const clock = afterMove(state, now, game.increment * 1000, thinkMs);
       // Moving declines the opponent's pending draw offer
       const drawOfferedBy = game.drawOfferedBy === userId ? userId : null;
       const deadlineAt = new Date(deadline(clock));

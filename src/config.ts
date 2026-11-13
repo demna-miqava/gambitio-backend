@@ -27,6 +27,14 @@ const envSchema = z.object({
     )
     .pipe(z.array(z.string().url()))
     .optional(),
+  // "true" also allows any origin on a private network (192.168.x.x, 10.x.x.x,
+  // 172.16-31.x.x, *.local): for opening the dev server from a phone when
+  // the Mac's IP keeps changing. Never set in production.
+  ALLOW_LAN_ORIGINS: z
+    .string()
+    .optional()
+    .transform((value) => value === "true" || value === "1")
+    .optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
@@ -34,6 +42,31 @@ export type Config = z.infer<typeof envSchema>;
 /** Every frontend origin allowed to call the API and mint session tokens for it. */
 export function allowedOrigins(config: Config): string[] {
   return [config.FRONTEND_URL, ...(config.EXTRA_FRONTEND_ORIGINS ?? [])];
+}
+
+/** An http(s) origin whose host is a private-network IPv4 address or a *.local name. */
+export function isLanOrigin(origin: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  const host = url.hostname;
+  if (host.endsWith(".local")) return true;
+  const octets = host.split(".").map(Number);
+  if (octets.length !== 4 || octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) {
+    return false;
+  }
+  const [a, b] = octets as [number, number, number, number];
+  return a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
+}
+
+/** Whether a frontend origin may call the API and have its session tokens accepted. */
+export function originChecker(config: Config): (origin: string) => boolean {
+  const listed = new Set(allowedOrigins(config));
+  return (origin) => listed.has(origin) || (config.ALLOW_LAN_ORIGINS === true && isLanOrigin(origin));
 }
 
 /**

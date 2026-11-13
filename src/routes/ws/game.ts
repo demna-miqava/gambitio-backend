@@ -29,11 +29,15 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
 
       // Register before anything async so no message is missed. Anyone may
       // watch; only the two players can act (checked by LiveGameService).
-      onValidatedMessage(socket, gameClientMessageSchema, request.log, async (message) => {
+      onValidatedMessage(socket, gameClientMessageSchema, request.log, async (message, { receivedAt }) => {
         const userId = user.id;
         switch (message.type) {
           case "move":
-            return liveGames.move(gameId, userId, message.move);
+            // Timed from arrival: queueing and database work don't cost the player
+            return liveGames.move(gameId, userId, message.move, {
+              receivedAt,
+              thinkMs: message.thinkMs,
+            });
           case "resign":
             return liveGames.resign(gameId, userId);
           case "abort":

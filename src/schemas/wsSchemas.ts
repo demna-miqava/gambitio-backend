@@ -12,6 +12,8 @@ export const gameClientMessageSchema = z.discriminatedUnion("type", [
       to: square,
       promotion: z.enum(["q", "r", "b", "n"]).optional(),
     }),
+    // How long the player's own clock ran for this move (see clock.ts)
+    thinkMs: z.number().int().min(0).max(24 * 60 * 60 * 1000).optional(),
   }),
   z.object({ type: z.literal("resign") }),
   z.object({ type: z.literal("abort") }),

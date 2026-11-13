@@ -1,3 +1,7 @@
+/** Same values as the CHECK in migrations/015_color_palette.sql */
+export const COLOR_PALETTES = ["emerald", "club", "midnight", "walnut"] as const;
+export type ColorPalette = (typeof COLOR_PALETTES)[number];
+
 export interface Settings {
   userId: number;
   boardCoordinatesEnabled: boolean;
@@ -13,6 +17,7 @@ export interface Settings {
   pieceIconNotationEnabled: boolean;
   emailNotificationsEnabled: boolean;
   messagesAllowedFrom: "nobody" | "everyone" | "only_friends";
+  colorPalette: ColorPalette;
 }
 
 export type UpdateSettingsRequest = {

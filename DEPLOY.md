@@ -80,6 +80,11 @@ builds the container image and deploys the Worker.
 ## Scaling
 
 - `wrangler.jsonc` runs the `basic` instance type (1/4 vCPU, 1 GiB).
+- Containers are limited to Western Europe (`constraints.regions`), next to
+  Neon and Upstash in Frankfurt. If you move the database, move this too:
+  each move makes several database round trips. `npx wrangler containers
+  instances <app id>` shows where instances run (`npx wrangler containers
+  list` gives the id).
 - `vars.BACKEND_INSTANCES` (default `"1"`, at most `max_instances`) sets how
   many containers share the load. With more than one, `worker/index.ts`
   sends all of a game's sockets to the same instance (by game id) and other

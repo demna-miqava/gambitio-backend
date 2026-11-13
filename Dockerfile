@@ -2,7 +2,7 @@
 # Cloudflare runs it on linux/amd64. Env vars come from the Worker
 # (worker/index.ts), never from a .env file baked into the image.
 
-FROM node:22-bookworm-slim AS build
+FROM node:26-trixie-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -10,7 +10,7 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
-FROM node:22-bookworm-slim
+FROM node:26-trixie-slim
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force

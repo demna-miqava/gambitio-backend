@@ -28,14 +28,20 @@ export function bearerToken(request: FastifyRequest): string | null {
 
 /**
  * Verifies Clerk session tokens (REST bearer tokens and WebSocket tokens
- * alike). `authorizedParties` rejects tokens minted for other origins.
+ * alike). `isAuthorizedParty` rejects tokens minted for other origins: like
+ * Clerk's own `authorizedParties` option, it checks the `azp` claim when the
+ * token has one, but can match origins by rule rather than from a fixed list.
  */
-export function clerkAuthProvider(secretKey: string, authorizedParties: string[]): AuthProvider {
+export function clerkAuthProvider(
+  secretKey: string,
+  isAuthorizedParty: (origin: string) => boolean
+): AuthProvider {
   const clerk = createClerkClient({ secretKey });
   return {
     verifyToken: async (token) => {
       try {
-        const payload = await verifyToken(token, { secretKey, authorizedParties });
+        const payload = await verifyToken(token, { secretKey });
+        if (typeof payload.azp === "string" && !isAuthorizedParty(payload.azp)) return null;
         return payload.sub ?? null;
       } catch {
         return null;

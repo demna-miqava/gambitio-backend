@@ -1,7 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { applyMove, loadGame, timeoutOutcome } from "../src/game/engine.js";
-import { afterMove, deadline, FIRST_MOVE_TIMEOUT_MS, isFlagged, remainingAt } from "../src/game/clock.js";
+import {
+  afterMove,
+  chargedTime,
+  deadline,
+  FIRST_MOVE_TIMEOUT_MS,
+  isFlagged,
+  MAX_LAG_COMPENSATION_MS,
+  remainingAt,
+} from "../src/game/clock.js";
 import { calculateRatingChanges, RATING_FLOOR } from "../src/utils/ratingHelpers.js";
 import { ratingRangeFor } from "../src/services/matchmakingService.js";
 import { redactUrl } from "../src/app.js";
@@ -60,9 +68,30 @@ test("clock does not run before both first moves, then counts down with incremen
   assert.deepEqual(remainingAt(afterBlack, 25_000), { whiteMs: 50_000, blackMs: 60_000 });
   const third = afterMove(afterBlack, 25_000, 2_000);
   assert.equal(third.whiteMs, 52_000);
-  assert.equal(deadline(third), 25_000 + 60_000);
+  // The deadline waits for a move that may still be on its way
+  assert.equal(deadline(third), 25_000 + 60_000 + MAX_LAG_COMPENSATION_MS);
   assert.equal(isFlagged(third, 85_000), true);
   assert.equal(isFlagged(third, 84_999), false);
+});
+
+test("network delay is forgiven up to MAX_LAG_COMPENSATION_MS per move", () => {
+  // Black to move with 2s left, the clock running since t=10s
+  const state = { whiteMs: 30_000, blackMs: 2_000, lastMoveAt: 10_000, ply: 21 };
+
+  // Black moved with 0.14s left on their screen; the move reached the
+  // server 400ms of network later, after the 2s were up there
+  const arrived = 10_000 + 2_000 + 400 - 140;
+  assert.equal(isFlagged(state, arrived), true, "without a report, the server's time counts");
+  assert.equal(isFlagged(state, arrived, 1_860), false);
+  assert.equal(afterMove(state, arrived, 0, 1_860).blackMs, 140);
+
+  // The claim is capped: at most MAX_LAG_COMPENSATION_MS less than the server measured
+  assert.equal(chargedTime(state, 15_000, 0), 5_000 - MAX_LAG_COMPENSATION_MS);
+  assert.equal(isFlagged(state, 10_000 + 2_000 + MAX_LAG_COMPENSATION_MS, 0), true);
+  // ...and never more than the server measured
+  assert.equal(chargedTime(state, 11_000, 9_999), 1_000);
+  // No time is charged before both first moves
+  assert.equal(chargedTime({ ...state, ply: 1 }, 50_000, 40_000), 0);
 });
 
 test("winner always gains and loser always loses", () => {

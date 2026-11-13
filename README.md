@@ -20,7 +20,14 @@ Required env (validated at startup in `src/config.ts`): `POSTGRES_CONNECTION_STR
 Optional: `EXTRA_FRONTEND_ORIGINS`, comma-separated origins allowed besides
 `FRONTEND_URL` (e.g. your LAN address, to open the dev server from a phone);
 `PG_POOL_MAX` (Postgres connections, default 15); `PG_STATEMENT_TIMEOUT_MS`
-(longest a query may run, default 5000).
+(longest a query may run, default 5000); `ALLOW_LAN_ORIGINS=true` (local dev
+only) also allows any private-network origin, so a phone keeps working when
+the Mac's IP changes.
+
+To open the dev server from a phone on the same Wi-Fi, run the backend with
+`ALLOW_LAN_ORIGINS=true` and the frontend with `VITE_API_BASE_URL` and
+`VITE_WS_BASE_URL` empty and `--host`: the app then calls its own origin and
+Vite proxies `/api` to the backend.
 
 ### Puzzles
 

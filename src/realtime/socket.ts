@@ -31,7 +31,8 @@ export function onValidatedMessage<S extends z.ZodType>(
   socket: WebSocket,
   schema: S,
   log: FastifyBaseLogger,
-  handler: (message: z.infer<S>) => Promise<void>
+  /** `receivedAt`: when the message arrived, before waiting its turn */
+  handler: (message: z.infer<S>, meta: { receivedAt: number }) => Promise<void>
 ): void {
   let tokens = BUCKET_SIZE;
   let lastRefill = Date.now();
@@ -65,7 +66,7 @@ export function onValidatedMessage<S extends z.ZodType>(
 
     queue = queue.then(async () => {
       try {
-        await handler(parsed.data);
+        await handler(parsed.data, { receivedAt: now });
       } catch (error) {
         if (error instanceof AppError) {
           sendError(socket, error.message, error.code, parsed.data);

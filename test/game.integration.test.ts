@@ -174,6 +174,39 @@ describe("live games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_
     assert.equal(await ratingOf(black.id), 1208);
   });
 
+  test("a move that reaches the server just after its flag still counts (lag compensation)", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    for (const [socket, uci] of [
+      [w, "e2e4"],
+      [b, "e7e5"],
+    ] as const) {
+      socket.send(move(uci));
+      await w.next("move", (m) => m.move.lan === uci);
+    }
+
+    // White had 2s; by the server's clock 2.3s have passed (the move was in
+    // transit), but white's own clock ran 1.86s
+    await app.pg.query(
+      `UPDATE games SET "whiteTimeLeftMs" = 2000, "lastMoveAt" = now() - interval '2300 milliseconds',
+         "deadlineAt" = now() + interval '700 milliseconds' WHERE id = $1`,
+      [game.id]
+    );
+    w.send({ ...move("g1f3"), thinkMs: 1860 });
+    const played = await b.next("move", (m) => m.move.lan === "g1f3");
+    assert.ok(played.whiteTimeLeft > 0 && played.whiteTimeLeft <= 140, `white has ${played.whiteTimeLeft}ms`);
+
+    // A client claiming to have thought 0ms is forgiven at most a second
+    await app.pg.query(
+      `UPDATE games SET "blackTimeLeftMs" = 2000, "lastMoveAt" = now() - interval '3500 milliseconds' WHERE id = $1`,
+      [game.id]
+    );
+    b.send({ ...move("b8c6"), thinkMs: 0 });
+    const ended = await w.next("game_ended");
+    assert.equal(ended.reason, "timeout");
+    assert.equal(ended.winnerId, white.id);
+  });
+
   test("sweeper aborts a game whose first move never comes, without rating changes", async () => {
     const game = await newGame();
     const { w } = await joinGame(game.id);
