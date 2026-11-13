@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { AppError } from "../errors/AppError.js";
 import { gameRepository } from "../repositories/gameRepository.js";
 import { AlreadyInGameError, createGame, matchFoundData } from "./gameService.js";
-import { topics, type RealtimeHub } from "../realtime/hub.js";
+import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
 import { getTimeControl, ratingColumns, type PlayerColor } from "../models/common.js";
 
 export interface Challenge {
@@ -283,11 +283,13 @@ export class ChallengeService {
       return created;
     });
 
+    this.fastify.liveGames.watchDeadline(game.id, game.deadlineAt);
     for (const playerId of [game.whiteId, game.blackId]) {
       await this.hub.publish(topics.notifications(playerId), {
         type: "match_created",
         data: matchFoundData(game, playerId),
       });
+      await this.hub.publish(topics.notifications(playerId), activeGameMessage(game.id));
     }
   }
 }

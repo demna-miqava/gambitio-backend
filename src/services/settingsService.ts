@@ -24,9 +24,6 @@ export class SettingsService {
     userId: number,
     updates: UpdateSettingsRequest
   ): Promise<Settings> {
-    // Ensure settings exist before updating
-    await this.getSettings(userId);
-
-    return await this.settingsRepository.updateSettings(userId, updates);
+    return this.settingsRepository.updateSettings(userId, updates);
   }
 }

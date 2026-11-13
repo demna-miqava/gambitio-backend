@@ -5,6 +5,12 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(8080),
   POSTGRES_CONNECTION_STRING: z.string().min(1),
   REDIS_URL: z.string().min(1).default("redis://localhost:6379"),
+  // Postgres pool. Neon's pooled endpoint takes many more connections than
+  // this; the limit protects the database and this small container.
+  PG_POOL_MAX: z.coerce.number().int().positive().default(15),
+  // Longest any one statement may run. A slow query fails instead of holding
+  // a pool connection (and, in a transaction, a game's row lock) for ages.
+  PG_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
   CLERK_PUBLISHABLE_KEY: z.string().min(1),
   CLERK_SECRET_KEY: z.string().min(1),
   FRONTEND_URL: z.string().url().default("http://localhost:5173"),

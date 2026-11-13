@@ -3,7 +3,7 @@ import type { MatchmakingRequest } from "../models/Matchmaking.js";
 import { getTimeControl, ratingColumns } from "../models/common.js";
 import { gameRepository } from "../repositories/gameRepository.js";
 import { createGame, matchFoundData, AlreadyInGameError } from "./gameService.js";
-import { topics, type RealtimeHub } from "../realtime/hub.js";
+import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
 
 const INITIAL_RATING_RANGE = 50;
 const RANGE_STEP = 50;
@@ -102,11 +102,13 @@ export class MatchmakingService {
     });
 
     if (!created) return null;
+    this.fastify.liveGames.watchDeadline(created.id, created.deadlineAt);
     for (const playerId of [created.whiteId, created.blackId]) {
       await this.hub.publish(topics.matchmaking(playerId), {
         type: "match_found",
         data: matchFoundData(created, playerId),
       });
+      await this.hub.publish(topics.notifications(playerId), activeGameMessage(created.id));
     }
     return created.id;
   }

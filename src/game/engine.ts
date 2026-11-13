@@ -80,9 +80,22 @@ export function detectOutcome(chess: Chess): Outcome | null {
 /**
  * Validates and applies a move to the stored game. Illegal input never throws;
  * it returns ok: false so the caller can tell the client to resync.
+ *
+ * Replays the whole game first; the live game service uses applyMoveTo on a
+ * cached position instead (see LiveGameService).
  */
 export function applyMove(pgn: string | null | undefined, input: MoveInput): ApplyMoveResult {
   const chess = loadGame(pgn);
+  return applyMoveTo(chess, pgn ?? "", chess.history().length, input);
+}
+
+/**
+ * Applies a move to `chess` in place, which must be the position after `pgn`
+ * (`ply` half-moves played). Costs one move generation regardless of game
+ * length: the new PGN is the old one plus this move, never a replay. On an
+ * illegal move `chess` is left unchanged.
+ */
+export function applyMoveTo(chess: Chess, pgn: string, ply: number, input: MoveInput): ApplyMoveResult {
   const mover = colorToMove(chess);
 
   let move;
@@ -107,10 +120,31 @@ export function applyMove(pgn: string | null | undefined, input: MoveInput): App
     },
     mover,
     fen: chess.fen(),
-    pgn: chess.pgn(),
-    ply: chess.history().length,
+    pgn: appendToPgn(pgn, ply, move.san) ?? chess.pgn(),
+    ply: ply + 1,
     outcome: detectOutcome(chess),
   };
+}
+
+/**
+ * chess.js's pgn() output for a game started from the initial position with
+ * no headers set: the seven-tag roster, a blank line, the moves, then the
+ * result token, which stays "*" (chess.js never sets Result).
+ */
+const PGN_HEADER = new Chess().pgn().replace(/\n \*$/, "");
+const PGN_TAIL = " *";
+
+/**
+ * The PGN after appending the move `san` at half-move `ply` (0-based), in
+ * exactly chess.js's format, so clients comparing against their own
+ * chess.pgn() see equal strings. Returns null when `pgn` isn't in that
+ * format, so the caller can fall back to chess.pgn().
+ */
+export function appendToPgn(pgn: string, ply: number, san: string): string | null {
+  const prefix = ply % 2 === 0 ? `${ply / 2 + 1}. ` : "";
+  if (ply === 0) return pgn ? null : `${PGN_HEADER}\n\n${prefix}${san}${PGN_TAIL}`;
+  if (!pgn.startsWith(`${PGN_HEADER}\n\n`) || !pgn.endsWith(PGN_TAIL)) return null;
+  return `${pgn.slice(0, -PGN_TAIL.length)} ${prefix}${san}${PGN_TAIL}`;
 }
 
 /**

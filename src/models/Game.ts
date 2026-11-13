@@ -84,8 +84,11 @@ export interface GameResponse {
   blackPlayer: PlayerResponse;
 }
 
+/** A game in the history list: no move list or position (open the game for those). */
+export type GameListItem = Omit<GameResponse, "pgn" | "fen">;
+
 export interface PaginatedGamesResponse {
-  data: GameResponse[];
+  data: GameListItem[];
   pagination: {
     page: number;
     limit: number;

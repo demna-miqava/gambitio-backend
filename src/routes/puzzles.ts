@@ -18,15 +18,17 @@ const puzzlesQuery = z.object({
   /** Lichess theme key, e.g. "fork" or "mateIn2" */
   theme: z.string().regex(/^[A-Za-z0-9]{1,40}$/).optional(),
   /**
-   * ascending: easiest first (Rush / Survival).
-   * rated: Infinite mode, starts near the user's puzzle rating and skips
-   * puzzles already attempted.
+   * ascending: easiest first (Rush / Survival), solutions included.
+   * rated: Infinite mode, starts near the user's puzzle rating, skips
+   * puzzles already attempted, and sends no solutions. The two modes serve
+   * disjoint halves of the puzzles (see RATED_POOL_SQL).
    */
   mode: z.enum(["ascending", "rated"]).default("ascending"),
 });
 
 const solveParams = z.object({ id: z.string().min(1).max(32) });
-const attemptBody = z.object({ success: z.boolean() });
+const uci = z.string().regex(/^[a-h][1-8][a-h][1-8][qrbn]?$/);
+const checkBody = z.object({ moves: z.array(uci).min(1).max(30) });
 
 export async function puzzleRoutes(fastify: FastifyInstance) {
   const puzzleService = new PuzzleService(fastify);
@@ -46,7 +48,10 @@ export async function puzzleRoutes(fastify: FastifyInstance) {
       data: page.map((p) => ({
         id: p.id,
         fen: p.fen,
-        moves: p.moves.split(" "),
+        // Rated puzzles are checked move by move (POST /puzzles/:id/check);
+        // their solution is only sent once the puzzle is over
+        moves: mode === "rated" ? [] : p.moves.split(" "),
+        ...(mode === "rated" && { hidden: true }),
         rating: p.rating,
         themes: p.themes ?? [],
       })),
@@ -63,16 +68,35 @@ export async function puzzleRoutes(fastify: FastifyInstance) {
   });
 
   /**
-   * POST /api/puzzles/:id/attempt { success }
-   * Rated mode (Infinite). The first attempt at a puzzle changes the user's
-   * puzzle rating; repeats are unrated. Success also marks it solved.
-   * Returns { rated, puzzleRating, highestPuzzleRating, ratingChange }.
+   * POST /api/puzzles/:id/check { moves: ["e2e4", ...] }
+   * Rated mode (Infinite). The user's moves so far; the server answers with
+   * the reply to play ({ result: "continue", line }) or the outcome with the
+   * full solution and the rating change ({ result: "solved" | "failed",
+   * line, attempt }). Only the first outcome on a puzzle is rated.
    */
-  fastify.post("/puzzles/:id/attempt", { preHandler: authMiddleware }, async (request) => {
-    const { id } = solveParams.parse(request.params);
-    const { success } = attemptBody.parse(request.body);
-    return puzzleService.attempt(request.user!.id, id, success);
-  });
+  fastify.post(
+    "/puzzles/:id/check",
+    { preHandler: authMiddleware, config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    async (request) => {
+      const { id } = solveParams.parse(request.params);
+      const { moves } = checkBody.parse(request.body);
+      return puzzleService.check(request.user!.id, id, moves);
+    }
+  );
+
+  /**
+   * POST /api/puzzles/:id/reveal
+   * Rated mode: the solution, for a hint or "show solution". Counts as a miss
+   * if the puzzle wasn't over yet.
+   */
+  fastify.post(
+    "/puzzles/:id/reveal",
+    { preHandler: authMiddleware, config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (request) => {
+      const { id } = solveParams.parse(request.params);
+      return puzzleService.reveal(request.user!.id, id);
+    }
+  );
 
   /**
    * POST /api/puzzles/:id/solve

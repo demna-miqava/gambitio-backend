@@ -18,9 +18,17 @@ Production: `npm run build && npm start`.
 Required env (validated at startup in `src/config.ts`): `POSTGRES_CONNECTION_STRING`,
 `REDIS_URL`, `CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `FRONTEND_URL`, `PORT`.
 Optional: `EXTRA_FRONTEND_ORIGINS`, comma-separated origins allowed besides
-`FRONTEND_URL` (e.g. your LAN address, to open the dev server from a phone).
+`FRONTEND_URL` (e.g. your LAN address, to open the dev server from a phone);
+`PG_POOL_MAX` (Postgres connections, default 15); `PG_STATEMENT_TIMEOUT_MS`
+(longest a query may run, default 5000).
 
 ### Puzzles
+
+Puzzles are split in two halves by id: rated (Infinite) mode serves one,
+never sends its solutions and checks every move on the server
+(`POST /api/puzzles/:id/check`); Rush and Survival serve the other half with
+solutions, to play locally. See `RATED_POOL_SQL` in
+`src/services/puzzleService.ts`.
 
 Migration 005 seeds a handful of verified puzzles. Load the full Lichess set
 (https://database.lichess.org/#puzzles, decompress with `zstd -d`):
@@ -55,6 +63,13 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
 - `src/services/gameService.ts` – game creation (the only place games are
   created), ending games and rating updates
 - `src/services/matchmakingService.ts` – queue pairing with `FOR UPDATE SKIP LOCKED`
-- `src/realtime/hub.ts` – WebSocket delivery via Redis pub/sub, presence, heartbeats
-- `src/jobs.ts` – clock and matchmaking sweepers (safe on every instance)
+- `src/game/positionCache.ts` – parsed positions of live games, so a move
+  doesn't replay the game from its PGN
+- `src/realtime/hub.ts` – WebSocket delivery (local first, then Redis pub/sub
+  to other instances), presence with one liveness key per instance
+- `src/realtime/socket.ts` – socket message handling, rate limit, session
+  re-authentication
+- `src/jobs.ts` – backstop sweeps that only run while there's something to
+  do; games end at their deadline through per-game timers
+  (`LiveGameService.watchDeadline`)
 - `migrations/` – SQL migrations; `scripts/migrate.ts` applies them

@@ -26,6 +26,8 @@ export async function startTestApp(): Promise<{ app: FastifyInstance; baseUrl: s
       PORT: 0,
       POSTGRES_CONNECTION_STRING: TEST_POSTGRES_URL!,
       REDIS_URL: TEST_REDIS_URL!,
+      PG_POOL_MAX: 10,
+      PG_STATEMENT_TIMEOUT_MS: 5_000,
       CLERK_PUBLISHABLE_KEY: "pk_test",
       CLERK_SECRET_KEY: "sk_test",
       FRONTEND_URL: "http://localhost:5173",
@@ -44,6 +46,8 @@ export async function resetDb(app: FastifyInstance) {
      RESTART IDENTITY CASCADE`
   );
   await app.redis.flushDb();
+  // Ids restart, so cached Clerk id -> user entries would point at old rows
+  app.users.clear();
 }
 
 export async function createUser(
@@ -73,8 +77,8 @@ export interface TestSocket {
 }
 
 export async function connect(baseUrl: string, path: string, clerkId: string): Promise<TestSocket> {
-  const separator = path.includes("?") ? "&" : "?";
-  const ws = new WebSocket(`ws://${baseUrl}/api/ws${path}${separator}token=${clerkId}`);
+  // The token travels as a subprotocol, like the browser sends it
+  const ws = new WebSocket(`ws://${baseUrl}/api/ws${path}`, ["gambitio", `auth.${clerkId}`]);
   const messages: any[] = [];
   const consumed = new Set<any>();
   const waiters: (() => void)[] = [];

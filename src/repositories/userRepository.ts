@@ -21,6 +21,17 @@ export class UserRepository {
     return rows[0] ?? null;
   }
 
+  /** A profile with its friend count, in one round trip. */
+  async findProfileById(id: number): Promise<(UserResponse & { friendCount: number }) | null> {
+    const { rows } = await this.fastify.pg.query<UserResponse & { friendCount: number }>(
+      `SELECT ${USER_RESPONSE_COLUMNS},
+         (SELECT COUNT(*)::int FROM friends WHERE "userOneId" = $1 OR "userTwoId" = $1) AS "friendCount"
+       FROM users WHERE id = $1`,
+      [id]
+    );
+    return rows[0] ?? null;
+  }
+
   async findByClerkId(clerkId: string): Promise<UserResponse | null> {
     const { rows } = await this.fastify.pg.query<UserResponse>(
       `SELECT ${USER_RESPONSE_COLUMNS} FROM users WHERE "clerkId" = $1`,

@@ -8,7 +8,10 @@ declare module "fastify" {
 }
 
 export async function registerRedis(fastify: FastifyInstance, url: string) {
-  const redisClient = createClient({ url });
+  // Commands fail at once while disconnected instead of queueing until
+  // Redis is back: callers treat Redis as optional where they can (caches)
+  // and would otherwise hang
+  const redisClient = createClient({ url, disableOfflineQueue: true });
 
   redisClient.on("error", (err) => {
     fastify.log.error({ err }, "Redis client error");

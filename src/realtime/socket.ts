@@ -55,6 +55,8 @@ export function onValidatedMessage<S extends z.ZodType>(
       sendError(socket, "Invalid JSON", "INVALID_MESSAGE");
       return;
     }
+    // Session refreshes are handled by keepAuthenticated
+    if (isAuthMessage(json)) return;
     const parsed = schema.safeParse(json);
     if (!parsed.success) {
       sendError(socket, "Invalid message", "INVALID_MESSAGE");
@@ -77,4 +79,55 @@ export function onValidatedMessage<S extends z.ZodType>(
 
   socket.on("message", onMessage);
   socket.on("error", (err) => log.warn({ err }, "WebSocket error"));
+}
+
+/**
+ * How long a socket stays open on one session token. The client sends a
+ * fresh one ({ type: "auth", token }) every few minutes; a socket that
+ * hasn't by the deadline is closed, so a signed-out or revoked session
+ * doesn't keep a socket alive. Mutable so tests can shorten it.
+ */
+export const reauthTimings = { validForMs: 10 * 60_000, checkEveryMs: 60_000 };
+
+function isAuthMessage(json: unknown): json is { type: "auth"; token?: unknown } {
+  return typeof json === "object" && json !== null && (json as { type?: unknown }).type === "auth";
+}
+
+/** Closes the socket once its session lapses; see reauthTimings. */
+export function keepAuthenticated(
+  socket: WebSocket,
+  options: {
+    clerkId: string;
+    verifyToken: (token: string) => Promise<string | null>;
+    log: FastifyBaseLogger;
+  }
+): void {
+  let validUntil = Date.now() + reauthTimings.validForMs;
+  const expire = (reason: string) => socket.close(4001, reason);
+
+  socket.on("message", (raw: Buffer) => {
+    let json: unknown;
+    try {
+      json = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    if (!isAuthMessage(json)) return;
+    const token = typeof json.token === "string" ? json.token : null;
+    if (!token || token.length > 8192) return expire("Invalid session");
+    options
+      .verifyToken(token)
+      .then((clerkId) => {
+        // Another user's token can't take over this socket
+        if (clerkId !== options.clerkId) return expire("Invalid session");
+        validUntil = Date.now() + reauthTimings.validForMs;
+      })
+      .catch((err) => options.log.warn({ err }, "Socket re-authentication failed"));
+  });
+
+  const timer = setInterval(() => {
+    if (Date.now() > validUntil) expire("Session expired");
+  }, reauthTimings.checkEveryMs);
+  timer.unref();
+  socket.on("close", () => clearInterval(timer));
 }

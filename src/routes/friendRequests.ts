@@ -2,11 +2,9 @@ import type { FastifyInstance } from "fastify";
 import { FriendService } from "../services/friendService.js";
 import { sendFriendRequestSchema, requestIdParamSchema } from "../schemas/friendSchemas.js";
 import { authMiddleware } from "../middleware/auth.js";
-import { UserRepository } from "../repositories/userRepository.js";
 
 export async function friendRequestsRoutes(fastify: FastifyInstance) {
   const friendService = new FriendService(fastify);
-  const userRepository = new UserRepository(fastify);
 
   /**
    * POST /api/friend-requests
@@ -14,11 +12,9 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
    */
   fastify.post("/friend-requests", { preHandler: authMiddleware }, async (request, reply) => {
     const { receiverId } = sendFriendRequestSchema.parse(request.body);
-    const sender = await userRepository.findById(request.user!.id);
     const friendRequest = await friendService.sendFriendRequest(
       request.user!.id,
       request.user!.username,
-      sender?.avatarUrl ?? null,
       receiverId
     );
     return reply.status(201).send({ data: friendRequest });

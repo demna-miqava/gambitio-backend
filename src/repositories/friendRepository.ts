@@ -7,10 +7,6 @@ import type {
   IncomingFriendRequestResponse,
   OutgoingFriendRequestResponse,
 } from "../models/Friend.js";
-import {
-  FriendRequestNotFoundError,
-  UserNotFoundError,
-} from "../errors/index.js";
 
 /**
  * Raw database row types for query results
@@ -23,13 +19,6 @@ interface FriendListItemRaw {
   blitzRating: number | null;
   bulletRating: number | null;
   rapidRating: number | null;
-  total_count?: string;
-}
-
-interface FriendSuggestionRaw {
-  id: number;
-  username: string;
-  avatarUrl: string | null;
   total_count?: string;
 }
 
@@ -57,64 +46,42 @@ export class FriendRepository {
   }
 
   /**
-   * Private helper: Builds the CASE condition for bidirectional friend joins
-   * Returns SQL fragment for use in JOIN ON clauses
+   * Join condition from a friends row to the *other* user. It must stay in
+   * the form `u.id = <expression of f>`: that lets Postgres look the friend
+   * up by primary key. A CASE around the whole comparison instead makes it
+   * compare every user against every friendship row.
    */
   private buildFriendJoinCondition(userParam: string = "$1"): string {
-    return `
-      CASE
-        WHEN f."userOneId" = ${userParam} THEN u.id = f."userTwoId"
-        WHEN f."userTwoId" = ${userParam} THEN u.id = f."userOneId"
-        ELSE FALSE
-      END
-    `;
+    return `u.id = CASE WHEN f."userOneId" = ${userParam} THEN f."userTwoId" ELSE f."userOneId" END`;
   }
 
   /**
-   * Get friend suggestions for a user (paginated)
-   * Excludes users who are already friends with the given user
-   *
-   * @param userId - The ID of the user requesting suggestions
-   * @param limit - Maximum number of results to return
-   * @param offset - Number of results to skip for pagination
-   * @returns Object containing suggestions array and total count
+   * A few users to suggest, starting at a random point in the id range (so
+   * different people see different suggestions) and wrapping around. Not
+   * the user, not deleted accounts, not existing friends. Each half is a
+   * primary-key range scan that stops after `limit` rows.
    */
-  async getFriendSuggestions(
-    userId: number,
-    limit: number,
-    offset: number
-  ): Promise<{ suggestions: FriendSuggestion[]; total: number }> {
-    const client = this.fastify.pg;
-    // Use CTE and window function for efficient single-query approach
-    const { rows } = await client.query<FriendSuggestionRaw>(
+  async getFriendSuggestions(userId: number, limit: number): Promise<FriendSuggestion[]> {
+    const pick = (range: string) => `(
+        SELECT id, username, "avatarUrl" FROM users
+        WHERE ${range} AND id <> $1 AND "clerkId" IS NOT NULL -- deleted accounts
+          AND id NOT IN (SELECT friend_id FROM user_friends)
+        ORDER BY id LIMIT $2)`;
+    const { rows } = await this.fastify.pg.query<FriendSuggestion>(
       `
       WITH user_friends AS (
         ${this.buildExcludeFriendsSubquery()}
+      ), start AS (
+        SELECT floor(random() * (COALESCE((SELECT max(id) FROM users), 0) + 1))::int AS id
       )
-      SELECT
-        id,
-        username,
-        "avatarUrl",
-        COUNT(*) OVER() as total_count
-      FROM users
-      WHERE id != $1
-        AND "clerkId" IS NOT NULL -- deleted accounts
-        AND id NOT IN (SELECT friend_id FROM user_friends)
-      ORDER BY username
-      LIMIT $2 OFFSET $3
+      ${pick(`id >= (SELECT id FROM start)`)}
+      UNION ALL
+      ${pick(`id < (SELECT id FROM start)`)}
+      LIMIT $2
       `,
-      [userId, limit, offset]
+      [userId, limit]
     );
-
-    const total = rows[0] ? parseInt(rows[0].total_count || "0", 10) : 0;
-
-    const suggestions: FriendSuggestion[] = rows.map((row) => ({
-      id: row.id,
-      username: row.username,
-      avatarUrl: row.avatarUrl,
-    }));
-
-    return { suggestions, total };
+    return rows.map((row) => ({ id: row.id, username: row.username, avatarUrl: row.avatarUrl }));
   }
 
   /**
@@ -197,67 +164,82 @@ export class FriendRepository {
   }
 
   /**
-   * Search for users by username (excluding current friends)
-   * Used for finding new users to send friend requests to
-   *
-   * @param userId - The ID of the user performing the search
-   * @param searchQuery - Search string to filter users by username
-   * @param limit - Maximum number of results to return
-   * @param offset - Number of results to skip for pagination
-   * @returns Object containing suggestions array and total count
+   * Users whose name contains the query (starts with it, for queries under
+   * three characters), excluding the user and their friends, A to Z. Both
+   * forms can use the trigram index on username (migration 014).
    */
-  async searchUsers(
-    userId: number,
-    searchQuery: string,
-    limit: number,
-    offset: number
-  ): Promise<{ suggestions: FriendSuggestion[]; total: number }> {
-    const client = this.fastify.pg;
-    const searchPattern = `%${escapeLike(searchQuery)}%`;
-
-    // Use CTE and window function for efficient single-query approach
-    const { rows } = await client.query<FriendSuggestionRaw>(
+  async searchUsers(userId: number, searchQuery: string, limit: number): Promise<FriendSuggestion[]> {
+    const escaped = escapeLike(searchQuery);
+    const searchPattern = searchQuery.length < 3 ? `${escaped}%` : `%${escaped}%`;
+    const { rows } = await this.fastify.pg.query<FriendSuggestion>(
       `
       WITH user_friends AS (
         ${this.buildExcludeFriendsSubquery()}
       )
-      SELECT
-        id,
-        username,
-        "avatarUrl",
-        COUNT(*) OVER() as total_count
+      SELECT id, username, "avatarUrl"
       FROM users
       WHERE id != $1
         AND "clerkId" IS NOT NULL -- deleted accounts
         AND username ILIKE $2 ESCAPE '\\'
         AND id NOT IN (SELECT friend_id FROM user_friends)
-      ORDER BY username
-      LIMIT $3 OFFSET $4
+      -- lower(username) is the unique index's order: for a common prefix
+      -- Postgres walks it and stops after $3 matches, for a rare one it uses
+      -- the trigram index and sorts the few matches
+      ORDER BY lower(username)
+      LIMIT $3
       `,
-      [userId, searchPattern, limit, offset]
+      [userId, searchPattern, limit]
     );
-
-    const total = rows[0] ? parseInt(rows[0].total_count || "0", 10) : 0;
-
-    const suggestions: FriendSuggestion[] = rows.map((row) => ({
-      id: row.id,
-      username: row.username,
-      avatarUrl: row.avatarUrl,
-    }));
-
-    return { suggestions, total };
+    return rows.map((row) => ({ id: row.id, username: row.username, avatarUrl: row.avatarUrl }));
   }
 
   /**
-   * Create a new friend request
-   *
-   * @param senderId - ID of the user sending the request
-   * @param senderUsername - Username of the sender
-   * @param senderAvatarUrl - Avatar URL of the sender
-   * @param receiverId - ID of the user receiving the request
-   * @param receiverUsername - Username of the receiver
-   * @param receiverAvatarUrl - Avatar URL of the receiver
-   * @returns The created friend request
+   * Everything sending a request depends on, in one round trip: the
+   * receiver (not a deleted account), the sender's avatar, and whether the
+   * two are already friends or have a request pending in either direction.
+   */
+  async getRequestContext(senderId: number, receiverId: number): Promise<{
+    receiver: { id: number; username: string; avatarUrl: string | null } | null;
+    senderAvatarUrl: string | null;
+    areFriends: boolean;
+    requestExists: boolean;
+  }> {
+    const { rows } = await this.fastify.pg.query<{
+      receiverId: number | null;
+      receiverUsername: string | null;
+      receiverAvatarUrl: string | null;
+      senderAvatarUrl: string | null;
+      areFriends: boolean;
+      requestExists: boolean;
+    }>(
+      `SELECT r.id AS "receiverId", r.username AS "receiverUsername", r."avatarUrl" AS "receiverAvatarUrl",
+         (SELECT "avatarUrl" FROM users WHERE id = $1) AS "senderAvatarUrl",
+         EXISTS (SELECT 1 FROM friends
+                 WHERE ("userOneId" = $1 AND "userTwoId" = $2) OR ("userOneId" = $2 AND "userTwoId" = $1))
+           AS "areFriends",
+         EXISTS (SELECT 1 FROM friend_requests
+                 WHERE ("senderId" = $1 AND "receiverId" = $2) OR ("senderId" = $2 AND "receiverId" = $1))
+           AS "requestExists"
+       FROM (SELECT 1) one
+       LEFT JOIN users r ON r.id = $2 AND r."clerkId" IS NOT NULL`,
+      [senderId, receiverId]
+    );
+    const row = rows[0]!;
+    return {
+      receiver:
+        row.receiverId === null
+          ? null
+          : { id: row.receiverId, username: row.receiverUsername!, avatarUrl: row.receiverAvatarUrl },
+      senderAvatarUrl: row.senderAvatarUrl,
+      areFriends: row.areFriends,
+      requestExists: row.requestExists,
+    };
+  }
+
+  /**
+   * Creates a friend request. Returns null if one already exists between the
+   * two users in either direction: the unique index on the unordered pair
+   * (migration 014) settles two users requesting each other at once.
    */
   async createFriendRequest(
     senderId: number,
@@ -266,13 +248,14 @@ export class FriendRepository {
     receiverId: number,
     receiverUsername: string,
     receiverAvatarUrl: string | null
-  ): Promise<FriendRequest> {
+  ): Promise<FriendRequest | null> {
     const client = this.fastify.pg;
     const { rows } = await client.query<FriendRequest>(
       `INSERT INTO friend_requests (
         "senderId", "receiverId", "senderUsername", "receiverUsername",
         "senderAvatarUrl", "receiverAvatarUrl"
       ) VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT DO NOTHING
       RETURNING *`,
       [
         senderId,
@@ -284,7 +267,7 @@ export class FriendRepository {
       ]
     );
 
-    return rows[0]!;
+    return rows[0] ?? null;
   }
 
   /**
@@ -325,47 +308,6 @@ export class FriendRepository {
   }
 
   /**
-   * Check if a friend request exists between two users (bidirectional)
-   *
-   * @param senderId - ID of one user
-   * @param receiverId - ID of the other user
-   * @returns True if a request exists in either direction
-   */
-  async friendRequestExists(
-    senderId: number,
-    receiverId: number
-  ): Promise<boolean> {
-    const client = this.fastify.pg;
-    const { rows } = await client.query(
-      `SELECT id FROM friend_requests
-       WHERE ("senderId" = $1 AND "receiverId" = $2)
-       OR ("senderId" = $2 AND "receiverId" = $1)`,
-      [senderId, receiverId]
-    );
-
-    return rows.length > 0;
-  }
-
-  /**
-   * Check if two users are friends (bidirectional)
-   *
-   * @param userOneId - ID of one user
-   * @param userTwoId - ID of the other user
-   * @returns True if the users are friends
-   */
-  async areFriends(userOneId: number, userTwoId: number): Promise<boolean> {
-    const client = this.fastify.pg;
-    const { rows } = await client.query(
-      `SELECT id FROM friends
-       WHERE ("userOneId" = $1 AND "userTwoId" = $2)
-       OR ("userOneId" = $2 AND "userTwoId" = $1)`,
-      [userOneId, userTwoId]
-    );
-
-    return rows.length > 0;
-  }
-
-  /**
    * Get a friend request by its ID
    *
    * @param requestId - The ID of the friend request
@@ -382,26 +324,19 @@ export class FriendRepository {
   }
 
   /**
-   * Accept a friend request, creating a friendship and deleting the request
-   * This operation is performed within a transaction to ensure atomicity
-   *
-   * @param requestId - The ID of the friend request to accept
-   * @returns The created friendship
-   * @throws {FriendRequestNotFoundError} If the friend request doesn't exist
+   * Accepts a request addressed to `receiverId`: deletes it and creates the
+   * friendship in one transaction. Deleting first claims the request, so two
+   * concurrent accepts can't both succeed. Returns null if there is no such
+   * request for this receiver (the caller works out which error applies).
    */
-  async acceptFriendRequest(requestId: number): Promise<Friend> {
+  async acceptFriendRequest(requestId: number, receiverId: number): Promise<Friend | null> {
     return this.fastify.pg.transact(async (client) => {
-      // Deleting first claims the request, so two concurrent accepts can't both succeed
       const { rows: requestRows } = await client.query<FriendRequest>(
-        `DELETE FROM friend_requests WHERE id = $1 RETURNING *`,
-        [requestId]
+        `DELETE FROM friend_requests WHERE id = $1 AND "receiverId" = $2 RETURNING *`,
+        [requestId, receiverId]
       );
       const request = requestRows[0];
-      if (!request) {
-        throw new FriendRequestNotFoundError(
-          `Friend request with ID ${requestId} not found`
-        );
-      }
+      if (!request) return null;
 
       const { rows: friendRows } = await client.query<Friend>(
         `INSERT INTO friends ("userOneId", "userTwoId", "userOneUsername", "userTwoUsername")
@@ -419,17 +354,19 @@ export class FriendRepository {
   }
 
   /**
-   * Delete a friend request (can be used for both declining and canceling)
-   * Decline = receiver deletes incoming request
-   * Cancel = sender deletes outgoing request
-   *
-   * @param requestId - The ID of the friend request to delete
+   * Deletes a request if `userId` is on the given side of it (the receiver
+   * declines, the sender cancels). Returns false if nothing was deleted.
    */
-  async deleteFriendRequest(requestId: number): Promise<void> {
-    const client = this.fastify.pg;
-    await client.query(`DELETE FROM friend_requests WHERE id = $1`, [
-      requestId,
-    ]);
+  async deleteFriendRequestAs(
+    requestId: number,
+    userId: number,
+    side: "senderId" | "receiverId"
+  ): Promise<boolean> {
+    const { rowCount } = await this.fastify.pg.query(
+      `DELETE FROM friend_requests WHERE id = $1 AND "${side}" = $2`,
+      [requestId, userId]
+    );
+    return (rowCount ?? 0) > 0;
   }
 
   /**

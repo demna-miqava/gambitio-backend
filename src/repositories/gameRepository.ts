@@ -10,6 +10,12 @@ const GAME_COLUMNS = `
   "drawOfferedBy", "rematchRequestedBy", "rematchGameId",
   "whiteRatingChange", "blackRatingChange", "botId", rated`;
 
+/** GAME_COLUMNS without the move list and position, for lists. */
+const GAME_LIST_COLUMNS = GAME_COLUMNS.replace(/\bpgn, fen, /, "");
+if (GAME_LIST_COLUMNS === GAME_COLUMNS) throw new Error("GAME_LIST_COLUMNS must drop pgn and fen");
+
+export type GameListRow = Omit<Game, "pgn" | "fen">;
+
 export interface NewGame {
   whiteId: number;
   blackId: number;
@@ -55,6 +61,21 @@ export const gameRepository = {
       [gameId]
     );
     return rows[0] ?? null;
+  },
+
+  /**
+   * Opens a transaction on `client` and locks the game row, in one round
+   * trip: both statements go out as a single simple query, which can't
+   * carry parameters, so the id is inlined (after checking it is a plain
+   * positive integer). Returns null, with the transaction still open, if
+   * there is no such game.
+   */
+  async beginAndLock(client: Queryable, gameId: number): Promise<Game | null> {
+    if (!Number.isSafeInteger(gameId) || gameId <= 0) throw new Error(`Invalid game id ${gameId}`);
+    const results = (await client.query(
+      `BEGIN; SELECT ${GAME_COLUMNS} FROM games WHERE id = ${gameId} FOR UPDATE`
+    )) as unknown as { rows: Game[] }[];
+    return results[1]?.rows[0] ?? null;
   },
 
   /** Locks the row for the rest of the transaction; all game state changes go through this. */
@@ -219,6 +240,26 @@ export const gameRepository = {
     return rows[0]?.id ?? null;
   },
 
+  /** Just what's needed to tell whether a game's deadline has passed (no lock, no PGN). */
+  async findDeadline(
+    db: Queryable,
+    gameId: number
+  ): Promise<{ status: Game["status"]; deadlineAt: Date | null; whiteId: number | null; blackId: number | null } | null> {
+    const { rows } = await db.query(
+      `SELECT status, "deadlineAt", "whiteId", "blackId" FROM games WHERE id = $1`,
+      [gameId]
+    );
+    return rows[0] ?? null;
+  },
+
+  /** Every game in progress with its deadline, to arm deadline timers at startup. */
+  async findLiveDeadlines(db: Queryable): Promise<{ id: number; deadlineAt: Date | null }[]> {
+    const { rows } = await db.query<{ id: number; deadlineAt: Date | null }>(
+      `SELECT id, "deadlineAt" FROM games WHERE status = 'in_progress'`
+    );
+    return rows;
+  },
+
   async findIdsPastDeadline(db: Queryable, now: Date, limit: number): Promise<number[]> {
     const { rows } = await db.query<{ id: number }>(
       `SELECT id FROM games
@@ -232,7 +273,7 @@ export const gameRepository = {
   /**
    * Games in progress where a friend of the user plays, newest first. The
    * user's own games are left out. In-progress games are few, and the partial
-   * index games_deadline_idx covers exactly them.
+   * indexes games_white_live_idx / games_black_live_idx cover exactly them.
    */
   async findLiveForFriends(db: Queryable, userId: number, limit: number): Promise<LiveGame[]> {
     const { rows } = await db.query<LiveGame>(
@@ -264,22 +305,44 @@ export const gameRepository = {
     return rows;
   },
 
-  /** Games for a user, newest first, bot games included. Aborted games are hidden. */
-  async findByUserId(
-    db: Queryable,
-    userId: number,
-    limit: number,
-    offset: number
-  ): Promise<{ games: Game[]; total: number }> {
-    const where = `("whiteId" = $1 OR "blackId" = $1) AND result IS DISTINCT FROM 'aborted'`;
-    const [{ rows: countRows }, { rows }] = await Promise.all([
-      db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM games WHERE ${where}`, [userId]),
-      db.query<Game>(
-        `SELECT ${GAME_COLUMNS} FROM games WHERE ${where}
-         ORDER BY "createdAt" DESC LIMIT $2 OFFSET $3`,
-        [userId, limit, offset]
-      ),
-    ]);
-    return { games: rows, total: parseInt(countRows[0]?.count ?? "0", 10) };
+  /**
+   * One page of a user's games, newest first, bot games included. Aborted
+   * games are hidden. Without pgn and fen: the history list doesn't show
+   * them, and they are most of a row's size.
+   *
+   * Written as two scans, one per color, each walking its (player,
+   * createdAt DESC) index and stopping after offset + limit rows. A single
+   * WHERE "whiteId" = $1 OR "blackId" = $1 can't be read in index order, so
+   * it would fetch and sort every game the user ever played.
+   */
+  async findPageByUserId(db: Queryable, userId: number, limit: number, offset: number): Promise<GameListRow[]> {
+    const side = (column: string, extra = "") => `(
+        SELECT ${GAME_LIST_COLUMNS} FROM games
+        WHERE "${column}" = $1 ${extra} AND result IS DISTINCT FROM 'aborted'
+        ORDER BY "createdAt" DESC, id DESC LIMIT $2)`;
+    const { rows } = await db.query<GameListRow>(
+      `SELECT * FROM (
+         ${side("whiteId")}
+         UNION ALL
+         ${side("blackId", `AND "whiteId" IS DISTINCT FROM $1`)}
+       ) page
+       ORDER BY "createdAt" DESC, id DESC
+       LIMIT $3 OFFSET $4`,
+      [userId, offset + limit, limit, offset]
+    );
+    return rows;
+  },
+
+  /** Games findPageByUserId can return, counted per color so each count uses its index. */
+  async countByUserId(db: Queryable, userId: number): Promise<number> {
+    const { rows } = await db.query<{ n: number }>(
+      `SELECT
+         (SELECT COUNT(*) FROM games WHERE "whiteId" = $1 AND result IS DISTINCT FROM 'aborted')
+       + (SELECT COUNT(*) FROM games
+          WHERE "blackId" = $1 AND "whiteId" IS DISTINCT FROM $1 AND result IS DISTINCT FROM 'aborted')
+         AS n`,
+      [userId]
+    );
+    return Number(rows[0]?.n ?? 0);
   },
 };

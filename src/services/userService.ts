@@ -113,6 +113,9 @@ export class UserService {
         );
       });
     }
+    this.fastify.users.forget(clerkId);
+    // Open sockets were authenticated before; close them on every instance
+    if (user) await this.fastify.hub.closeUserSockets(user.id).catch(() => {});
     await this.fastify.authProvider.deleteUser(clerkId);
   }
 

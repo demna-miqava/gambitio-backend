@@ -18,28 +18,24 @@ export class SettingsRepository {
   }
 
   /**
-   * Update user settings (partial update)
+   * Partial update in one statement, creating the row with defaults first if
+   * it doesn't exist. Field names come from the validated settings schema.
    */
-  async updateSettings(
-    userId: number,
-    updates: UpdateSettingsRequest
-  ): Promise<Settings> {
-    const client = this.fastify.pg;
-    // Build dynamic SET clause
+  async updateSettings(userId: number, updates: UpdateSettingsRequest): Promise<Settings> {
     const fields = Object.keys(updates);
-    const setClause = fields
-      .map((field, index) => `"${field}" = $${index + 2}`)
-      .join(", ");
-    const values = Object.values(updates);
-
-    const { rows } = await client.query<Settings>(
-      `UPDATE user_settings
-       SET ${setClause}
-       WHERE "userId" = $1
+    if (fields.length === 0) {
+      return (await this.getSettings(userId)) ?? (await this.createDefaultSettings(userId));
+    }
+    const columns = fields.map((field) => `"${field}"`).join(", ");
+    const placeholders = fields.map((_, index) => `$${index + 2}`).join(", ");
+    const setClause = fields.map((field) => `"${field}" = EXCLUDED."${field}"`).join(", ");
+    const { rows } = await this.fastify.pg.query<Settings>(
+      `INSERT INTO user_settings ("userId", ${columns})
+       VALUES ($1, ${placeholders})
+       ON CONFLICT ("userId") DO UPDATE SET ${setClause}
        RETURNING *`,
-      [userId, ...values]
+      [userId, ...Object.values(updates)]
     );
-
     return rows[0]!;
   }
 

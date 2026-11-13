@@ -28,15 +28,17 @@
 			"/api/*"
 		],
 	},
-	// The backend (Dockerfile). "lite" is 1/16 vCPU and 256 MiB, plenty for a
-	// handful of players. One instance: worker/index.ts always asks for the
-	// same one, so everyone is on the same game server.
+	// The backend (Dockerfile). "basic" is 1/4 vCPU and 1 GiB. ("lite", 1/16
+	// vCPU and 256 MiB, is cheaper but only fits a handful of concurrent
+	// games: moves, stats and sockets all share that one slice of a core.)
+	// worker/index.ts spreads requests over BACKEND_INSTANCES of these (see
+	// "vars"); max_instances is the ceiling that setting may go up to.
 	"containers": [
 		{
 			"class_name": "Backend",
 			"image": "./Dockerfile",
-			"instance_type": "lite",
-			"max_instances": 1,
+			"instance_type": "basic",
+			"max_instances": 4,
 		},
 	],
 	"durable_objects": {
@@ -57,6 +59,10 @@
 		// The site's address, with https://, matching routes[0].pattern. The
 		// backend uses it for CORS and to check Clerk session tokens.
 		"SITE_ORIGIN": "https://gambitio.example.com",
+		// Backend containers to run, 1 to max_instances. 1 keeps everyone on one
+		// server; raise it when one instance runs out of CPU. Each instance adds
+		// its own container cost and a Redis heartbeat.
+		"BACKEND_INSTANCES": "1",
 	},
 	"observability": {
 		"enabled": true,

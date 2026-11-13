@@ -25,6 +25,8 @@ export const gameClientMessageSchema = z.discriminatedUnion("type", [
     data: z.object({ accepted: z.boolean() }),
   }),
   z.object({ type: z.literal("cancel_rematch") }),
+  // The client's board drifted (a missed move): send the full state again
+  z.object({ type: z.literal("sync") }),
 ]);
 export type GameClientMessage = z.infer<typeof gameClientMessageSchema>;
 

@@ -1,19 +1,7 @@
 import { z } from "zod";
-import { paginationSchema } from "./pagination.js";
 
 /**
  * Search query schema with pagination and search term validation
- */
-export const searchQuerySchema = paginationSchema.extend({
-  q: z
-    .string()
-    .min(2, "Search query must be at least 2 characters")
-    .max(100, "Search query cannot exceed 100 characters")
-    .optional(),
-});
-
-/**
- * Suggestions query schema with optional search term
  */
 export const suggestionsQuerySchema = z.object({
   q: z
@@ -66,7 +54,6 @@ export const requestIdParamSchema = z.object({
 });
 
 // Type exports
-export type SearchQuery = z.infer<typeof searchQuerySchema>;
 export type SuggestionsQuery = z.infer<typeof suggestionsQuerySchema>;
 export type SendFriendRequest = z.infer<typeof sendFriendRequestSchema>;
 export type FriendIdParam = z.infer<typeof friendIdParamSchema>;

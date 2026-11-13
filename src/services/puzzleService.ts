@@ -1,7 +1,9 @@
 import type { FastifyInstance } from "fastify";
+import { Chess, type Square } from "chess.js";
 import { AppError } from "../errors/AppError.js";
 import { calculatePuzzleRating } from "../utils/puzzleRating.js";
 import { statsCacheKey } from "./statsService.js";
+import { cachedValue } from "../utils/cache.js";
 
 export interface PuzzleRow {
   id: string;
@@ -28,6 +30,11 @@ export interface AttemptResult {
   ratingChange: number;
 }
 
+/** POST /puzzles/:id/check and /reveal */
+export type CheckResult =
+  | { result: "continue"; line: string[] }
+  | { result: "solved" | "failed"; line: string[]; attempt: AttemptResult };
+
 export interface ThemeCount {
   theme: string;
   count: number;
@@ -39,6 +46,30 @@ export interface ThemeCount {
  */
 const RATED_START_BELOW = 50;
 const THEMES_CACHE_KEY = "puzzles:themes";
+
+/**
+ * The puzzles are split in two by id. Rated mode only serves (and only
+ * rates) one half, and never sends its solutions: the server checks each
+ * move. Rush and Survival serve the other half with solutions, to play
+ * locally. Otherwise one account could read a solution from the unrated
+ * feed and play it for rating. (Lichess ids use [0-9A-Za-z], which splits
+ * evenly by character code parity.)
+ */
+export const RATED_POOL_SQL = (alias: string) => `ascii(right(${alias}.id, 1)) % 2 = 0`;
+export const isRatedPool = (puzzleId: string) => puzzleId.charCodeAt(puzzleId.length - 1) % 2 === 0;
+
+/** Plays a UCI move; null if it's illegal. */
+function play(chess: Chess, uci: string) {
+  try {
+    return chess.move({
+      from: uci.slice(0, 2) as Square,
+      to: uci.slice(2, 4) as Square,
+      ...(uci[4] ? { promotion: uci[4] } : {}),
+    });
+  } catch {
+    return null;
+  }
+}
 /** Themes only change when puzzles are imported. */
 const THEMES_CACHE_SECONDS = 6 * 60 * 60;
 
@@ -70,6 +101,7 @@ export class PuzzleService {
     const values: unknown[] = [q.userId];
     const where: string[] = [
       `NOT EXISTS (SELECT 1 FROM solved_puzzles s WHERE s."userId" = $1 AND s."puzzleId" = p.id)`,
+      q.mode === "rated" ? RATED_POOL_SQL("p") : `NOT (${RATED_POOL_SQL("p")})`,
     ];
     if (q.mode === "rated") {
       where.push(
@@ -96,6 +128,67 @@ export class PuzzleService {
   }
 
   /**
+   * Checks the moves the user has played so far on a rated puzzle (UCI,
+   * their own moves only, in order) against the solution, which the client
+   * never sees until the puzzle is over. Returns the opponent's reply to
+   * continue, or the outcome with the full solution; the outcome is recorded
+   * as the rated attempt (see attempt()), so the rating never depends on
+   * what the client claims.
+   *
+   * Any checkmate is accepted, like on Lichess. A promotion on the right
+   * squares counts as the solution's promotion (the board promotes to a queen
+   * by default; the line returned says which piece it really was).
+   */
+  async check(userId: number, puzzleId: string, userMoves: string[]): Promise<CheckResult> {
+    const puzzle = await this.ratedPuzzle(puzzleId);
+    const line = puzzle.moves.split(" ");
+    const chess = new Chess(puzzle.fen);
+    const known: string[] = [];
+
+    for (let i = 0; i < userMoves.length; i++) {
+      const expected = line[2 * i];
+      if (!expected) throw new AppError("The puzzle is already over", "PUZZLE_OVER", 400);
+      const sent = userMoves[i]!;
+      const move = sent.slice(0, 4) === expected.slice(0, 4) && expected.length === 5 ? expected : sent;
+      if (!play(chess, move)) throw new AppError("Illegal move", "ILLEGAL_MOVE", 400);
+      known.push(move);
+
+      const correct = move === expected || chess.isCheckmate();
+      if (!correct) return this.finish(userId, puzzleId, line, false);
+      if (chess.isCheckmate() || 2 * i + 1 >= line.length) return this.finish(userId, puzzleId, line, true);
+
+      const reply = line[2 * i + 1]!;
+      play(chess, reply);
+      known.push(reply);
+    }
+    return { result: "continue", line: known };
+  }
+
+  /**
+   * The solution of a rated puzzle, for a hint or "show solution". Before
+   * the puzzle is over this counts as a miss, as a hinted solve always has.
+   */
+  async reveal(userId: number, puzzleId: string): Promise<CheckResult> {
+    const puzzle = await this.ratedPuzzle(puzzleId);
+    return this.finish(userId, puzzleId, puzzle.moves.split(" "), false);
+  }
+
+  private async ratedPuzzle(puzzleId: string): Promise<{ fen: string; moves: string }> {
+    if (!isRatedPool(puzzleId)) throw new AppError("Puzzle not found", "PUZZLE_NOT_FOUND", 404);
+    const { rows } = await this.fastify.pg.query<{ fen: string; moves: string }>(
+      `SELECT fen, moves FROM puzzles WHERE id = $1`,
+      [puzzleId]
+    );
+    if (!rows[0]) throw new AppError("Puzzle not found", "PUZZLE_NOT_FOUND", 404);
+    return rows[0];
+  }
+
+  private async finish(userId: number, puzzleId: string, line: string[], success: boolean): Promise<CheckResult> {
+    const attempt = await this.attempt(userId, puzzleId, success);
+    return { result: success ? "solved" : "failed", line, attempt };
+  }
+
+  /**
    * Records an attempt. The user's first attempt at a puzzle is rated: Elo
    * against the puzzle rating, stored in puzzle_attempts. Later attempts are
    * unrated. A successful attempt (rated or not) also marks the puzzle solved.
@@ -105,7 +198,7 @@ export class PuzzleService {
    * previous one wrote; the (userId, puzzleId) primary key makes a duplicate
    * submit unrated instead of counting twice.
    */
-  async attempt(userId: number, puzzleId: string, success: boolean): Promise<AttemptResult> {
+  private async attempt(userId: number, puzzleId: string, success: boolean): Promise<AttemptResult> {
     const result = await this.fastify.pg.transact(async (tx) => {
       const { rows: puzzles } = await tx.query<{ rating: number }>(
         `SELECT rating FROM puzzles WHERE id = $1`,
@@ -167,22 +260,19 @@ export class PuzzleService {
     });
 
     // Profile stats show the puzzle rating
-    if (result.rated) await this.fastify.redis.del(statsCacheKey(userId));
+    if (result.rated) await this.fastify.redis.del(statsCacheKey(userId)).catch(() => {});
     return result;
   }
 
   /** Every theme with its puzzle count, most common first. Cached in Redis. */
   async themes(): Promise<ThemeCount[]> {
-    const hit = await this.fastify.redis.get(THEMES_CACHE_KEY);
-    if (hit) return JSON.parse(hit) as ThemeCount[];
-    const { rows } = await this.fastify.pg.query<ThemeCount>(
-      `SELECT t AS theme, COUNT(*)::int AS count
-       FROM puzzles, unnest(themes) AS t
-       GROUP BY t ORDER BY count DESC, theme`
-    );
-    await this.fastify.redis.set(THEMES_CACHE_KEY, JSON.stringify(rows), {
-      EX: THEMES_CACHE_SECONDS,
+    return cachedValue(this.fastify.redis, this.fastify.log, THEMES_CACHE_KEY, THEMES_CACHE_SECONDS, async () => {
+      const { rows } = await this.fastify.pg.query<ThemeCount>(
+        `SELECT t AS theme, COUNT(*)::int AS count
+         FROM puzzles, unnest(themes) AS t
+         GROUP BY t ORDER BY count DESC, theme`
+      );
+      return rows;
     });
-    return rows;
   }
 }

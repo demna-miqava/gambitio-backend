@@ -13,6 +13,8 @@ import { LiveGameService } from "./services/liveGameService.js";
 import { MatchmakingService } from "./services/matchmakingService.js";
 import { ChallengeService } from "./services/challengeService.js";
 import { createJobs } from "./jobs.js";
+import { UserLookup } from "./plugins/userLookup.js";
+import { selectWsProtocol, wsHandshakeToken } from "./middleware/wsAuth.js";
 import { allowedOrigins, type Config } from "./config.js";
 import { userRoutes } from "./routes/users.js";
 import { gameRoutes } from "./routes/games.js";
@@ -33,6 +35,7 @@ declare module "fastify" {
     matchmaking: MatchmakingService;
     challenges: ChallengeService;
     jobs: ReturnType<typeof createJobs>;
+    users: UserLookup;
   }
 }
 
@@ -52,6 +55,53 @@ export interface BuildOptions {
 export function clientIp(req: { ip: string; headers: Record<string, string | string[] | undefined> }): string {
   const forwarded = req.headers["cf-connecting-ip"];
   return typeof forwarded === "string" && forwarded ? forwarded : req.ip;
+}
+
+/**
+ * The `sub` claim of the caller's session token (bearer header or the
+ * WebSocket handshake), read WITHOUT verifying the token. Only for rate-limit
+ * keys, where it is always paired with the IP: a forged token then only
+ * splits the forger's own traffic, it can't drain someone else's bucket.
+ */
+export function unverifiedSubject(req: {
+  headers: Record<string, string | string[] | undefined>;
+}): string | null {
+  const header = req.headers.authorization;
+  const token =
+    typeof header === "string" && header.startsWith("Bearer ")
+      ? header.slice(7)
+      : wsHandshakeToken(req.headers);
+  if (typeof token !== "string") return null;
+  const payload = token.split(".")[1];
+  if (!payload || payload.length > 4096) return null;
+  try {
+    const sub = (JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { sub?: unknown }).sub;
+    return typeof sub === "string" && sub.length <= 128 ? sub : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Requests per minute one IP may make in total, whatever tokens it sends.
+ * The per-user limit (300/min) is the one people normally meet; this only
+ * bounds a single address flooding with made-up tokens. Counted per instance.
+ */
+const PER_IP_PER_MINUTE = 3_000;
+
+function perIpLimiter() {
+  let windowStart = Date.now();
+  let counts = new Map<string, number>();
+  return (ip: string): boolean => {
+    const now = Date.now();
+    if (now - windowStart >= 60_000) {
+      windowStart = now;
+      counts = new Map();
+    }
+    const n = (counts.get(ip) ?? 0) + 1;
+    counts.set(ip, n);
+    return n <= PER_IP_PER_MINUTE;
+  };
 }
 
 /** Removes ?token=... from logged URLs: WebSocket auth tokens travel in the query string. */
@@ -106,19 +156,49 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
       clerkAuthProvider(config.CLERK_SECRET_KEY, allowedOrigins(config))
   );
 
-  await app.register(postgres, { connectionString: config.POSTGRES_CONNECTION_STRING });
+  await app.register(postgres, {
+    connectionString: config.POSTGRES_CONNECTION_STRING,
+    max: config.PG_POOL_MAX,
+    // Waiting this long for a free connection means the pool is saturated:
+    // fail the request rather than queue it indefinitely
+    connectionTimeoutMillis: 5_000,
+    // Idle connections close, so an idle server lets Neon suspend
+    idleTimeoutMillis: 30_000,
+    statement_timeout: config.PG_STATEMENT_TIMEOUT_MS,
+    // A transaction left open (a bug, a stuck await) releases its row locks
+    idle_in_transaction_session_timeout: 10_000,
+  });
   // Without a listener, an idle connection dropped by the database (or its
   // pooler, or Neon suspending) is an unhandled 'error' event and kills the
   // process. The pool discards the broken client and opens a new one.
   app.pg.pool.on("error", (err) => app.log.error({ err }, "Idle Postgres connection error"));
   await registerRedis(app, config.REDIS_URL);
+  app.decorate("users", new UserLookup(app.pg));
 
   await app.register(cors, {
     origin: allowedOrigins(config),
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   });
-  await app.register(rateLimit, { max: 300, timeWindow: "1 minute", keyGenerator: clientIp });
-  await app.register(websocket, { options: { maxPayload: 16 * 1024 } });
+  // Per signed-in user (and IP), so a school or club behind one address
+  // doesn't share a single bucket; anonymous requests are limited per IP
+  await app.register(rateLimit, {
+    max: 300,
+    timeWindow: "1 minute",
+    keyGenerator: (req) => {
+      const ip = clientIp(req);
+      const sub = unverifiedSubject(req);
+      return sub ? `${ip}|${sub}` : ip;
+    },
+  });
+  const ipAllowed = perIpLimiter();
+  app.addHook("onRequest", async (req, reply) => {
+    if (!ipAllowed(clientIp(req))) {
+      return reply.status(429).send({ error: "Too many requests", code: "RATE_LIMITED" });
+    }
+  });
+  await app.register(websocket, {
+    options: { maxPayload: 16 * 1024, handleProtocols: selectWsProtocol },
+  });
 
   const hub = new RealtimeHub(app.redis, app.log);
   app.decorate("hub", hub);

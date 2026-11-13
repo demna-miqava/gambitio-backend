@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { wsAuthHook } from "../../middleware/wsAuth.js";
 import { topics } from "../../realtime/hub.js";
-import { onValidatedMessage, sendError, sendJson } from "../../realtime/socket.js";
+import { keepAuthenticated, onValidatedMessage, sendError, sendJson } from "../../realtime/socket.js";
 import { gameClientMessageSchema } from "../../schemas/wsSchemas.js";
 import { AppError } from "../../errors/AppError.js";
 import { spectatorsKey } from "../../services/liveGameService.js";
@@ -14,6 +14,11 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
     { websocket: true, preValidation: wsAuthHook },
     async (socket, request) => {
       const user = request.wsUser!;
+    keepAuthenticated(socket, {
+      clerkId: user.clerkId,
+      verifyToken: (token) => fastify.authProvider.verifyToken(token),
+      log: request.log,
+    });
 
       const gameId = Number(request.params.id);
       if (!Number.isInteger(gameId) || gameId <= 0) {
@@ -38,13 +43,16 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
           case "draw_response":
             return liveGames.respondToDraw(gameId, userId, message.accepted);
           case "timeout":
-            return liveGames.resolveDeadline(gameId);
+            return liveGames.claimTimeout(gameId, userId);
           case "rematch_request":
             return liveGames.requestRematch(gameId, userId);
           case "rematch_response":
             return liveGames.respondToRematch(gameId, userId, message.data.accepted);
           case "cancel_rematch":
             return liveGames.cancelRematch(gameId, userId);
+          case "sync":
+            await sendState();
+            return;
         }
       });
 
@@ -58,12 +66,18 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
         },
       });
 
-      try {
+      /**
+       * Full state for this socket: on connect, and when the client asks
+       * ("sync"). On connect, a spectator of a live game is counted before
+       * the state goes out, so the count they see includes them.
+       */
+      async function sendState(onConnect = false): Promise<void> {
         const state = await liveGames.getState(gameId, user.id);
         const { data } = state;
         const isPlayer = user.id === data.whitePlayer.id || user.id === data.blackPlayer.id;
+        const live = data.status === "in_progress";
         // Only live games are counted; a finished game is just a replay
-        if (!isPlayer && data.status === "in_progress") {
+        if (onConnect && !isPlayer && live) {
           spectating = await hub
             .addMembership(socket, spectatorsKey(gameId))
             .catch((err) => {
@@ -71,11 +85,12 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
               return false;
             });
         }
-        const spectators =
-          data.status === "in_progress"
-            ? await liveGames.spectatorCount(gameId).catch(() => undefined)
-            : undefined;
+        const spectators = live ? await liveGames.spectatorCount(gameId).catch(() => undefined) : undefined;
         sendJson(socket, { ...state, data: { ...data, spectators } });
+      }
+
+      try {
+        await sendState(true);
         if (spectating) await liveGames.publishSpectatorCount(gameId);
       } catch (error) {
         sendError(socket, error instanceof AppError ? error.message : "Failed to load game");

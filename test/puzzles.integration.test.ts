@@ -63,15 +63,21 @@ describe("puzzles", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_RED
     assert.equal((await solve(user.clerkId, "nope")).statusCode, 404);
   });
 
-  // Seed puzzles (migration 005): seed01..seed06 rated 600, 650, 700, 750, 900, 1300
+  // Seed puzzles (migration 005): seed01..seed06 rated 600, 650, 700, 750, 900, 1300.
+  // Rated mode uses the even ids (seed02, seed04, seed06), Rush / Survival the odd ones.
+  // seed06 is a mate in 2: b3g8 f8g8 h6f7
   const auth = (clerkId: string) => ({ authorization: `Bearer ${clerkId}` });
-  const attempt = (clerkId: string, id: string, success: boolean) =>
+  const check = (clerkId: string, id: string, moves: unknown) =>
     app.inject({
       method: "POST",
-      url: `/api/puzzles/${id}/attempt`,
+      url: `/api/puzzles/${id}/check`,
       headers: auth(clerkId),
-      payload: { success },
+      payload: { moves },
     });
+  const reveal = (clerkId: string, id: string) =>
+    app.inject({ method: "POST", url: `/api/puzzles/${id}/reveal`, headers: auth(clerkId) });
+  const solveSeed06 = (clerkId: string) => check(clerkId, "seed06", ["b3g8", "h6f7"]);
+  const failSeed06 = (clerkId: string) => check(clerkId, "seed06", ["b3b8"]);
   const list = async (clerkId: string, params: Record<string, string>) => {
     const res = await app.inject({
       method: "GET",
@@ -79,7 +85,10 @@ describe("puzzles", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_RED
       headers: auth(clerkId),
     });
     assert.equal(res.statusCode, 200, res.body);
-    const body = res.json() as { data: { id: string; themes: string[] }[]; nextCursor: string | null };
+    const body = res.json() as {
+      data: { id: string; themes: string[]; moves: string[]; hidden?: boolean }[];
+      nextCursor: string | null;
+    };
     return { ids: body.data.map((p) => p.id), body };
   };
   const setPuzzleRating = (id: number, rating: number) =>
@@ -96,82 +105,124 @@ describe("puzzles", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_RED
     ).rows[0];
 
   test("new users start at 1500 and see it on their profile", async () => {
-    const me = await app.inject({ method: "GET", url: "/api/users/me", headers: auth(user.clerkId) });
+    const me = await app.inject({ method: "GET", url: "/api/users/status", headers: auth(user.clerkId) });
     assert.equal(me.json().user.puzzleRating, 1500);
     assert.equal(me.json().user.highestPuzzleRating, 1500);
     const profile = await app.inject({ method: "GET", url: `/api/users/${user.id}`, headers: auth(user.clerkId) });
     assert.equal(profile.json().user.puzzleRating, 1500);
   });
 
-  test("a solved rated attempt raises the rating, records it and marks the puzzle solved", async () => {
-    await setPuzzleRating(user.id, 1200);
-    const res = await attempt(user.clerkId, "seed06", true);
-    assert.equal(res.statusCode, 200, res.body);
-    // expected = 1 / (1 + 10^(100/400)) = 0.360; K = 40 (provisional) => +26
-    assert.deepEqual(res.json(), { rated: true, puzzleRating: 1226, highestPuzzleRating: 1226, ratingChange: 26 });
-    assert.deepEqual(await ratingRow(user.id), { puzzleRating: 1226, highestPuzzleRating: 1226, puzzleAttempts: 1 });
+  test("rated puzzles are served without their solution", async () => {
+    const { body } = await list(user.clerkId, { mode: "rated", limit: "10" });
+    assert.ok(body.data.length > 0);
+    for (const p of body.data) {
+      assert.deepEqual(p.moves, []);
+      assert.equal(p.hidden, true);
+    }
+    // ...while Rush / Survival puzzles come with it, from the other half
+    const unrated = await list(user.clerkId, { limit: "10" });
+    assert.deepEqual(unrated.ids, ["seed01", "seed03", "seed05"]);
+    assert.ok(unrated.body.data.every((p) => p.moves.length > 0 && !p.hidden));
+  });
 
+  test("the server checks each move: a reply to continue, then the rated outcome", async () => {
+    await setPuzzleRating(user.id, 1200);
+    const first = await check(user.clerkId, "seed06", ["b3g8"]);
+    assert.equal(first.statusCode, 200, first.body);
+    assert.deepEqual(first.json(), { result: "continue", line: ["b3g8", "f8g8"] });
+    // Nothing is recorded until the puzzle is over
+    assert.deepEqual(await ratingRow(user.id), { puzzleRating: 1200, highestPuzzleRating: 1200, puzzleAttempts: 0 });
+
+    const res = await solveSeed06(user.clerkId);
+    // expected = 1 / (1 + 10^(100/400)) = 0.360; K = 40 (provisional) => +26
+    assert.deepEqual(res.json(), {
+      result: "solved",
+      line: ["b3g8", "f8g8", "h6f7"],
+      attempt: { rated: true, puzzleRating: 1226, highestPuzzleRating: 1226, ratingChange: 26 },
+    });
+    assert.deepEqual(await ratingRow(user.id), { puzzleRating: 1226, highestPuzzleRating: 1226, puzzleAttempts: 1 });
     const { rows } = await app.pg.query(`SELECT success, "ratingBefore", "ratingChange" FROM puzzle_attempts`);
     assert.deepEqual(rows, [{ success: true, ratingBefore: 1200, ratingChange: 26 }]);
-    assert.ok(!(await list(user.clerkId, { limit: "10" })).ids.includes("seed06"));
+    assert.ok(!(await list(user.clerkId, { mode: "rated", limit: "10" })).ids.includes("seed06"));
   });
 
-  test("a failed rated attempt lowers the rating but keeps the highest", async () => {
+  test("a wrong move fails the puzzle, lowers the rating and reveals the solution", async () => {
     await setPuzzleRating(user.id, 1200);
-    const res = await attempt(user.clerkId, "seed06", false);
+    const res = await failSeed06(user.clerkId);
     // 40 * (0 - 0.360) => -14
-    assert.deepEqual(res.json(), { rated: true, puzzleRating: 1186, highestPuzzleRating: 1200, ratingChange: -14 });
-    // Failed puzzles are still served in unrated (ascending) mode
-    assert.ok((await list(user.clerkId, { limit: "10" })).ids.includes("seed06"));
+    assert.deepEqual(res.json(), {
+      result: "failed",
+      line: ["b3g8", "f8g8", "h6f7"],
+      attempt: { rated: true, puzzleRating: 1186, highestPuzzleRating: 1200, ratingChange: -14 },
+    });
   });
 
-  test("only the first attempt at a puzzle is rated; a later solve still marks it solved", async () => {
+  test("a one-move puzzle is solved by its mate", async () => {
+    const mate = await check(user.clerkId, "seed04", ["h5f7"]);
+    assert.equal(mate.json().result, "solved");
+    assert.deepEqual(mate.json().line, ["h5f7"]);
+  });
+
+  test("only the first outcome on a puzzle is rated", async () => {
     await setPuzzleRating(user.id, 1200);
-    assert.equal((await attempt(user.clerkId, "seed06", false)).json().ratingChange, -14);
-    const retry = await attempt(user.clerkId, "seed06", true);
-    assert.deepEqual(retry.json(), { rated: false, puzzleRating: 1186, highestPuzzleRating: 1200, ratingChange: 0 });
+    assert.equal((await failSeed06(user.clerkId)).json().attempt.ratingChange, -14);
+    const again = await solveSeed06(user.clerkId);
+    assert.deepEqual(again.json().attempt, { rated: false, puzzleRating: 1186, highestPuzzleRating: 1200, ratingChange: 0 });
     assert.deepEqual(await ratingRow(user.id), { puzzleRating: 1186, highestPuzzleRating: 1200, puzzleAttempts: 1 });
-    assert.ok(!(await list(user.clerkId, { limit: "10" })).ids.includes("seed06"));
-    // Another user's first attempt is rated independently
+    // Another user's first outcome is rated independently
     const other = await createUser(app, "other");
-    assert.equal((await attempt(other.clerkId, "seed06", true)).json().rated, true);
+    assert.equal((await solveSeed06(other.clerkId)).json().attempt.rated, true);
   });
 
-  test("concurrent duplicate attempts are rated once", async () => {
+  test("revealing the solution before the end counts as a miss", async () => {
+    await setPuzzleRating(user.id, 1200);
+    const res = await reveal(user.clerkId, "seed06");
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(res.json().result, "failed");
+    assert.deepEqual(res.json().line, ["b3g8", "f8g8", "h6f7"]);
+    assert.equal(res.json().attempt.ratingChange, -14);
+    // Solving it now is unrated
+    assert.equal((await solveSeed06(user.clerkId)).json().attempt.rated, false);
+  });
+
+  test("concurrent duplicate outcomes are rated once", async () => {
     await setPuzzleRating(user.id, 1200);
     const results = await Promise.all(
-      Array.from({ length: 6 }, (_, i) => attempt(user.clerkId, "seed06", i % 2 === 0))
+      Array.from({ length: 6 }, (_, i) => (i % 2 === 0 ? solveSeed06 : failSeed06)(user.clerkId))
     );
     assert.ok(results.every((r) => r.statusCode === 200));
-    const rated = results.map((r) => r.json()).filter((r) => r.rated);
+    const rated = results.map((r) => r.json().attempt).filter((a) => a.rated);
     assert.equal(rated.length, 1);
     const row = await ratingRow(user.id);
     assert.equal(row.puzzleAttempts, 1);
     assert.equal(row.puzzleRating, 1200 + rated[0].ratingChange);
-    const { rows } = await app.pg.query(`SELECT count(*)::int AS n FROM puzzle_attempts`);
-    assert.equal(rows[0].n, 1);
   });
 
-  test("attempts on unknown puzzles are 404 and bodies are validated", async () => {
-    assert.equal((await attempt(user.clerkId, "nope", true)).statusCode, 404);
-    const bad = await app.inject({
+  test("checks refuse unrated or unknown puzzles, illegal moves and bad bodies", async () => {
+    // Rush / Survival puzzles (solution already sent) can't be rated
+    assert.equal((await check(user.clerkId, "seed05", ["g5f7"])).statusCode, 404);
+    assert.equal((await check(user.clerkId, "nope", ["e2e4"])).statusCode, 404);
+    assert.equal((await check(user.clerkId, "seed06", ["a1a8"])).statusCode, 400);
+    assert.equal((await check(user.clerkId, "seed06", ["b3g8", "h6f7", "a2a3"])).json().result, "solved");
+    assert.equal((await check(user.clerkId, "seed06", [])).statusCode, 400);
+    assert.equal((await check(user.clerkId, "seed06", ["zz"])).statusCode, 400);
+    const legacy = await app.inject({
       method: "POST",
-      url: "/api/puzzles/seed01/attempt",
+      url: "/api/puzzles/seed06/attempt",
       headers: auth(user.clerkId),
-      payload: { success: "yes" },
+      payload: { success: true },
     });
-    assert.equal(bad.statusCode, 400);
-    assert.deepEqual(await ratingRow(user.id), { puzzleRating: 1500, highestPuzzleRating: 1500, puzzleAttempts: 0 });
+    assert.equal(legacy.statusCode, 404);
   });
 
   test("theme filter returns only puzzles with that theme, keyset-paged", async () => {
-    const page1 = await list(user.clerkId, { theme: "smotheredMate", limit: "1" });
-    assert.deepEqual(page1.ids, ["seed05"]);
+    const page1 = await list(user.clerkId, { theme: "mateIn1", limit: "2" });
+    assert.deepEqual(page1.ids, ["seed01", "seed03"]);
     assert.ok(page1.body.nextCursor);
-    const page2 = await list(user.clerkId, { theme: "smotheredMate", limit: "1", cursor: page1.body.nextCursor });
-    assert.deepEqual(page2.ids, ["seed06"]);
+    const page2 = await list(user.clerkId, { theme: "mateIn1", limit: "2", cursor: page1.body.nextCursor });
+    assert.deepEqual(page2.ids, ["seed05"]);
     assert.equal(page2.body.nextCursor, null);
-    assert.deepEqual((await list(user.clerkId, { theme: "opening" })).ids, ["seed04"]);
+    assert.deepEqual((await list(user.clerkId, { theme: "smotheredMate" })).ids, ["seed05"]);
     assert.deepEqual((await list(user.clerkId, { theme: "noSuchTheme" })).ids, []);
 
     const bad = await app.inject({ method: "GET", url: "/api/puzzles?theme=a%20b", headers: auth(user.clerkId) });
@@ -179,25 +230,25 @@ describe("puzzles", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_RED
   });
 
   test("rated mode starts near the user's rating, skips attempted puzzles and falls back to the easiest", async () => {
-    await setPuzzleRating(user.id, 900);
-    // Starts at 900 - 50: seed05 (900) and seed06 (1300)
+    await setPuzzleRating(user.id, 750);
+    // Starts at 750 - 50 within the rated half: seed04 (750), then seed06 (1300)
     const page1 = await list(user.clerkId, { mode: "rated", limit: "1" });
-    assert.deepEqual(page1.ids, ["seed05"]);
+    assert.deepEqual(page1.ids, ["seed04"]);
     const page2 = await list(user.clerkId, { mode: "rated", limit: "1", cursor: page1.body.nextCursor! });
     assert.deepEqual(page2.ids, ["seed06"]);
     assert.equal(page2.body.nextCursor, null);
 
-    // A failed rated attempt isn't served again in rated mode (it couldn't be rated)
-    await attempt(user.clerkId, "seed05", false);
+    // A failed puzzle isn't served again in rated mode (it couldn't be rated)
+    await check(user.clerkId, "seed04", ["h5h7"]);
     assert.deepEqual((await list(user.clerkId, { mode: "rated", limit: "1" })).ids, ["seed06"]);
 
     // Nothing left at or above the rating: easiest first instead of nothing
     await setPuzzleRating(user.id, 2500);
-    assert.deepEqual((await list(user.clerkId, { mode: "rated", limit: "2" })).ids, ["seed01", "seed02"]);
+    assert.deepEqual((await list(user.clerkId, { mode: "rated", limit: "2" })).ids, ["seed02", "seed06"]);
     // Ascending (Rush / Survival) is unaffected by the rating
-    assert.deepEqual((await list(user.clerkId, { limit: "2" })).ids, ["seed01", "seed02"]);
+    assert.deepEqual((await list(user.clerkId, { limit: "2" })).ids, ["seed01", "seed03"]);
     // Rated mode combined with a theme
-    assert.deepEqual((await list(user.clerkId, { mode: "rated", theme: "opening" })).ids, ["seed04"]);
+    assert.deepEqual((await list(user.clerkId, { mode: "rated", theme: "mateIn2" })).ids, ["seed06"]);
   });
 
   test("themes lists every theme with its count, cached", async () => {
@@ -223,7 +274,7 @@ describe("puzzles", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_RED
       solved: 0,
       delta: 0,
     });
-    await attempt(user.clerkId, "seed06", true); // clears the stats cache
+    await solveSeed06(user.clerkId); // clears the stats cache
     assert.deepEqual((await summary()).json().puzzle, {
       rating: 1226,
       highestRating: 1226,

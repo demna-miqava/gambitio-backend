@@ -6,6 +6,7 @@ import {
   type LeaderboardScope,
   type LeaderboardVariant,
 } from "../models/Leaderboard.js";
+import { cachedValue } from "../utils/cache.js";
 
 const GLOBAL_CACHE_SECONDS = 30;
 export const leaderboardCacheKey = (variant: LeaderboardVariant, page: number, limit: number) =>
@@ -78,17 +79,13 @@ export class LeaderboardService {
     };
   }
 
-  private async cachedGlobal(
+  private cachedGlobal(
     variant: LeaderboardVariant,
     page: number,
     limit: number,
     compute: () => Promise<Page>
   ): Promise<Page> {
     const key = leaderboardCacheKey(variant, page, limit);
-    const hit = await this.fastify.redis.get(key);
-    if (hit) return JSON.parse(hit) as Page;
-    const value = await compute();
-    await this.fastify.redis.setEx(key, GLOBAL_CACHE_SECONDS, JSON.stringify(value));
-    return value;
+    return cachedValue(this.fastify.redis, this.fastify.log, key, GLOBAL_CACHE_SECONDS, compute);
   }
 }

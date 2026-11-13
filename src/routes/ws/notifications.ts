@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { wsAuthHook } from "../../middleware/wsAuth.js";
 import { topics } from "../../realtime/hub.js";
-import { onValidatedMessage, sendJson } from "../../realtime/socket.js";
+import { keepAuthenticated, onValidatedMessage, sendJson } from "../../realtime/socket.js";
 import { notificationClientMessageSchema } from "../../schemas/wsSchemas.js";
 import { AppError } from "../../errors/AppError.js";
 
@@ -10,6 +10,11 @@ export async function notificationWebSocketRoute(fastify: FastifyInstance) {
 
   fastify.get("/notifications", { websocket: true, preValidation: wsAuthHook }, async (socket, request) => {
     const user = request.wsUser!;
+    keepAuthenticated(socket, {
+      clerkId: user.clerkId,
+      verifyToken: (token) => fastify.authProvider.verifyToken(token),
+      log: request.log,
+    });
 
     onValidatedMessage(
       socket,

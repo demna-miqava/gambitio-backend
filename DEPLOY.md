@@ -14,8 +14,9 @@ WebSockets) to this backend, which runs in a Cloudflare Container. Postgres
    the **pooled** connection string (host contains `-pooler`), with
    `?sslmode=require`.
 3. **Upstash Redis** – create a database in a nearby region and copy the
-   `rediss://` URL (TLS). The heartbeat and matchmaking sweep send a steady
-   stream of commands, so check the plan's command limit.
+   `rediss://` URL (TLS). Each backend instance sends one heartbeat command
+   every 25 seconds, plus a few commands per connection, game move and page
+   view; check the plan's command limit.
 4. **Clerk** – create a *production* instance for your domain and finish its
    DNS setup. You need its `pk_live_...` and `sk_live_...` keys.
 
@@ -47,6 +48,12 @@ POSTGRES_CONNECTION_STRING='postgres://...neon...' npx tsx scripts/migrate.ts
 It only applies files not yet recorded in `schema_migrations`, so re-running
 is safe. Run it from one place at a time.
 
+Migration 014 needs the `pg_trgm` extension (available on Neon) and builds
+indexes on `users`, `games` and `friend_requests`. Each migration runs in one
+transaction, so the indexes are built without `CONCURRENTLY`: writes to those
+tables wait until it finishes. On a small database that's a moment; on a
+large one, run it when nobody is playing.
+
 Optional, the full puzzle set (see README):
 
 ```bash
@@ -70,11 +77,21 @@ builds the container image and deploys the Worker.
   the game is settled by the clock.
 - `npx wrangler tail` shows Worker and container logs.
 
+## Scaling
+
+- `wrangler.jsonc` runs the `basic` instance type (1/4 vCPU, 1 GiB).
+- `vars.BACKEND_INSTANCES` (default `"1"`, at most `max_instances`) sets how
+  many containers share the load. With more than one, `worker/index.ts`
+  sends all of a game's sockets to the same instance (by game id) and other
+  requests by client IP; the instances coordinate through Postgres and Redis.
+  Each one is billed separately. Rate limits and small caches are kept per
+  instance.
+- An idle instance sends no queries (Neon can suspend). Containers sleep 15
+  minutes after the last connection closes and start again on the next
+  request (a few seconds).
+
 ## Known limits
 
-- One container instance (`max_instances: 1`): every player shares one game
-  server. It sleeps 15 minutes after the last connection closes and starts
-  again on the next request (a few seconds).
 - Deleting an account deletes the Clerk user from the backend
   (`DELETE /api/users/me`). Users deleted directly in the Clerk dashboard keep
   their Gambitio profile; there is no Clerk webhook yet.

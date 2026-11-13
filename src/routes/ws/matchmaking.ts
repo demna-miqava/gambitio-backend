@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { wsAuthHook } from "../../middleware/wsAuth.js";
 import { topics } from "../../realtime/hub.js";
-import { onValidatedMessage, sendError, sendJson } from "../../realtime/socket.js";
+import { keepAuthenticated, onValidatedMessage, sendError, sendJson } from "../../realtime/socket.js";
 import {
   matchmakingClientMessageSchema,
   matchmakingQuerySchema,
@@ -13,6 +13,11 @@ export async function matchmakingWebSocketRoute(fastify: FastifyInstance) {
 
   fastify.get("/matchmaking", { websocket: true, preValidation: wsAuthHook }, async (socket, request) => {
     const user = request.wsUser!;
+    keepAuthenticated(socket, {
+      clerkId: user.clerkId,
+      verifyToken: (token) => fastify.authProvider.verifyToken(token),
+      log: request.log,
+    });
 
     const query = matchmakingQuerySchema.safeParse(request.query);
     if (!query.success) {

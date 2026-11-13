@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import type { Queryable } from "../db.js";
 import type {
   Game,
+  GameListItem,
   GameResponse,
   LiveGame,
   LiveGameSummary,
@@ -16,13 +17,17 @@ import type { Outcome } from "../game/engine.js";
 import { replayBotGame } from "../game/botGame.js";
 import { getBotById } from "../game/bots.js";
 import { AppError } from "../errors/AppError.js";
+import { cachedField } from "../utils/cache.js";
+import { STATS_CACHE_SECONDS, statsCacheKey } from "./statsService.js";
 
 export function toGameResponse(game: Game): GameResponse {
+  return { ...toGameListItem(game), pgn: game.pgn, fen: game.fen };
+}
+
+export function toGameListItem(game: Omit<Game, "pgn" | "fen">): GameListItem {
   return {
     id: game.id,
     createdAt: game.createdAt,
-    pgn: game.pgn,
-    fen: game.fen,
     winnerId: game.winnerId,
     numMoves: game.numMoves,
     time: game.time,
@@ -122,14 +127,18 @@ export class GameService {
   ): Promise<PaginatedGamesResponse> {
     const normalizedPage = Math.max(1, page);
     const normalizedLimit = Math.min(Math.max(1, limit), 100);
-    const { games, total } = await gameRepository.findByUserId(
-      this.fastify.pg,
-      userId,
-      normalizedLimit,
-      (normalizedPage - 1) * normalizedLimit
-    );
+    const offset = (normalizedPage - 1) * normalizedLimit;
+    const games = await gameRepository.findPageByUserId(this.fastify.pg, userId, normalizedLimit, offset);
+    // A short first page is the whole history; otherwise the count comes
+    // from the stats cache, which is cleared whenever one of the user's games
+    // ends (a game that just started may be missing from it for a minute)
+    const total =
+      normalizedPage === 1 && games.length < normalizedLimit
+        ? games.length
+        : await cachedField(this.fastify.redis, this.fastify.log, statsCacheKey(userId), "gamesTotal",
+            STATS_CACHE_SECONDS, () => gameRepository.countByUserId(this.fastify.pg, userId));
     return {
-      data: games.map(toGameResponse),
+      data: games.map(toGameListItem),
       pagination: {
         page: normalizedPage,
         limit: normalizedLimit,
@@ -184,6 +193,8 @@ export class GameService {
       // result tells them apart
       winnerId: playerWon ? userId : null,
     });
+    // The game history count is cached with the stats
+    await this.fastify.redis.del(statsCacheKey(userId)).catch(() => {});
     return toGameResponse(game);
   }
 }

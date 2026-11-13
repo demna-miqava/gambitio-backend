@@ -26,11 +26,7 @@ export async function authMiddleware(request: FastifyRequest, reply: FastifyRepl
     return reply.status(401).send({ error: "Authentication required", code: "AUTH_REQUIRED" });
   }
 
-  const { rows } = await request.server.pg.query<{ id: number; username: string }>(
-    `SELECT id, username FROM users WHERE "clerkId" = $1`,
-    [clerkId]
-  );
-  const user = rows[0];
+  const user = await request.server.users.byClerkId(clerkId);
   if (!user) {
     // Signed in with Clerk but hasn't completed profile setup
     return reply.status(403).send({

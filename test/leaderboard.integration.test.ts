@@ -89,13 +89,14 @@ describe("leaderboard", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST
     assert.deepEqual(before.body.data, []);
     assert.equal(before.body.me, null);
 
-    const res = await fetch(`http://${baseUrl}/api/puzzles/seed06/attempt`, {
+    // Solving it move by move (seed06: b3g8 f8g8 h6f7); the server rates it
+    const res = await fetch(`http://${baseUrl}/api/puzzles/seed06/check`, {
       method: "POST",
       headers: { authorization: `Bearer ${solver.clerkId}`, "content-type": "application/json" },
-      body: JSON.stringify({ success: true }),
+      body: JSON.stringify({ moves: ["b3g8", "h6f7"] }),
     });
     assert.equal(res.status, 200);
-    const { puzzleRating } = (await res.json()) as any;
+    const { puzzleRating } = ((await res.json()) as any).attempt;
 
     const { body } = await get(solver.clerkId, "variant=puzzle");
     assert.deepEqual(

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { authMiddleware } from "../middleware/auth.js";
 import { gameRepository } from "../repositories/gameRepository.js";
 import { toLiveGameSummary } from "../services/gameService.js";
+import { memoize } from "../utils/cache.js";
 
 /** Most friends' games returned; a user rarely has more friends playing at once. */
 const FRIENDS_LIVE_LIMIT = 50;
@@ -15,7 +16,14 @@ const topLiveQuery = z.object({
  * Games in progress, for spectators (the Watch page). Watching itself goes
  * through the game WebSocket, which anyone signed in may open.
  */
+/** The top list is the same for everyone; a few seconds old is fine for the Watch page. */
+const TOP_LIVE_CACHE_MS = 5_000;
+
 export async function liveGameRoutes(fastify: FastifyInstance) {
+  const topLive = memoize(TOP_LIVE_CACHE_MS, async (limit: number) =>
+    (await gameRepository.findTopLive(fastify.pg, limit)).map(toLiveGameSummary)
+  );
+
   // GET /games/live/friends - The signed-in user's friends' games in progress
   fastify.get("/games/live/friends", { preHandler: authMiddleware }, async (request) => {
     const games = await gameRepository.findLiveForFriends(fastify.pg, request.user!.id, FRIENDS_LIVE_LIMIT);
@@ -25,7 +33,6 @@ export async function liveGameRoutes(fastify: FastifyInstance) {
   // GET /games/live/top?limit=12 - Games in progress with the highest average rating
   fastify.get("/games/live/top", { preHandler: authMiddleware }, async (request) => {
     const { limit } = topLiveQuery.parse(request.query);
-    const games = await gameRepository.findTopLive(fastify.pg, limit);
-    return { data: games.map(toLiveGameSummary) };
+    return { data: await topLive(limit) };
   });
 }
