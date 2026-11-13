@@ -24,6 +24,16 @@ export const FIRST_MOVE_TIMEOUT_MS = 30_000;
  */
 export const MAX_LAG_COMPENSATION_MS = 1_000;
 
+/** Time one "give time" click adds to the opponent's clock */
+export const GIVE_TIME_MS = 10_000;
+
+/**
+ * Most a clock can hold from given time (the longest time control). Keeps a
+ * player who clicks without end from growing the clock past what the
+ * integer columns hold.
+ */
+export const MAX_CLOCK_MS = 3 * 60 * 60 * 1000;
+
 export interface ClockState {
   whiteMs: number;
   blackMs: number;
@@ -94,6 +104,20 @@ export function afterMove(
     blackMs: mover === "black" ? left : state.blackMs,
     lastMoveAt: now,
     ply: state.ply + 1,
+  };
+}
+
+/**
+ * Clock after `ms` is added to `color`'s time. The stored time of the side
+ * to move is as of lastMoveAt, so adding to it adds to the time they have
+ * left now. Capped at MAX_CLOCK_MS (as stored).
+ */
+export function addTime(state: ClockState, color: PlayerColor, ms: number): ClockState {
+  const add = (current: number) => Math.max(current, Math.min(MAX_CLOCK_MS, current + ms));
+  return {
+    ...state,
+    whiteMs: color === "white" ? add(state.whiteMs) : state.whiteMs,
+    blackMs: color === "black" ? add(state.blackMs) : state.blackMs,
   };
 }
 

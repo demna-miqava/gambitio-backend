@@ -12,8 +12,10 @@ import {
 } from "../game/engine.js";
 import {
   activeColor,
+  addTime,
   afterMove,
   deadline,
+  GIVE_TIME_MS,
   isClockRunning,
   isFlagged,
   remainingAt,
@@ -465,13 +467,65 @@ export class LiveGameService {
         return;
       }
 
-      const state = clockOf(game);
-      if (!isClockRunning(state.ply)) {
-        await this.end(tx, game, { result: "aborted", reason: "aborted" }, null, fx);
+      await this.endAtDeadline(tx, game, now, fx);
+    });
+  }
+
+  /** Ends a game whose deadline has passed: an abort, or a flag fall. */
+  private async endAtDeadline(tx: TxClient, game: LiveGame, now: number, fx: TxEffects) {
+    const state = clockOf(game);
+    if (!isClockRunning(state.ply)) {
+      await this.end(tx, game, { result: "aborted", reason: "aborted" }, null, fx);
+      return;
+    }
+    const flagged = activeColor(state.ply);
+    await this.end(tx, game, timeoutOutcome(this.position(game), flagged), remainingAt(state, now), fx);
+  }
+
+  /**
+   * Adds GIVE_TIME_MS to the opponent's clock, moving their deadline if it's
+   * their turn. Everyone on the game is told the new time left. A game whose
+   * deadline has already passed ends instead: given time can't undo a flag
+   * that has fallen.
+   */
+  async giveTime(gameId: number, userId: number): Promise<void> {
+    await this.run(gameId, async (tx, game, fx) => {
+      if (game.status !== "in_progress") throw gameOver();
+      const color = colorOf(game, userId);
+      if (!color) throw notAPlayer();
+      const now = Date.now();
+      if (isPastDeadline(game, now)) {
+        await this.endAtDeadline(tx, game, now, fx);
         return;
       }
-      const flagged = activeColor(state.ply);
-      await this.end(tx, game, timeoutOutcome(this.position(game), flagged), remainingAt(state, now), fx);
+
+      const receiver = color === "white" ? "black" : "white";
+      const state = clockOf(game);
+      const clock = addTime(state, receiver, GIVE_TIME_MS);
+      const before = receiver === "white" ? state.whiteMs : state.blackMs;
+      const after = receiver === "white" ? clock.whiteMs : clock.blackMs;
+      if (after === before) return; // already at the most a clock can hold
+
+      const deadlineAt = new Date(deadline(clock));
+      await gameRepository.saveClock(tx, gameId, {
+        whiteTimeLeftMs: clock.whiteMs,
+        blackTimeLeftMs: clock.blackMs,
+        deadlineAt,
+      });
+      fx.deadlines.push({ gameId, at: deadlineAt });
+
+      const left = remainingAt(clock, now);
+      fx.out.push({
+        topic: topics.game(gameId),
+        message: {
+          type: "time_added",
+          userId,
+          color: receiver,
+          addedMs: after - before,
+          whiteTimeLeft: left.whiteMs,
+          blackTimeLeft: left.blackMs,
+        },
+      });
     });
   }
 

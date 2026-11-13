@@ -21,6 +21,8 @@ export const gameClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("draw_response"), accepted: z.boolean() }),
   // A hint that a clock reached zero; the server checks its own clock
   z.object({ type: z.literal("timeout") }),
+  // Adds GIVE_TIME_MS to the opponent's clock
+  z.object({ type: z.literal("give_time") }),
   z.object({ type: z.literal("rematch_request") }),
   z.object({
     type: z.literal("rematch_response"),

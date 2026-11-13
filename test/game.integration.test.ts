@@ -207,6 +207,69 @@ describe("live games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_
     assert.equal(ended.winnerId, white.id);
   });
 
+  test("a player can give the opponent time, which moves their flag", async () => {
+    const game = await newGame(60);
+    const { w, b } = await joinGame(game.id);
+    for (const [socket, uci] of [
+      [w, "e2e4"],
+      [b, "e7e5"],
+    ] as const) {
+      socket.send(move(uci));
+      await w.next("move", (m) => m.move.lan === uci);
+    }
+
+    // White to move with 2s left; black gives 10s twice
+    await app.pg.query(
+      `UPDATE games SET "whiteTimeLeftMs" = 2000, "lastMoveAt" = now(),
+         "deadlineAt" = now() + interval '3 seconds' WHERE id = $1`,
+      [game.id]
+    );
+    b.send({ type: "give_time" });
+    const first = await w.next("time_added");
+    assert.equal(first.color, "white");
+    assert.equal(first.userId, black.id);
+    assert.equal(first.addedMs, 10_000);
+    assert.ok(first.whiteTimeLeft > 11_000 && first.whiteTimeLeft <= 12_000, `white has ${first.whiteTimeLeft}ms`);
+    assert.equal(first.blackTimeLeft, 60_000);
+    b.send({ type: "give_time" });
+    const second = await b.next("time_added", (m) => m.whiteTimeLeft > 20_000);
+    assert.ok(second.whiteTimeLeft <= 22_000);
+
+    const { rows } = await app.pg.query(
+      `SELECT "whiteTimeLeftMs", "deadlineAt" > now() + interval '20 seconds' AS later FROM games WHERE id = $1`,
+      [game.id]
+    );
+    assert.deepEqual(rows[0], { whiteTimeLeftMs: 22_000, later: true });
+
+    // A spectator can't give time
+    const o = await open(`/game/${game.id}`, (await createUser(app, "onlooker")).clerkId);
+    await o.next("initial_game_state");
+    o.send({ type: "give_time" });
+    const error = await o.next("error");
+    assert.equal(error.data.code, "NOT_A_PLAYER");
+  });
+
+  test("given time can't save a flag that has already fallen", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    for (const [socket, uci] of [
+      [w, "e2e4"],
+      [b, "e7e5"],
+    ] as const) {
+      socket.send(move(uci));
+      await w.next("move", (m) => m.move.lan === uci);
+    }
+    await app.pg.query(
+      `UPDATE games SET "whiteTimeLeftMs" = 0, "deadlineAt" = now() - interval '1 second' WHERE id = $1`,
+      [game.id]
+    );
+    b.send({ type: "give_time" });
+    const ended = await w.next("game_ended");
+    assert.equal(ended.reason, "timeout");
+    assert.equal(ended.winnerId, black.id);
+    await w.none("time_added");
+  });
+
   test("sweeper aborts a game whose first move never comes, without rating changes", async () => {
     const game = await newGame();
     const { w } = await joinGame(game.id);

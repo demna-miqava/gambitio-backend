@@ -2,11 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { applyMove, loadGame, timeoutOutcome } from "../src/game/engine.js";
 import {
+  addTime,
   afterMove,
   chargedTime,
   deadline,
   FIRST_MOVE_TIMEOUT_MS,
   isFlagged,
+  MAX_CLOCK_MS,
   MAX_LAG_COMPENSATION_MS,
   remainingAt,
 } from "../src/game/clock.js";
@@ -92,6 +94,24 @@ test("network delay is forgiven up to MAX_LAG_COMPENSATION_MS per move", () => {
   assert.equal(chargedTime(state, 11_000, 9_999), 1_000);
   // No time is charged before both first moves
   assert.equal(chargedTime({ ...state, ply: 1 }, 50_000, 40_000), 0);
+});
+
+test("given time is added to time left now and moves the deadline", () => {
+  // Black to move since t=10s with 5s stored: 2s left at t=13s
+  const state = { whiteMs: 30_000, blackMs: 5_000, lastMoveAt: 10_000, ply: 21 };
+  const given = addTime(state, "black", 10_000);
+  assert.deepEqual(remainingAt(given, 13_000), { whiteMs: 30_000, blackMs: 12_000 });
+  assert.equal(deadline(given), deadline(state) + 10_000);
+  assert.equal(given.lastMoveAt, state.lastMoveAt);
+
+  // Time for the side not to move just waits on their clock
+  const toWhite = addTime(state, "white", 10_000);
+  assert.equal(toWhite.whiteMs, 40_000);
+  assert.equal(deadline(toWhite), deadline(state));
+
+  // Capped
+  assert.equal(addTime({ ...state, whiteMs: MAX_CLOCK_MS - 1_000 }, "white", 10_000).whiteMs, MAX_CLOCK_MS);
+  assert.equal(addTime({ ...state, whiteMs: MAX_CLOCK_MS + 5 }, "white", 10_000).whiteMs, MAX_CLOCK_MS + 5);
 });
 
 test("winner always gains and loser always loses", () => {

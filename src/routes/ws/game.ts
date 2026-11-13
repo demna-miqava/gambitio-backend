@@ -48,6 +48,8 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
             return liveGames.respondToDraw(gameId, userId, message.accepted);
           case "timeout":
             return liveGames.claimTimeout(gameId, userId);
+          case "give_time":
+            return liveGames.giveTime(gameId, userId);
           case "rematch_request":
             return liveGames.requestRematch(gameId, userId);
           case "rematch_response":

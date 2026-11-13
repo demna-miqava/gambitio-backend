@@ -214,6 +214,19 @@ export const gameRepository = {
     return rowCount === 1;
   },
 
+  /** New clock times (given time) without a move */
+  async saveClock(
+    db: Queryable,
+    gameId: number,
+    update: { whiteTimeLeftMs: number; blackTimeLeftMs: number; deadlineAt: Date }
+  ): Promise<void> {
+    await db.query(
+      `UPDATE games SET "whiteTimeLeftMs" = $2, "blackTimeLeftMs" = $3, "deadlineAt" = $4
+       WHERE id = $1`,
+      [gameId, update.whiteTimeLeftMs, update.blackTimeLeftMs, update.deadlineAt]
+    );
+  },
+
   async setDrawOffer(db: Queryable, gameId: number, userId: number | null): Promise<void> {
     await db.query(`UPDATE games SET "drawOfferedBy" = $2 WHERE id = $1`, [gameId, userId]);
   },
