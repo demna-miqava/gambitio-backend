@@ -1,0 +1,64 @@
+// Gambitio as one Cloudflare Worker: it serves the built frontend and passes
+// /api (REST and WebSockets) to the Fastify backend in a container. Postgres
+// and Redis live outside Cloudflare (Neon and Upstash); their URLs are
+// secrets. See DEPLOY.md.
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "gambitio",
+	"main": "worker/index.ts",
+	"compatibility_date": "2026-11-01",
+	// Only on the site's own domain (set below): Clerk's production keys only
+	// work there, so a *.workers.dev address would just show a broken login.
+	"workers_dev": false,
+	"preview_urls": false,
+	"routes": [
+		{
+			// Replace with your domain (or a subdomain of it), without https://.
+			"pattern": "gambitio.example.com",
+			"custom_domain": true,
+		},
+	],
+	// The frontend, built with `npm --prefix ../gambitio-frontend run build`.
+	// /api goes to the Worker; any other path the files don't have gets
+	// index.html, so React Router's routes work.
+	"assets": {
+		"directory": "../gambitio-frontend/dist",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": [
+			"/api/*"
+		],
+	},
+	// The backend (Dockerfile). "lite" is 1/16 vCPU and 256 MiB, plenty for a
+	// handful of players. One instance: worker/index.ts always asks for the
+	// same one, so everyone is on the same game server.
+	"containers": [
+		{
+			"class_name": "Backend",
+			"image": "./Dockerfile",
+			"instance_type": "lite",
+			"max_instances": 1,
+		},
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "BACKEND",
+				"class_name": "Backend",
+			},
+		],
+	},
+	"exports": {
+		"Backend": {
+			"type": "durable-object",
+			"storage": "sqlite",
+		},
+	},
+	"vars": {
+		// The site's address, with https://, matching routes[0].pattern. The
+		// backend uses it for CORS and to check Clerk session tokens.
+		"SITE_ORIGIN": "https://gambitio.example.com",
+	},
+	"observability": {
+		"enabled": true,
+	},
+}

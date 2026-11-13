@@ -7,22 +7,6 @@ export interface MatchmakingRequest {
   createdAt: Date;
   rating: number;
   time: number;
-  increment: number | null;
+  increment: number;
   userId: number;
-}
-
-export interface MatchmakingMessage {
-  type: "find_match" | "cancel_match" | "match_found" | "searching" | "error";
-  data?: {
-    time?: number;
-    increment?: number | null | undefined;
-    rating?: number;
-    matchId?: number;
-    opponentId?: number;
-    opponentUsername?: string;
-    opponentRating?: number;
-    gameId?: number;
-    color?: "white" | "black";
-    message?: string;
-  };
 }
