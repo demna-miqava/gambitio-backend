@@ -14,7 +14,7 @@
 	"routes": [
 		{
 			// Replace with your domain (or a subdomain of it), without https://.
-			"pattern": "gambitio.mipupu.com",
+			"pattern": "gambitio.demnamikava.dev",
 			"custom_domain": true,
 		},
 	],
@@ -65,7 +65,7 @@
 	"vars": {
 		// The site's address, with https://, matching routes[0].pattern. The
 		// backend uses it for CORS and to check Clerk session tokens.
-		"SITE_ORIGIN": "https://gambitio.mipupu.com",
+		"SITE_ORIGIN": "https://gambitio.demnamikava.dev",
 		// Backend containers to run, 1 to max_instances. 1 keeps everyone on one
 		// server; raise it when one instance runs out of CPU. Each instance adds
 		// its own container cost and a Redis heartbeat.
