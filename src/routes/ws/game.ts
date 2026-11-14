@@ -37,6 +37,7 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
             return liveGames.move(gameId, userId, message.move, {
               receivedAt,
               thinkMs: message.thinkMs,
+              ply: message.ply,
             });
           case "resign":
             return liveGames.resign(gameId, userId);

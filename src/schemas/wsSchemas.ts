@@ -15,6 +15,10 @@ export const gameClientMessageSchema = z.discriminatedUnion("type", [
     }),
     // How long the player's own clock ran for this move (see clock.ts)
     thinkMs: z.number().int().min(0).max(24 * 60 * 60 * 1000).optional(),
+    // Half-moves on the client's board before this move. A move meant for a
+    // position the server no longer has (a takeback was accepted meanwhile)
+    // is rejected instead of being played in the new one.
+    ply: z.number().int().min(0).optional(),
   }),
   z.object({ type: z.literal("resign") }),
   z.object({ type: z.literal("abort") }),

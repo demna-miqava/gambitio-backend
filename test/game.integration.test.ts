@@ -545,6 +545,32 @@ describe("live games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_
     assert.ok(played.whiteTimeLeft > 51_000 && played.whiteTimeLeft <= 52_000, `white has ${played.whiteTimeLeft}ms`);
   });
 
+  test("a move made for a position a takeback has since replaced is rejected", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    await play({ w, b }, ["e2e4", "e7e5", "g1f3", "b8c6"]);
+
+    // White asks on their own turn (back to ply 2), black accepts...
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+    b.send({ type: "takeback_response", accepted: true });
+    await w.next("takeback");
+    // ...while white, still seeing ply 4, plays Bc4: legal at ply 2 too, but
+    // meant for another position
+    w.send({ ...move("f1c4"), ply: 4 });
+    const rejected = await w.next("move_rejected");
+    assert.equal(rejected.message, "The position changed");
+    assert.ok(rejected.pgn.endsWith("1. e4 e5 *"), rejected.pgn);
+    assert.equal((await storedGame(game.id)).numMoves, 2);
+
+    // Resynced, the same move for the right position is played
+    w.send({ ...move("f1c4"), ply: 2 });
+    assert.equal((await w.next("move")).moveNumber, 3);
+    // A client that doesn't say which position it means is trusted as before
+    b.send(move("g8f6"));
+    assert.equal((await b.next("move", (m) => m.moveNumber === 4)).moveNumber, 4);
+  });
+
   test("a takeback can't save a flag that has already fallen", async () => {
     const game = await newGame();
     const { w, b } = await joinGame(game.id);

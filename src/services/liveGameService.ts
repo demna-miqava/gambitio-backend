@@ -309,13 +309,15 @@ export class LiveGameService {
    * Plays a move. `receivedAt` is when the move reached this server (taken
    * before any database work, which shouldn't cost the player time) and
    * `thinkMs` how long the player's own clock ran, if the client said (see
-   * MAX_LAG_COMPENSATION_MS).
+   * MAX_LAG_COMPENSATION_MS). `ply` is the position the client made the move
+   * in, if it said: a move for another position (a takeback accepted while
+   * the move was on its way) is rejected rather than played where it lands.
    */
   async move(
     gameId: number,
     userId: number,
     input: MoveInput,
-    timing: { receivedAt?: number; thinkMs?: number | undefined } = {}
+    timing: { receivedAt?: number; thinkMs?: number | undefined; ply?: number | undefined } = {}
   ): Promise<void> {
     let rejected: { reason: string; fen: string; pgn: string } | null = null;
     // The position after the stored move, cached once the transaction commits
@@ -332,6 +334,10 @@ export class LiveGameService {
       const { thinkMs } = timing;
       if (activeColor(state.ply) !== color) {
         rejected = { reason: "Not your turn", fen: game.fen ?? "", pgn: game.pgn ?? "" };
+        return;
+      }
+      if (timing.ply !== undefined && timing.ply !== game.numMoves) {
+        rejected = { reason: "The position changed", fen: game.fen ?? "", pgn: game.pgn ?? "" };
         return;
       }
       // A move that arrives after the deadline doesn't count
