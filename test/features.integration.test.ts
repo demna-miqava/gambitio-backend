@@ -446,6 +446,46 @@ describe("series, repertoire, study rooms and endgames", { skip }, () => {
     });
   });
 
+  describe("friends", () => {
+    test("the other user hears about requests and friendships at once", async () => {
+      const na = await open("/notifications", alice.clerkId);
+      const nb = await open("/notifications", bob.clerkId);
+      const updated = (socket: TestSocket, event: string) =>
+        socket.next("friends_updated", (m) => m.data.event === event);
+
+      // Sent, then cancelled by the sender
+      let sent = await request("POST", "/api/friend-requests", alice.clerkId, { receiverId: bob.id });
+      assert.equal(sent.statusCode, 201);
+      const received = await updated(nb, "request_received");
+      assert.deepEqual(received.data.user, { id: alice.id, username: "alice", avatarUrl: null });
+      let requestId: number = sent.json().data.id;
+      assert.equal((await request("DELETE", `/api/friend-requests/${requestId}`, alice.clerkId)).statusCode, 200);
+      assert.equal((await updated(nb, "request_cancelled")).data.user.id, alice.id);
+
+      // Sent, then declined by the receiver
+      sent = await request("POST", "/api/friend-requests", alice.clerkId, { receiverId: bob.id });
+      requestId = sent.json().data.id;
+      await updated(nb, "request_received");
+      assert.equal((await request("POST", `/api/friend-requests/${requestId}/decline`, bob.clerkId)).statusCode, 200);
+      assert.equal((await updated(na, "request_declined")).data.user.id, bob.id);
+
+      // Sent and accepted
+      sent = await request("POST", "/api/friend-requests", alice.clerkId, { receiverId: bob.id });
+      requestId = sent.json().data.id;
+      await updated(nb, "request_received");
+      assert.equal((await request("POST", `/api/friend-requests/${requestId}/accept`, bob.clerkId)).statusCode, 200);
+      assert.deepEqual((await updated(na, "request_accepted")).data.user, { id: bob.id, username: "bobby" });
+
+      // Unfriended
+      assert.equal((await request("DELETE", `/api/friends/${alice.id}`, bob.clerkId)).statusCode, 200);
+      assert.equal((await updated(na, "removed")).data.user.id, bob.id);
+
+      // The one acting isn't told about their own action
+      await na.none("friends_updated");
+      assert.equal(nb.messages.filter((m) => m.type === "friends_updated").length, 4);
+    });
+  });
+
   describe("endgame progress", () => {
     test("attempts, completion and the best result are kept", async () => {
       const post = (body: object) => request("POST", "/api/endgames/kq-vs-k/attempts", alice.clerkId, body);

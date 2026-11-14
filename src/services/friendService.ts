@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { FriendRepository } from "../repositories/friendRepository.js";
+import { topics } from "../realtime/hub.js";
 import type {
   FriendRequest,
   PaginatedFriendRequestsResponse,
@@ -25,6 +26,23 @@ const FRIEND_CONFIG = {
   MAX_PAGE_SIZE: 100,
 } as const;
 
+/** What changed, from the point of view of the user being told. */
+export type FriendsEvent =
+  | "request_received"
+  | "request_accepted"
+  | "request_declined"
+  | "request_cancelled"
+  | "removed";
+
+/**
+ * Sent on the other user's notifications topic whenever a request or
+ * friendship between them changes, so their lists update without a reload.
+ */
+export const friendsUpdatedMessage = (
+  event: FriendsEvent,
+  user: { id: number; username?: string; avatarUrl?: string | null }
+) => ({ type: "friends_updated", data: { event, user } });
+
 /**
  * Service layer for managing friend relationships and friend requests
  * Handles business logic and validation before delegating to repositories
@@ -32,8 +50,15 @@ const FRIEND_CONFIG = {
 export class FriendService {
   private friendRepository: FriendRepository;
 
-  constructor(fastify: FastifyInstance) {
+  constructor(private fastify: FastifyInstance) {
     this.friendRepository = new FriendRepository(fastify);
+  }
+
+  /** Tells `userId` (on every tab and instance) that something changed. Never throws. */
+  private async notify(userId: number, message: ReturnType<typeof friendsUpdatedMessage>) {
+    await this.fastify.hub
+      .publish(topics.notifications(userId), message)
+      .catch((err) => this.fastify.log.error({ err, userId }, "Failed to publish friends update"));
   }
 
   /**
@@ -85,6 +110,14 @@ export class FriendService {
     );
     // Sent at the same moment as one the other way
     if (!created) throw exists();
+    await this.notify(
+      created.receiverId,
+      friendsUpdatedMessage("request_received", {
+        id: senderId,
+        username: senderUsername,
+        avatarUrl: context.senderAvatarUrl,
+      })
+    );
     return created;
   }
 
@@ -116,7 +149,17 @@ export class FriendService {
    */
   async acceptFriendRequest(requestId: number, userId: number): Promise<Friend> {
     const friendship = await this.friendRepository.acceptFriendRequest(requestId, userId);
-    if (friendship) return friendship;
+    if (friendship) {
+      // userOne is the request's sender, userTwo its receiver (who accepted)
+      await this.notify(
+        friendship.userOneId,
+        friendsUpdatedMessage("request_accepted", {
+          id: friendship.userTwoId,
+          username: friendship.userTwoUsername,
+        })
+      );
+      return friendship;
+    }
     throw await this.requestError(requestId, "Not authorized to accept this friend request");
   }
 
@@ -125,7 +168,11 @@ export class FriendService {
    * receiver of the request can decline it.
    */
   async declineFriendRequest(requestId: number, userId: number): Promise<void> {
-    if (await this.friendRepository.deleteFriendRequestAs(requestId, userId, "receiverId")) return;
+    const declined = await this.friendRepository.deleteFriendRequestAs(requestId, userId, "receiverId");
+    if (declined) {
+      await this.notify(declined.senderId, friendsUpdatedMessage("request_declined", { id: userId }));
+      return;
+    }
     throw await this.requestError(requestId, "Not authorized to decline this friend request");
   }
 
@@ -134,7 +181,11 @@ export class FriendService {
    * the request can cancel it.
    */
   async cancelFriendRequest(requestId: number, userId: number): Promise<void> {
-    if (await this.friendRepository.deleteFriendRequestAs(requestId, userId, "senderId")) return;
+    const cancelled = await this.friendRepository.deleteFriendRequestAs(requestId, userId, "senderId");
+    if (cancelled) {
+      await this.notify(cancelled.receiverId, friendsUpdatedMessage("request_cancelled", { id: userId }));
+      return;
+    }
     throw await this.requestError(requestId, "Not authorized to cancel this friend request");
   }
 
@@ -159,5 +210,6 @@ export class FriendService {
     if (!(await this.friendRepository.deleteFriendship(userId, friendId))) {
       throw new FriendNotFoundError("Not friends with this user");
     }
+    await this.notify(friendId, friendsUpdatedMessage("removed", { id: userId }));
   }
 }

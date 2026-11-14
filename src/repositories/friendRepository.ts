@@ -355,18 +355,19 @@ export class FriendRepository {
 
   /**
    * Deletes a request if `userId` is on the given side of it (the receiver
-   * declines, the sender cancels). Returns false if nothing was deleted.
+   * declines, the sender cancels). Returns the deleted request's two users,
+   * or null if nothing was deleted.
    */
   async deleteFriendRequestAs(
     requestId: number,
     userId: number,
     side: "senderId" | "receiverId"
-  ): Promise<boolean> {
-    const { rowCount } = await this.fastify.pg.query(
-      `DELETE FROM friend_requests WHERE id = $1 AND "${side}" = $2`,
+  ): Promise<Pick<FriendRequest, "senderId" | "receiverId"> | null> {
+    const { rows } = await this.fastify.pg.query<Pick<FriendRequest, "senderId" | "receiverId">>(
+      `DELETE FROM friend_requests WHERE id = $1 AND "${side}" = $2 RETURNING "senderId", "receiverId"`,
       [requestId, userId]
     );
-    return (rowCount ?? 0) > 0;
+    return rows[0] ?? null;
   }
 
   /**
