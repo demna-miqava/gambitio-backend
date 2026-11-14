@@ -1,7 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Chess } from "chess.js";
-import { applyMove, applyMoveTo, appendToPgn, loadGame } from "../src/game/engine.js";
+import {
+  applyMove,
+  applyMoveTo,
+  appendToPgn,
+  loadGame,
+  takebackPlies,
+  undoMoves,
+} from "../src/game/engine.js";
 import { PositionCache } from "../src/game/positionCache.js";
 
 /** Small deterministic PRNG so failures reproduce */
@@ -50,6 +57,38 @@ test("an illegal move leaves the cached position unchanged", () => {
   const bad = applyMoveTo(chess, first.pgn, first.ply, { from: "e4", to: "e6" });
   assert.equal(bad.ok, false);
   assert.equal(chess.fen(), fen);
+});
+
+test("a takeback undoes the requester's move and any reply, never back before ply 2", () => {
+  // White to move: white undoes the reply too, black just their own move
+  assert.equal(takebackPlies(4, "white"), 2);
+  assert.equal(takebackPlies(4, "black"), 1);
+  assert.equal(takebackPlies(3, "white"), 1);
+  // Would reopen the first-move window, or the requester hasn't moved
+  assert.equal(takebackPlies(3, "black"), null);
+  assert.equal(takebackPlies(2, "white"), null);
+  assert.equal(takebackPlies(2, "black"), null);
+  assert.equal(takebackPlies(1, "white"), null);
+  assert.equal(takebackPlies(0, "white"), null);
+});
+
+test("undoing moves gives the PGN the moves would have written", () => {
+  const pgns = [""];
+  const chess = new Chess();
+  for (const [from, to] of [["e2", "e4"], ["e7", "e5"], ["g1", "f3"], ["b8", "c6"]] as const) {
+    const played = applyMoveTo(chess, pgns.at(-1)!, pgns.length - 1, { from, to });
+    assert.ok(played.ok);
+    pgns.push(played.pgn);
+  }
+  // Both on a live position and on one loaded from the stored PGN
+  for (const position of [chess, loadGame(pgns[4])]) {
+    const undone = undoMoves(position, 4, 2);
+    assert.deepEqual(undone, { fen: loadGame(pgns[2]).fen(), pgn: pgns[2], ply: 2 });
+    // ...and the next move appends to it
+    const next = applyMoveTo(position, undone.pgn, undone.ply, { from: "d2", to: "d4" });
+    assert.ok(next.ok);
+    assert.equal(next.pgn, position.pgn());
+  }
 });
 
 test("appendToPgn refuses PGN it didn't write", () => {

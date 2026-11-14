@@ -8,6 +8,7 @@ const GAME_COLUMNS = `
   "whiteAvatarUrl", "blackAvatarUrl", status, result, "endReason", "endedAt",
   "whiteTimeLeftMs", "blackTimeLeftMs", "lastMoveAt", "deadlineAt",
   "drawOfferedBy", "rematchRequestedBy", "rematchGameId",
+  "takebackRequestedBy", "takebackDeclinedFor",
   "whiteRatingChange", "blackRatingChange", "botId", rated, "seriesId", "seriesGame"`;
 
 /** GAME_COLUMNS without the move list and position, for lists. */
@@ -152,6 +153,10 @@ export const gameRepository = {
     return rows[0]!;
   },
 
+  /**
+   * Stores a new position: a move, or an accepted takeback. Either clears a
+   * pending takeback request and a declined one's block (migration 021).
+   */
   async saveMove(
     db: Queryable,
     gameId: number,
@@ -169,7 +174,8 @@ export const gameRepository = {
     await db.query(
       `UPDATE games SET fen = $2, pgn = $3, "numMoves" = $4,
          "whiteTimeLeftMs" = $5, "blackTimeLeftMs" = $6, "lastMoveAt" = $7,
-         "deadlineAt" = $8, "drawOfferedBy" = $9
+         "deadlineAt" = $8, "drawOfferedBy" = $9,
+         "takebackRequestedBy" = NULL, "takebackDeclinedFor" = NULL
        WHERE id = $1`,
       [
         gameId,
@@ -202,7 +208,8 @@ export const gameRepository = {
     const { rowCount } = await db.query(
       `UPDATE games SET status = 'finished', result = $2, "endReason" = $3, "winnerId" = $4,
          "whiteTimeLeftMs" = $5, "blackTimeLeftMs" = $6, "whiteRatingChange" = $7,
-         "blackRatingChange" = $8, "endedAt" = now(), "deadlineAt" = NULL, "drawOfferedBy" = NULL
+         "blackRatingChange" = $8, "endedAt" = now(), "deadlineAt" = NULL, "drawOfferedBy" = NULL,
+         "takebackRequestedBy" = NULL, "takebackDeclinedFor" = NULL
        WHERE id = $1 AND status = 'in_progress'`,
       [
         gameId,
@@ -233,6 +240,18 @@ export const gameRepository = {
 
   async setDrawOffer(db: Queryable, gameId: number, userId: number | null): Promise<void> {
     await db.query(`UPDATE games SET "drawOfferedBy" = $2 WHERE id = $1`, [gameId, userId]);
+  },
+
+  async setTakebackRequest(db: Queryable, gameId: number, userId: number): Promise<void> {
+    await db.query(`UPDATE games SET "takebackRequestedBy" = $2 WHERE id = $1`, [gameId, userId]);
+  },
+
+  /** Clears the request; `requesterId` can't ask again until the next move. */
+  async declineTakeback(db: Queryable, gameId: number, requesterId: number): Promise<void> {
+    await db.query(
+      `UPDATE games SET "takebackRequestedBy" = NULL, "takebackDeclinedFor" = $2 WHERE id = $1`,
+      [gameId, requesterId]
+    );
   },
 
   async setRematchRequest(db: Queryable, gameId: number, userId: number | null): Promise<void> {

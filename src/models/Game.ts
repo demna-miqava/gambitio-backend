@@ -34,6 +34,10 @@ export interface Game {
   drawOfferedBy: number | null;
   rematchRequestedBy: number | null;
   rematchGameId: number | null;
+  /** The player asking to take back a move (migration 021) */
+  takebackRequestedBy: number | null;
+  /** The player whose takeback was declined; they can't ask again until a move is made */
+  takebackDeclinedFor: number | null;
   whiteRatingChange: number | null;
   blackRatingChange: number | null;
   /** The computer opponent (src/game/bots.ts) when this is a bot game */

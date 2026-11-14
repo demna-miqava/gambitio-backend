@@ -320,6 +320,276 @@ describe("live games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_
     assert.equal((await w.next("error")).data.code, "ABORT_NOT_ALLOWED");
   });
 
+  /** Plays `ucis` from ply `from`, white's moves on `w`, waiting until each is played. */
+  const play = async ({ w, b }: { w: TestSocket; b: TestSocket }, ucis: string[], from = 0) => {
+    for (const [i, uci] of ucis.entries()) {
+      const ply = from + i;
+      (ply % 2 === 0 ? w : b).send(move(uci));
+      await w.next("move", (m) => m.move.lan === uci && m.moveNumber === ply + 1);
+    }
+  };
+  const storedGame = async (gameId: number) =>
+    (
+      await app.pg.query(
+        `SELECT "numMoves", pgn, "takebackRequestedBy", "takebackDeclinedFor", "drawOfferedBy"
+         FROM games WHERE id = $1`,
+        [gameId]
+      )
+    ).rows[0];
+  const stateOf = async (gameId: number, clerkId: string) =>
+    (await (await open(`/game/${gameId}`, clerkId)).next("initial_game_state")).data;
+
+  test("a takeback on the requester's turn undoes their move and the reply", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    const watcher = await createUser(app, "watcher");
+    const s = await open(`/game/${game.id}`, watcher.clerkId);
+    await s.next("initial_game_state");
+    await play({ w, b }, ["e2e4", "e7e5", "g1f3", "b8c6"]);
+
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+    await w.none("takeback_request");
+    await s.none("takeback_request");
+    // The pending request is between the players
+    assert.equal((await stateOf(game.id, black.clerkId)).takebackRequestedBy, white.id);
+    assert.equal((await stateOf(game.id, white.clerkId)).takebackRequestedBy, white.id);
+    assert.equal((await stateOf(game.id, watcher.clerkId)).takebackRequestedBy, null);
+    // Asking again while pending changes nothing
+    w.send({ type: "takeback_request" });
+    await b.none("takeback_request");
+
+    b.send({ type: "takeback_response", accepted: true });
+    const taken = await w.next("takeback");
+    assert.equal(taken.moveNumber, 2);
+    assert.equal(taken.fen, "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2");
+    assert.ok(taken.pgn.endsWith("\n\n1. e4 e5 *"), taken.pgn);
+    assert.equal(taken.clockRunning, true);
+    assert.equal(typeof taken.whiteTimeLeft, "number");
+    assert.deepEqual(await b.next("takeback"), taken);
+    assert.deepEqual(await s.next("takeback"), taken);
+    assert.deepEqual(await storedGame(game.id), {
+      numMoves: 2,
+      pgn: taken.pgn,
+      takebackRequestedBy: null,
+      takebackDeclinedFor: null,
+      drawOfferedBy: null,
+    });
+
+    // The game goes on from the restored position: Nf3 is legal again
+    await play({ w, b }, ["g1f3", "g8f6"], 2);
+    assert.equal((await stateOf(game.id, white.clerkId)).numMoves, 4);
+  });
+
+  test("a takeback on the opponent's turn undoes only the requester's move", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    await play({ w, b }, ["e2e4", "e7e5", "g1f3"]);
+    w.send({ type: "draw_offer" });
+    await b.next("draw_offer");
+
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+    b.send({ type: "takeback_response", accepted: true });
+    const taken = await w.next("takeback");
+    assert.equal(taken.moveNumber, 2);
+    assert.ok(taken.pgn.endsWith("1. e4 e5 *"), taken.pgn);
+    // A pending draw offer lapses with the position it was made in
+    assert.equal((await storedGame(game.id)).drawOfferedBy, null);
+
+    // White is to move again
+    b.send(move("b8c6"));
+    assert.equal((await b.next("move_rejected")).message, "Not your turn");
+    await play({ w, b }, ["d2d4"], 2);
+  });
+
+  test("a takeback can't go back before both players have moved", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    const refused = async (socket: TestSocket) => {
+      socket.send({ type: "takeback_request" });
+      assert.equal((await socket.next("error")).data.code, "TAKEBACK_NOT_ALLOWED");
+    };
+
+    await refused(w); // nothing played
+    await play({ w, b }, ["e2e4"]);
+    await refused(w);
+    await refused(b); // hasn't moved
+    await play({ w, b }, ["e7e5"], 1);
+    await refused(w);
+    await refused(b);
+    await play({ w, b }, ["g1f3"], 2);
+    await refused(b); // would undo black's first move
+    await w.none("takeback_request");
+    await b.none("takeback_request");
+    assert.equal((await storedGame(game.id)).takebackRequestedBy, null);
+
+    // Answering a request nobody made
+    b.send({ type: "takeback_response", accepted: true });
+    assert.equal((await b.next("error")).data.code, "NO_TAKEBACK_REQUEST");
+    // From here white can ask
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+    // ...but can't answer their own request
+    w.send({ type: "takeback_response", accepted: true });
+    assert.equal((await w.next("error")).data.code, "NO_TAKEBACK_REQUEST");
+  });
+
+  test("a declined takeback can't be asked for again until a move is made", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    await play({ w, b }, ["e2e4", "e7e5", "g1f3"]);
+
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+    b.send({ type: "takeback_response", accepted: false });
+    assert.deepEqual(await w.next("takeback_response"), { type: "takeback_response", accepted: false });
+    await b.none("takeback_response");
+    assert.equal((await storedGame(game.id)).takebackDeclinedFor, white.id);
+    assert.equal((await stateOf(game.id, black.clerkId)).takebackRequestedBy, null);
+
+    w.send({ type: "takeback_request" });
+    assert.equal((await w.next("error")).data.code, "TAKEBACK_DECLINED");
+    await b.none("takeback_request");
+
+    // A move lifts the block
+    await play({ w, b }, ["b8c6"], 3);
+    assert.equal((await storedGame(game.id)).takebackDeclinedFor, null);
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+  });
+
+  test("a move clears a pending takeback request", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    await play({ w, b }, ["e2e4", "e7e5", "g1f3", "b8c6"]);
+
+    // White asks, then plays on instead
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+    await play({ w, b }, ["f1c4"], 4);
+    assert.equal((await storedGame(game.id)).takebackRequestedBy, null);
+    assert.equal((await stateOf(game.id, black.clerkId)).takebackRequestedBy, null);
+    b.send({ type: "takeback_response", accepted: true });
+    assert.equal((await b.next("error")).data.code, "NO_TAKEBACK_REQUEST");
+    await w.none("takeback");
+
+    // The end of the game clears one too
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+    b.send({ type: "resign" });
+    await w.next("game_ended");
+    assert.equal((await storedGame(game.id)).takebackRequestedBy, null);
+    b.send({ type: "takeback_response", accepted: true });
+    assert.equal((await b.next("error")).data.code, "GAME_OVER");
+  });
+
+  test("both players asking for a takeback means both agree", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    await play({ w, b }, ["e2e4", "e7e5", "g1f3", "b8c6"]);
+
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+    b.send({ type: "takeback_request" });
+    // White's request is the one granted: back to white's move
+    const taken = await b.next("takeback");
+    assert.equal(taken.moveNumber, 2);
+    await w.next("takeback");
+    await w.none("takeback_request");
+    assert.equal((await storedGame(game.id)).takebackRequestedBy, null);
+  });
+
+  test("after a takeback the clock runs for the side to move, with the time they had left", async () => {
+    const game = await newGame(60, 2);
+    const { w, b } = await joinGame(game.id);
+    await play({ w, b }, ["e2e4", "e7e5", "g1f3"]);
+
+    // Black to move, thinking for 5s so far
+    await app.pg.query(
+      `UPDATE games SET "whiteTimeLeftMs" = 50000, "blackTimeLeftMs" = 40000,
+         "lastMoveAt" = now() - interval '5 seconds', "deadlineAt" = now() + interval '36 seconds'
+       WHERE id = $1`,
+      [game.id]
+    );
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+    b.send({ type: "takeback_response", accepted: true });
+    const taken = await w.next("takeback");
+    assert.equal(taken.moveNumber, 2);
+    assert.equal(taken.clockRunning, true);
+    // Black is charged the 5s; white's time stays (no increment back or again)
+    assert.equal(taken.whiteTimeLeft, 50_000);
+    assert.ok(taken.blackTimeLeft > 34_000 && taken.blackTimeLeft <= 35_000, `black has ${taken.blackTimeLeft}ms`);
+
+    // Now white's clock runs from the takeback, and their flag is the deadline
+    const { rows } = await app.pg.query(
+      `SELECT "whiteTimeLeftMs", "blackTimeLeftMs",
+         extract(epoch FROM now() - "lastMoveAt") * 1000 AS "sinceTakeback",
+         extract(epoch FROM "deadlineAt" - "lastMoveAt") * 1000 AS "deadlineIn"
+       FROM games WHERE id = $1`,
+      [game.id]
+    );
+    assert.equal(rows[0].whiteTimeLeftMs, 50_000);
+    assert.equal(rows[0].blackTimeLeftMs, taken.blackTimeLeft);
+    assert.ok(Number(rows[0].sinceTakeback) < 1_000, `${rows[0].sinceTakeback}ms since the takeback`);
+    assert.equal(Math.round(Number(rows[0].deadlineIn)), 50_000 + 1_000); // + MAX_LAG_COMPENSATION_MS
+    const state = await stateOf(game.id, white.clerkId);
+    assert.ok(state.whiteTimeLeft <= 50_000 && state.whiteTimeLeft > 49_000);
+    assert.equal(state.blackTimeLeft, taken.blackTimeLeft);
+
+    // White's next move is charged from the takeback and gets the increment
+    w.send(move("g1f3"));
+    // On w: play() already took w's earlier move 3, b still has it
+    const played = await w.next("move", (m) => m.moveNumber === 3);
+    assert.ok(played.whiteTimeLeft > 51_000 && played.whiteTimeLeft <= 52_000, `white has ${played.whiteTimeLeft}ms`);
+  });
+
+  test("a move made for a position a takeback has since replaced is rejected", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    await play({ w, b }, ["e2e4", "e7e5", "g1f3", "b8c6"]);
+
+    // White asks on their own turn (back to ply 2), black accepts...
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+    b.send({ type: "takeback_response", accepted: true });
+    await w.next("takeback");
+    // ...while white, still seeing ply 4, plays Bc4: legal at ply 2 too, but
+    // meant for another position
+    w.send({ ...move("f1c4"), ply: 4 });
+    const rejected = await w.next("move_rejected");
+    assert.equal(rejected.message, "The position changed");
+    assert.ok(rejected.pgn.endsWith("1. e4 e5 *"), rejected.pgn);
+    assert.equal((await storedGame(game.id)).numMoves, 2);
+
+    // Resynced, the same move for the right position is played
+    w.send({ ...move("f1c4"), ply: 2 });
+    assert.equal((await w.next("move")).moveNumber, 3);
+    // A client that doesn't say which position it means is trusted as before
+    b.send(move("g8f6"));
+    assert.equal((await b.next("move", (m) => m.moveNumber === 4)).moveNumber, 4);
+  });
+
+  test("a takeback can't save a flag that has already fallen", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    await play({ w, b }, ["e2e4", "e7e5", "g1f3"]);
+    w.send({ type: "takeback_request" });
+    await b.next("takeback_request");
+    // Black's clock runs out, within the lag allowance (deadline not reached)
+    await app.pg.query(
+      `UPDATE games SET "blackTimeLeftMs" = 1000, "lastMoveAt" = now() - interval '1500 milliseconds',
+         "deadlineAt" = now() + interval '500 milliseconds' WHERE id = $1`,
+      [game.id]
+    );
+    b.send({ type: "takeback_response", accepted: true });
+    const ended = await w.next("game_ended");
+    assert.equal(ended.reason, "timeout");
+    assert.equal(ended.winnerId, white.id);
+    await w.none("takeback");
+  });
+
   test("closing a second tab doesn't disconnect the first", async () => {
     const game = await newGame();
     const { w, b } = await joinGame(game.id);
