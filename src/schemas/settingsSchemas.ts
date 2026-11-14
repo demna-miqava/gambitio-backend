@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { COLOR_PALETTES } from "../models/Settings.js";
 
 export const updateSettingsSchema = z
   .object({
@@ -17,6 +18,7 @@ export const updateSettingsSchema = z
     messagesAllowedFrom: z
       .enum(["nobody", "everyone", "only_friends"])
       .optional(),
+    colorPalette: z.enum(COLOR_PALETTES).optional(),
   })
   .strict()
   .refine((data) => Object.keys(data).length > 0, {

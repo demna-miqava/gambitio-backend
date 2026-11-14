@@ -1,141 +1,132 @@
 import type { FastifyInstance } from "fastify";
 import { FriendRepository } from "../repositories/friendRepository.js";
+import { topics } from "../realtime/hub.js";
 import type {
-  PaginatedFriendsResponse,
   FriendRequest,
   PaginatedFriendRequestsResponse,
   Friend,
   FriendSuggestion,
 } from "../models/Friend.js";
+import {
+  SelfFriendRequestError,
+  UserNotFoundError,
+  FriendshipExistsError,
+  FriendRequestExistsError,
+  FriendRequestNotFoundError,
+  UnauthorizedFriendActionError,
+  FriendNotFoundError,
+} from "../errors/index.js";
 
+/**
+ * Configuration constants for friend-related operations
+ */
+const FRIEND_CONFIG = {
+  MAX_SUGGESTIONS: 5,
+  DEFAULT_PAGE_SIZE: 10,
+  MAX_PAGE_SIZE: 100,
+} as const;
+
+/** What changed, from the point of view of the user being told. */
+export type FriendsEvent =
+  | "request_received"
+  | "request_accepted"
+  | "request_declined"
+  | "request_cancelled"
+  | "removed";
+
+/**
+ * Sent on the other user's notifications topic whenever a request or
+ * friendship between them changes, so their lists update without a reload.
+ */
+export const friendsUpdatedMessage = (
+  event: FriendsEvent,
+  user: { id: number; username?: string; avatarUrl?: string | null }
+) => ({ type: "friends_updated", data: { event, user } });
+
+/**
+ * Service layer for managing friend relationships and friend requests
+ * Handles business logic and validation before delegating to repositories
+ */
 export class FriendService {
   private friendRepository: FriendRepository;
 
-  constructor(fastify: FastifyInstance) {
+  constructor(private fastify: FastifyInstance) {
     this.friendRepository = new FriendRepository(fastify);
   }
 
-  /**
-   * Get friend suggestions (max 5)
-   * If query provided, search users; otherwise return random suggestions
-   */
-  async getFriendSuggestions(
-    userId: number,
-    searchQuery?: string
-  ): Promise<{ data: FriendSuggestion[] }> {
-    const limit = 5;
-    const offset = 0;
-
-    let suggestions;
-
-    if (searchQuery) {
-      // Search for users matching the query
-      const result = await this.friendRepository.searchUsers(
-        userId,
-        searchQuery,
-        limit,
-        offset
-      );
-      suggestions = result.suggestions;
-    } else {
-      // Get random friend suggestions
-      const result = await this.friendRepository.getFriendSuggestions(
-        userId,
-        limit,
-        offset
-      );
-      suggestions = result.suggestions;
-    }
-
-    return {
-      data: suggestions,
-    };
+  /** Tells `userId` (on every tab and instance) that something changed. Never throws. */
+  private async notify(userId: number, message: ReturnType<typeof friendsUpdatedMessage>) {
+    await this.fastify.hub
+      .publish(topics.notifications(userId), message)
+      .catch((err) => this.fastify.log.error({ err, userId }, "Failed to publish friends update"));
   }
 
   /**
-   * Get user's friends list (paginated)
-   * If searchQuery provided, filter friends by username
+   * Up to MAX_SUGGESTIONS users to add: matching `searchQuery` when given,
+   * otherwise a random handful.
    */
-  async getFriends(
-    userId: number,
-    page: number,
-    limit: number,
-    searchQuery?: string
-  ): Promise<PaginatedFriendsResponse> {
-    const offset = (page - 1) * limit;
-    // Return user's friends list
-    const { suggestions: friends, total } =
-      await this.friendRepository.getFriends(
-        userId,
-        limit,
-        offset,
-        searchQuery
-      );
-
-    const totalPages = Math.ceil(total / limit);
-
-    return {
-      data: friends,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages,
-      },
-    };
+  async getFriendSuggestions(userId: number, searchQuery?: string): Promise<FriendSuggestion[]> {
+    const limit = FRIEND_CONFIG.MAX_SUGGESTIONS;
+    return searchQuery
+      ? this.friendRepository.searchUsers(userId, searchQuery, limit)
+      : this.friendRepository.getFriendSuggestions(userId, limit);
   }
 
   /**
-   * Send friend request
+   * Send a friend request from one user to another
+   *
+   * @throws {SelfFriendRequestError} If trying to send request to self
+   * @throws {UserNotFoundError} If receiver doesn't exist
+   * @throws {FriendshipExistsError} If users are already friends
+   * @throws {FriendRequestExistsError} If a request already exists between users
    */
   async sendFriendRequest(
     senderId: number,
     senderUsername: string,
-    senderAvatarUrl: string | null,
     receiverId: number
   ): Promise<FriendRequest> {
-    // Check if trying to send request to self
     if (senderId === receiverId) {
-      throw new Error("Cannot send friend request to yourself");
+      throw new SelfFriendRequestError("Cannot send friend request to yourself");
     }
 
-    // Get receiver info
-    const receiver = await this.friendRepository.getUserById(receiverId);
-    if (!receiver) {
-      throw new Error("User not found");
+    const context = await this.friendRepository.getRequestContext(senderId, receiverId);
+    if (!context.receiver) {
+      throw new UserNotFoundError(`User with ID ${receiverId} not found`);
     }
-
-    // Check if already friends
-    const areFriends = await this.friendRepository.areFriends(
-      senderId,
-      receiverId
-    );
-    if (areFriends) {
-      throw new Error("Already friends with this user");
+    if (context.areFriends) {
+      throw new FriendshipExistsError("Already friends with this user");
     }
+    const exists = () =>
+      new FriendRequestExistsError("Friend request already exists between these users");
+    if (context.requestExists) throw exists();
 
-    // Check if friend request already exists
-    const requestExists = await this.friendRepository.friendRequestExists(
-      senderId,
-      receiverId
-    );
-    if (requestExists) {
-      throw new Error("Friend request already exists");
-    }
-
-    // Create friend request
-    return await this.friendRepository.createFriendRequest(
+    const created = await this.friendRepository.createFriendRequest(
       senderId,
       senderUsername,
-      senderAvatarUrl,
-      receiver.id,
-      receiver.username,
-      receiver.avatarUrl
+      context.senderAvatarUrl,
+      context.receiver.id,
+      context.receiver.username,
+      context.receiver.avatarUrl
     );
+    // Sent at the same moment as one the other way
+    if (!created) throw exists();
+    await this.notify(
+      created.receiverId,
+      friendsUpdatedMessage("request_received", {
+        id: senderId,
+        username: senderUsername,
+        avatarUrl: context.senderAvatarUrl,
+      })
+    );
+    return created;
   }
 
   /**
-   * Get pending friend requests (both incoming and outgoing)
+   * Get all pending friend requests for a user
+   * Returns both incoming requests (received) and outgoing requests (sent)
+   *
+   * @param userId - The ID of the user
+   * @returns Object containing arrays of incoming and outgoing requests
    */
   async getPendingFriendRequests(
     userId: number
@@ -150,75 +141,75 @@ export class FriendService {
   }
 
   /**
-   * Accept friend request
+   * Accept a friend request, creating a friendship. Only the receiver of the
+   * request can accept it.
+   *
+   * @throws {FriendRequestNotFoundError} If the request doesn't exist
+   * @throws {UnauthorizedFriendActionError} If user is not the receiver
    */
-  async acceptFriendRequest(
-    requestId: number,
-    userId: number
-  ): Promise<Friend> {
-    const request = await this.friendRepository.getFriendRequestById(requestId);
-    if (!request) {
-      throw new Error("Friend request not found");
+  async acceptFriendRequest(requestId: number, userId: number): Promise<Friend> {
+    const friendship = await this.friendRepository.acceptFriendRequest(requestId, userId);
+    if (friendship) {
+      // userOne is the request's sender, userTwo its receiver (who accepted)
+      await this.notify(
+        friendship.userOneId,
+        friendsUpdatedMessage("request_accepted", {
+          id: friendship.userTwoId,
+          username: friendship.userTwoUsername,
+        })
+      );
+      return friendship;
     }
-
-    // Verify the user is the receiver of this request
-    if (request.receiverId !== userId) {
-      throw new Error("Not authorized to accept this friend request");
-    }
-
-    return await this.friendRepository.acceptFriendRequest(requestId);
+    throw await this.requestError(requestId, "Not authorized to accept this friend request");
   }
 
   /**
-   * Decline friend request
+   * Decline a friend request (delete without creating friendship). Only the
+   * receiver of the request can decline it.
    */
   async declineFriendRequest(requestId: number, userId: number): Promise<void> {
-    const request = await this.friendRepository.getFriendRequestById(requestId);
-    if (!request) {
-      throw new Error("Friend request not found");
+    const declined = await this.friendRepository.deleteFriendRequestAs(requestId, userId, "receiverId");
+    if (declined) {
+      await this.notify(declined.senderId, friendsUpdatedMessage("request_declined", { id: userId }));
+      return;
     }
-
-    // Verify the user is the receiver of this request
-    if (request.receiverId !== userId) {
-      throw new Error("Not authorized to decline this friend request");
-    }
-
-    await this.friendRepository.declineFriendRequest(requestId);
+    throw await this.requestError(requestId, "Not authorized to decline this friend request");
   }
 
   /**
-   * Cancel friend request (for outgoing requests)
+   * Cancel a friend request (delete an outgoing request). Only the sender of
+   * the request can cancel it.
    */
   async cancelFriendRequest(requestId: number, userId: number): Promise<void> {
-    const request = await this.friendRepository.getFriendRequestById(requestId);
-    if (!request) {
-      throw new Error("Friend request not found");
+    const cancelled = await this.friendRepository.deleteFriendRequestAs(requestId, userId, "senderId");
+    if (cancelled) {
+      await this.notify(cancelled.receiverId, friendsUpdatedMessage("request_cancelled", { id: userId }));
+      return;
     }
-
-    // Verify the user is the sender of this request
-    if (request.senderId !== userId) {
-      throw new Error("Not authorized to cancel this friend request");
-    }
-
-    await this.friendRepository.cancelFriendRequest(requestId);
+    throw await this.requestError(requestId, "Not authorized to cancel this friend request");
   }
 
   /**
-   * Delete friendship
+   * Why acting on a request failed: it doesn't exist, or it isn't this
+   * user's to act on. Only looked up on the failure path.
+   */
+  private async requestError(requestId: number, unauthorizedMessage: string): Promise<Error> {
+    const request = await this.friendRepository.getFriendRequestById(requestId);
+    return request
+      ? new UnauthorizedFriendActionError(unauthorizedMessage)
+      : new FriendRequestNotFoundError(`Friend request with ID ${requestId} not found`);
+  }
+
+  /**
+   * Delete a friendship between two users. Either user in the friendship can
+   * delete it.
+   *
+   * @throws {FriendNotFoundError} If users are not friends
    */
   async deleteFriendship(userId: number, friendId: number): Promise<void> {
-    // Check if they are actually friends
-    const areFriends = await this.friendRepository.areFriends(userId, friendId);
-    if (!areFriends) {
-      throw new Error("Not friends with this user");
+    if (!(await this.friendRepository.deleteFriendship(userId, friendId))) {
+      throw new FriendNotFoundError("Not friends with this user");
     }
-
-    const deleted = await this.friendRepository.deleteFriendship(
-      userId,
-      friendId
-    );
-    if (!deleted) {
-      throw new Error("Failed to delete friendship");
-    }
+    await this.notify(friendId, friendsUpdatedMessage("removed", { id: userId }));
   }
 }

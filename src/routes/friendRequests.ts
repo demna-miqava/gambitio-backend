@@ -1,11 +1,6 @@
-import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
+import type { FastifyInstance } from "fastify";
 import { FriendService } from "../services/friendService.js";
-import {
-  sendFriendRequestSchema,
-  requestIdParamSchema,
-  type SendFriendRequest,
-  type RequestIdParam,
-} from "../schemas/friendSchemas.js";
+import { sendFriendRequestSchema, requestIdParamSchema } from "../schemas/friendSchemas.js";
 import { authMiddleware } from "../middleware/auth.js";
 
 export async function friendRequestsRoutes(fastify: FastifyInstance) {
@@ -13,183 +8,49 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
 
   /**
    * POST /api/friend-requests
-   * Send a friend request
+   * 400 for self-request / already friends / request exists, 404 if receiver not found
    */
-  fastify.post<{ Body: SendFriendRequest }>(
-    "/friend-requests",
-    { preHandler: authMiddleware },
-    async (request: FastifyRequest, reply: FastifyReply) => {
-      try {
-        // Validate request body
-        const validation = sendFriendRequestSchema.safeParse(request.body);
-        console.log("VALIDATION", validation);
-        if (!validation.success) {
-          return reply.status(400).send({
-            error: "Validation failed",
-            details: validation.error.issues,
-          });
-        }
-
-        const { receiverId } = validation.data;
-
-        const friendRequest = await friendService.sendFriendRequest(
-          request.user!.id,
-          request.user!.username,
-          null, // avatarUrl - fetch from DB if needed
-          receiverId
-        );
-
-        return reply.status(201).send(friendRequest);
-      } catch (error) {
-        if (error instanceof Error) {
-          if (
-            error.message === "User not found" ||
-            error.message === "Cannot send friend request to yourself" ||
-            error.message === "Already friends with this user" ||
-            error.message === "Friend request already exists"
-          ) {
-            return reply.status(400).send({ error: error.message });
-          }
-        }
-        return reply.status(500).send({ error: "Internal server error" });
-      }
-    }
-  );
+  fastify.post("/friend-requests", { preHandler: authMiddleware }, async (request, reply) => {
+    const { receiverId } = sendFriendRequestSchema.parse(request.body);
+    const friendRequest = await friendService.sendFriendRequest(
+      request.user!.id,
+      request.user!.username,
+      receiverId
+    );
+    return reply.status(201).send({ data: friendRequest });
+  });
 
   /**
    * GET /api/friend-requests/pending
-   * Get pending friend requests
+   * Incoming and outgoing pending requests
    */
-  fastify.get(
-    "/friend-requests/pending",
-    { preHandler: authMiddleware },
-    async (request: FastifyRequest, reply: FastifyReply) => {
-      try {
-        const requests = await friendService.getPendingFriendRequests(
-          request.user!.id
-        );
+  fastify.get("/friend-requests/pending", { preHandler: authMiddleware }, async (request) => {
+    return friendService.getPendingFriendRequests(request.user!.id);
+  });
 
-        return reply.send(requests);
-      } catch (error) {
-        return reply.status(500).send({ error: "Internal server error" });
-      }
-    }
-  );
-
-  /**
-   * POST /api/friend-requests/:requestId/accept
-   * Accept a friend request
-   */
-  fastify.post<{ Params: RequestIdParam }>(
+  fastify.post(
     "/friend-requests/:requestId/accept",
     { preHandler: authMiddleware },
-    async (request: FastifyRequest, reply: FastifyReply) => {
-      try {
-        // Validate path parameters
-        const validation = requestIdParamSchema.safeParse(request.params);
-        if (!validation.success) {
-          return reply.status(400).send({
-            error: "Validation failed",
-            details: validation.error.issues,
-          });
-        }
-
-        const requestId = parseInt(validation.data.requestId, 10);
-
-        const friendship = await friendService.acceptFriendRequest(
-          requestId,
-          request.user!.id
-        );
-
-        return reply.send({
-          message: "Friend request accepted",
-          friendship,
-        });
-      } catch (error) {
-        if (error instanceof Error) {
-          if (
-            error.message === "Friend request not found" ||
-            error.message === "Not authorized to accept this friend request"
-          ) {
-            return reply.status(404).send({ error: error.message });
-          }
-        }
-        return reply.status(500).send({ error: "Internal server error" });
-      }
+    async (request) => {
+      const { requestId } = requestIdParamSchema.parse(request.params);
+      const friendship = await friendService.acceptFriendRequest(requestId, request.user!.id);
+      return { success: true, message: "Friend request accepted", data: friendship };
     }
   );
 
-  /**
-   * POST /api/friend-requests/:requestId/decline
-   * Decline a friend request
-   */
-  fastify.post<{ Params: RequestIdParam }>(
+  fastify.post(
     "/friend-requests/:requestId/decline",
     { preHandler: authMiddleware },
-    async (request: FastifyRequest, reply: FastifyReply) => {
-      try {
-        // Validate path parameters
-        const validation = requestIdParamSchema.safeParse(request.params);
-        if (!validation.success) {
-          return reply.status(400).send({
-            error: "Validation failed",
-            details: validation.error.issues,
-          });
-        }
-
-        const requestId = parseInt(validation.data.requestId, 10);
-
-        await friendService.declineFriendRequest(requestId, request.user!.id);
-
-        return reply.send({ message: "Friend request declined" });
-      } catch (error) {
-        if (error instanceof Error) {
-          if (
-            error.message === "Friend request not found" ||
-            error.message === "Not authorized to decline this friend request"
-          ) {
-            return reply.status(404).send({ error: error.message });
-          }
-        }
-        return reply.status(500).send({ error: "Internal server error" });
-      }
+    async (request) => {
+      const { requestId } = requestIdParamSchema.parse(request.params);
+      await friendService.declineFriendRequest(requestId, request.user!.id);
+      return { success: true, message: "Friend request declined" };
     }
   );
 
-  /**
-   * DELETE /api/friend-requests/:requestId
-   * Cancel a friend request (outgoing)
-   */
-  fastify.delete<{ Params: RequestIdParam }>(
-    "/friend-requests/:requestId",
-    { preHandler: authMiddleware },
-    async (request: FastifyRequest, reply: FastifyReply) => {
-      try {
-        // Validate path parameters
-        const validation = requestIdParamSchema.safeParse(request.params);
-        if (!validation.success) {
-          return reply.status(400).send({
-            error: "Validation failed",
-            details: validation.error.issues,
-          });
-        }
-
-        const requestId = parseInt(validation.data.requestId, 10);
-
-        await friendService.cancelFriendRequest(requestId, request.user!.id);
-
-        return reply.send({ message: "Friend request canceled" });
-      } catch (error) {
-        if (error instanceof Error) {
-          if (
-            error.message === "Friend request not found" ||
-            error.message === "Not authorized to cancel this friend request"
-          ) {
-            return reply.status(404).send({ error: error.message });
-          }
-        }
-        return reply.status(500).send({ error: "Internal server error" });
-      }
-    }
-  );
+  fastify.delete("/friend-requests/:requestId", { preHandler: authMiddleware }, async (request) => {
+    const { requestId } = requestIdParamSchema.parse(request.params);
+    await friendService.cancelFriendRequest(requestId, request.user!.id);
+    return { success: true, message: "Friend request canceled" };
+  });
 }

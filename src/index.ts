@@ -1,18 +1,28 @@
 import { buildApp } from "./app.js";
+import { loadConfig } from "./config.js";
 
 async function start() {
-  try {
-    const app = await buildApp();
+  const config = loadConfig();
+  const app = await buildApp(config);
 
-    const port = Number(process.env.PORT) || 5000;
-
-    await app.listen({ port, host: "0.0.0.0" });
-
-    console.log(`Server listening at http://localhost:${port}`);
-  } catch (err) {
-    console.error(err);
-    process.exit(1);
+  // Close connections and finish in-flight requests on shutdown
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.once(signal, () => {
+      app.log.info({ signal }, "Shutting down");
+      app
+        .close()
+        .then(() => process.exit(0))
+        .catch((err) => {
+          app.log.error({ err }, "Error during shutdown");
+          process.exit(1);
+        });
+    });
   }
+
+  await app.listen({ port: config.PORT, host: "0.0.0.0" });
 }
 
-start();
+start().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

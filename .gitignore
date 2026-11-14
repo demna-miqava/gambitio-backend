@@ -1,3 +1,6 @@
 /node_modules
 .env
 dist
+backups/
+.wrangler/
+.neon

@@ -1,0 +1,77 @@
+// Gambitio as one Cloudflare Worker: it serves the built frontend and passes
+// /api (REST and WebSockets) to the Fastify backend in a container. Postgres
+// and Redis live outside Cloudflare (Neon and Upstash); their URLs are
+// secrets. See DEPLOY.md.
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "gambitio",
+	"main": "worker/index.ts",
+	"compatibility_date": "2026-11-01",
+	// Only on the site's own domain (set below): Clerk's production keys only
+	// work there, so a *.workers.dev address would just show a broken login.
+	"workers_dev": false,
+	"preview_urls": false,
+	"routes": [
+		{
+			// Replace with your domain (or a subdomain of it), without https://.
+			"pattern": "gambitio.mipupu.com",
+			"custom_domain": true,
+		},
+	],
+	// The frontend, built with `npm --prefix ../gambitio-frontend run build`.
+	// /api goes to the Worker; any other path the files don't have gets
+	// index.html, so React Router's routes work.
+	"assets": {
+		"directory": "../gambitio-frontend/dist",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": [
+			"/api/*"
+		],
+	},
+	// The backend (Dockerfile). "basic" is 1/4 vCPU and 1 GiB. ("lite", 1/16
+	// vCPU and 256 MiB, is cheaper but only fits a handful of concurrent
+	// games: moves, stats and sockets all share that one slice of a core.)
+	// worker/index.ts spreads requests over BACKEND_INSTANCES of these (see
+	// "vars"); max_instances is the ceiling that setting may go up to.
+	"containers": [
+		{
+			"class_name": "Backend",
+			"image": "./Dockerfile",
+			"instance_type": "basic",
+			"max_instances": 4,
+			// Next to the database and Redis (Neon and Upstash, both in
+			// Frankfurt): a move makes several round trips to them, which from
+			// another continent cost ~0.1s each. Without this Cloudflare may
+			// start the container anywhere (the first one ran in Ohio).
+			"constraints": {
+				"regions": ["WEUR"],
+			},
+		},
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "BACKEND",
+				"class_name": "Backend",
+			},
+		],
+	},
+	"exports": {
+		"Backend": {
+			"type": "durable-object",
+			"storage": "sqlite",
+		},
+	},
+	"vars": {
+		// The site's address, with https://, matching routes[0].pattern. The
+		// backend uses it for CORS and to check Clerk session tokens.
+		"SITE_ORIGIN": "https://gambitio.mipupu.com",
+		// Backend containers to run, 1 to max_instances. 1 keeps everyone on one
+		// server; raise it when one instance runs out of CPU. Each instance adds
+		// its own container cost and a Redis heartbeat.
+		"BACKEND_INSTANCES": "1",
+	},
+	"observability": {
+		"enabled": true,
+	},
+}

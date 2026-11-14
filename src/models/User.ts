@@ -14,6 +14,9 @@ export interface User {
   highestRapidRating: number;
   highestBlitzRating: number;
   highestBulletRating: number;
+  puzzleRating: number;
+  highestPuzzleRating: number;
+  puzzleAttempts: number;
   status: UserStatus;
   avatarUrl?: string | null;
 }
@@ -22,6 +25,7 @@ export interface UserResponse {
   id: number;
   clerkId: string;
   username: string;
+  avatarUrl: string | null;
   createdAt: Date;
   rapidRating: number;
   blitzRating: number;
@@ -29,6 +33,8 @@ export interface UserResponse {
   highestRapidRating: number;
   highestBlitzRating: number;
   highestBulletRating: number;
+  puzzleRating: number;
+  highestPuzzleRating: number;
 }
 
 // Data needed to create a new user from Clerk

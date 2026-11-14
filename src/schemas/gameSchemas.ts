@@ -1,21 +1,25 @@
 import { z } from "zod";
+import { MAX_BOT_GAME_PGN_LENGTH } from "../game/botGame.js";
 
-export const paginationQuerySchema = z.object({
-  page: z
-    .string()
-    .optional()
-    .default("1")
-    .transform((val) => parseInt(val, 10))
-    .refine((val) => val > 0, "Page must be greater than 0"),
-  limit: z
-    .string()
-    .optional()
-    .default("10")
-    .transform((val) => parseInt(val, 10))
-    .refine(
-      (val) => val > 0 && val <= 100,
-      "Limit must be between 1 and 100"
-    ),
-});
+/**
+ * POST /games/bot. endReason is what the browser saw end the game; the
+ * server checks it against the replayed position and only takes it on trust
+ * for a resignation (see replayBotGame).
+ */
+export const saveBotGameSchema = z
+  .object({
+    botId: z.string().min(1).max(40),
+    color: z.enum(["white", "black"]),
+    pgn: z.string().min(1).max(MAX_BOT_GAME_PGN_LENGTH),
+    endReason: z.enum([
+      "checkmate",
+      "resignation",
+      "stalemate",
+      "insufficient_material",
+      "threefold_repetition",
+      "fifty_move_rule",
+    ]),
+  })
+  .strict();
 
-export type PaginationQueryType = z.infer<typeof paginationQuerySchema>;
+export type SaveBotGameBody = z.infer<typeof saveBotGameSchema>;
