@@ -6,7 +6,7 @@ import { authMiddleware } from "../middleware/auth.js";
 import { gameRepository } from "../repositories/gameRepository.js";
 import { saveBotGameSchema } from "../schemas/gameSchemas.js";
 
-const gameIdParams = z.object({ id: z.coerce.number().int().positive() });
+const gameIdParams = z.object({ id: z.coerce.number().int().positive().max(2_147_483_647) });
 
 export async function gameRoutes(fastify: FastifyInstance) {
   const gameService = new GameService(fastify);

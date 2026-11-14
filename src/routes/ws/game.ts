@@ -21,7 +21,7 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
     });
 
       const gameId = Number(request.params.id);
-      if (!Number.isInteger(gameId) || gameId <= 0) {
+      if (!Number.isInteger(gameId) || gameId <= 0 || gameId > 2_147_483_647) {
         sendError(socket, "Invalid game id", "INVALID_GAME_ID");
         socket.close();
         return;

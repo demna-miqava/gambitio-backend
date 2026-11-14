@@ -10,7 +10,8 @@ import { paginationSchema } from "../schemas/pagination.js";
 import { syncUserSchema, checkUsernameSchema } from "../schemas/userSchemas.js";
 import { AppError } from "../errors/AppError.js";
 
-const userIdParams = z.object({ userId: z.coerce.number().int().positive() });
+// Capped at Postgres' integer max: a larger id would be a 500, not a 404
+const userIdParams = z.object({ userId: z.coerce.number().int().positive().max(2_147_483_647) });
 const friendsQuery = paginationSchema.extend({ q: z.string().max(100).optional() });
 const statsQuery = z.object({
   days: z.enum(["30", "90", "365", "all-time"]).default("all-time"),

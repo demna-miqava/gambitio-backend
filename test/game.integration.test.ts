@@ -526,6 +526,9 @@ describe("matchmaking and challenges", { skip: !integrationEnabled && "TEST_POST
     // Staying away withdraws it
     await back.close();
     assert.equal((await nb.next("challenge_cancelled")).data.challengerId, a.id);
+    // The sender's "offline" notice goes out just after; let it pass before
+    // reconnecting, or the new socket may hear it
+    await new Promise((r) => setTimeout(r, 100));
 
     const na2 = await open("/notifications", a.clerkId);
     await new Promise((r) => setTimeout(r, 100));

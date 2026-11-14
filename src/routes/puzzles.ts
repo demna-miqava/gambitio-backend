@@ -6,7 +6,8 @@ import { PuzzleService } from "../services/puzzleService.js";
 /** Keyset cursor "<rating>:<id>" of the last puzzle on the previous page. */
 const cursorSchema = z
   .string()
-  .regex(/^\d+:[A-Za-z0-9_-]+$/)
+  // Rating fits the integer column (a longer one was a 500)
+  .regex(/^\d{1,9}:[A-Za-z0-9_-]+$/)
   .transform((c) => {
     const i = c.indexOf(":");
     return { rating: Number(c.slice(0, i)), id: c.slice(i + 1) };

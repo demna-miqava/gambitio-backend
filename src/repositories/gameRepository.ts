@@ -8,10 +8,10 @@ const GAME_COLUMNS = `
   "whiteAvatarUrl", "blackAvatarUrl", status, result, "endReason", "endedAt",
   "whiteTimeLeftMs", "blackTimeLeftMs", "lastMoveAt", "deadlineAt",
   "drawOfferedBy", "rematchRequestedBy", "rematchGameId",
-  "whiteRatingChange", "blackRatingChange", "botId", rated`;
+  "whiteRatingChange", "blackRatingChange", "botId", rated, "seriesId", "seriesGame"`;
 
 /** GAME_COLUMNS without the move list and position, for lists. */
-const GAME_LIST_COLUMNS = GAME_COLUMNS.replace(/\bpgn, fen, /, "");
+export const GAME_LIST_COLUMNS = GAME_COLUMNS.replace(/\bpgn, fen, /, "");
 if (GAME_LIST_COLUMNS === GAME_COLUMNS) throw new Error("GAME_LIST_COLUMNS must drop pgn and fen");
 
 export type GameListRow = Omit<Game, "pgn" | "fen">;
@@ -29,6 +29,8 @@ export interface NewGame {
   increment: number;
   lastMoveAt: Date;
   deadlineAt: Date;
+  seriesId?: number | null;
+  seriesGame?: number | null;
 }
 
 /** A finished game against a computer bot; one side is the bot (no user id). */
@@ -93,8 +95,8 @@ export const gameRepository = {
         "whiteId", "blackId", "whiteUsername", "blackUsername",
         "whiteRating", "blackRating", "whiteAvatarUrl", "blackAvatarUrl",
         time, increment, status, "numMoves",
-        "whiteTimeLeftMs", "blackTimeLeftMs", "lastMoveAt", "deadlineAt"
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'in_progress', 0, $11, $11, $12, $13)
+        "whiteTimeLeftMs", "blackTimeLeftMs", "lastMoveAt", "deadlineAt", "seriesId", "seriesGame"
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'in_progress', 0, $11, $11, $12, $13, $14, $15)
       RETURNING ${GAME_COLUMNS}`,
       [
         game.whiteId,
@@ -110,6 +112,8 @@ export const gameRepository = {
         game.time * 1000,
         game.lastMoveAt,
         game.deadlineAt,
+        game.seriesId ?? null,
+        game.seriesGame ?? null,
       ]
     );
     return rows[0]!;

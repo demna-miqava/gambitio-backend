@@ -66,7 +66,9 @@ export function isLanOrigin(origin: string): boolean {
 /** Whether a frontend origin may call the API and have its session tokens accepted. */
 export function originChecker(config: Config): (origin: string) => boolean {
   const listed = new Set(allowedOrigins(config));
-  return (origin) => listed.has(origin) || (config.ALLOW_LAN_ORIGINS === true && isLanOrigin(origin));
+  // Never in production, even if loadConfig was bypassed
+  const allowLan = config.ALLOW_LAN_ORIGINS === true && config.NODE_ENV !== "production";
+  return (origin) => listed.has(origin) || (allowLan && isLanOrigin(origin));
 }
 
 /**
@@ -80,6 +82,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       .map((issue) => `  ${issue.path.join(".")}: ${issue.message}`)
       .join("\n");
     throw new Error(`Invalid environment configuration:\n${problems}`);
+  }
+  if (result.data.NODE_ENV === "production" && result.data.ALLOW_LAN_ORIGINS) {
+    throw new Error("Invalid environment configuration:\n  ALLOW_LAN_ORIGINS: not allowed in production");
   }
   return result.data;
 }

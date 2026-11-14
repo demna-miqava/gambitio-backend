@@ -40,6 +40,10 @@ export interface Game {
   botId: string | null;
   /** False for bot games: they never change ratings or stats */
   rated: boolean;
+  /** Set when the game is part of a friend series (migration 016) */
+  seriesId: number | null;
+  /** 1-based number of the game within its series */
+  seriesGame: number | null;
 }
 
 /**
@@ -80,6 +84,9 @@ export interface GameResponse {
   rated: boolean;
   /** Set when the opponent was a computer bot */
   botId: string | null;
+  /** Set when the game is part of a friend series */
+  seriesId: number | null;
+  seriesGame: number | null;
   whitePlayer: PlayerResponse;
   blackPlayer: PlayerResponse;
 }

@@ -27,6 +27,12 @@ import { AppError } from "../errors/AppError.js";
 import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
 import { statsCacheKey } from "./statsService.js";
 import { PositionCache } from "../game/positionCache.js";
+import {
+  nextSeriesGame,
+  recordSeriesResult,
+  seriesRepository,
+  type SeriesSummary,
+} from "./seriesService.js";
 
 /** What a game transaction does once it has committed. */
 interface TxEffects {
@@ -107,7 +113,10 @@ export class LiveGameService {
       this.positions.drop(id);
       this.clearDeadline(id);
     }
-    for (const { gameId: id, at } of fx.deadlines) this.watchDeadline(id, at);
+    // A move that ends the game also set a new deadline: no timer for it
+    for (const { gameId: id, at } of fx.deadlines) {
+      if (!fx.ended.includes(id)) this.watchDeadline(id, at);
+    }
     // Before publishing: players refetch their stats as soon as they hear
     // the game ended
     if (fx.staleStats.length > 0) {
@@ -194,6 +203,8 @@ export class LiveGameService {
       if (!game || !isLiveGame(game)) throw notFound();
     }
     const isPlayer = colorOf(game, viewerId) !== null;
+    const series =
+      game.seriesId !== null ? await seriesRepository.summary(this.fastify.pg, game.seriesId) : null;
     const clock = game.status === "in_progress" ? remainingAt(clockOf(game), Date.now()) : null;
     return {
       type: "initial_game_state",
@@ -223,6 +234,9 @@ export class LiveGameService {
         blackTimeLeft: clock?.blackMs ?? game.blackTimeLeftMs,
         drawOfferedBy: isPlayer ? game.drawOfferedBy : null,
         rematchRequestedBy: isPlayer ? game.rematchRequestedBy : null,
+        rematchGameId: game.rematchGameId,
+        series,
+        seriesGame: game.seriesGame,
         ...(game.status === "finished" && {
           result: game.result,
           reason: game.endReason,
@@ -260,11 +274,17 @@ export class LiveGameService {
     clock: { whiteMs: number; blackMs: number } | null,
     fx: TxEffects
   ) {
+    // The series row is locked before the players' rows (finishGame), the
+    // same order a rematch takes them in
+    if (game.seriesId !== null && game.status === "in_progress") {
+      await seriesRepository.lock(tx, game.seriesId);
+    }
     const finished = await finishGame(tx, game, outcome, clock);
     if (!finished) return;
+    const series = await recordSeriesResult(tx, game, outcome.result);
     fx.staleStats.push(game.whiteId, game.blackId);
     fx.ended.push(game.id);
-    fx.out.push({ topic: topics.game(game.id), message: gameEndedMessage(outcome, finished) });
+    fx.out.push({ topic: topics.game(game.id), message: gameEndedMessage(outcome, finished, series) });
     for (const playerId of [game.whiteId, game.blackId]) {
       fx.out.push({ topic: topics.notifications(playerId), message: activeGameMessage(null) });
     }
@@ -384,8 +404,14 @@ export class LiveGameService {
       if (game.status !== "in_progress") throw gameOver();
       const color = colorOf(game, userId);
       if (!color) throw notAPlayer();
+      const now = Date.now();
+      // A flag that has already fallen decides the game, not a later resignation
+      if (isPastDeadline(game, now)) {
+        await this.endAtDeadline(tx, game, now, fx);
+        return;
+      }
       const winner = color === "white" ? "black" : "white";
-      const clock = remainingAt(clockOf(game), Date.now());
+      const clock = remainingAt(clockOf(game), now);
       await this.end(tx, game, { result: winFor(winner), reason: "resignation" }, clock, fx);
     });
   }
@@ -407,10 +433,15 @@ export class LiveGameService {
       if (game.status !== "in_progress") throw gameOver();
       if (!colorOf(game, userId)) throw notAPlayer();
       const opponentId = opponentOf(game, userId);
+      const now = Date.now();
+      if (isPastDeadline(game, now)) {
+        await this.endAtDeadline(tx, game, now, fx);
+        return;
+      }
 
       // Both players offering means both agree
       if (game.drawOfferedBy === opponentId) {
-        const clock = remainingAt(clockOf(game), Date.now());
+        const clock = remainingAt(clockOf(game), now);
         await this.end(tx, game, { result: "draw", reason: "draw_agreement" }, clock, fx);
         return;
       }
@@ -425,6 +456,11 @@ export class LiveGameService {
     await this.run(gameId, async (tx, game, fx) => {
       if (game.status !== "in_progress") throw gameOver();
       if (!colorOf(game, userId)) throw notAPlayer();
+      const now = Date.now();
+      if (isPastDeadline(game, now)) {
+        await this.endAtDeadline(tx, game, now, fx);
+        return;
+      }
       const offererId = opponentOf(game, userId);
       // Only the opponent of whoever offered can answer
       if (game.drawOfferedBy !== offererId) {
@@ -432,7 +468,7 @@ export class LiveGameService {
       }
 
       if (accepted) {
-        const clock = remainingAt(clockOf(game), Date.now());
+        const clock = remainingAt(clockOf(game), now);
         await this.end(tx, game, { result: "draw", reason: "draw_agreement" }, clock, fx);
       } else {
         await gameRepository.setDrawOffer(tx, gameId, null);
@@ -590,16 +626,22 @@ export class LiveGameService {
   }
 
   private async startRematch(tx: TxClient, game: LiveGame, fx: TxEffects) {
-    // Colors swap
+    // Queue rows are locked before the players' rows (createGame), the order
+    // matchmaking takes them in, so a player re-queueing while the rematch is
+    // accepted can't deadlock the two
+    await tx.query(`DELETE FROM matchmaking WHERE "userId" = ANY($1)`, [[game.whiteId, game.blackId]]);
+    // In a series the next game follows the series' colours; otherwise
+    // (and after a series is over) colours swap
+    const next = await nextSeriesGame(tx, game);
     const rematch = await createGame(tx, {
-      whiteId: game.blackId,
-      blackId: game.whiteId,
+      whiteId: next ? next.whiteId : game.blackId,
+      blackId: next ? next.blackId : game.whiteId,
       time: game.time,
       increment: game.increment,
+      ...(next && { series: { id: next.seriesId, game: next.number } }),
     });
     await gameRepository.setRematchGame(tx, game.id, rematch.id);
     fx.deadlines.push({ gameId: rematch.id, at: rematch.deadlineAt });
-    await tx.query(`DELETE FROM matchmaking WHERE "userId" = ANY($1)`, [[game.whiteId, game.blackId]]);
     for (const playerId of [game.whiteId, game.blackId]) {
       fx.out.push({
         topic: topics.gameUser(game.id, playerId),
@@ -616,7 +658,8 @@ function isPastDeadline(game: LiveGame, now: number): boolean {
 
 function gameEndedMessage(
   outcome: Outcome,
-  finished: { winnerId: number | null; ratingChanges: RatingChanges | null }
+  finished: { winnerId: number | null; ratingChanges: RatingChanges | null },
+  series: SeriesSummary | null
 ) {
   return {
     type: "game_ended",
@@ -624,5 +667,7 @@ function gameEndedMessage(
     result: outcome.result,
     reason: outcome.reason,
     ...(finished.ratingChanges && { ratingChanges: finished.ratingChanges }),
+    // The series score after this game
+    ...(series && { series }),
   };
 }

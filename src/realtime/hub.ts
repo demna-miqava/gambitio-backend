@@ -25,6 +25,8 @@ export const topics = {
   gameUser: (gameId: number, userId: number) => `game:${gameId}:user:${userId}`,
   notifications: (userId: number) => `notifications:user:${userId}`,
   matchmaking: (userId: number) => `matchmaking:user:${userId}`,
+  study: (roomId: number) => `study:${roomId}`,
+  studyUser: (roomId: number, userId: number) => `study:${roomId}:user:${userId}`,
 };
 
 /**
@@ -51,7 +53,8 @@ interface Attached {
 /** What goes over the Redis channel */
 type Envelope =
   | { origin: string; topic: string; message: object }
-  | { origin: string; closeUser: number };
+  | { origin: string; closeUser: number }
+  | { origin: string; closeTopic: string; code: number; reason: string };
 
 /**
  * Routes WebSocket messages between server instances.
@@ -174,6 +177,12 @@ export class RealtimeHub {
     return new Set(members.map((m) => m.slice(0, m.indexOf(":")))).size;
   }
 
+  /** Distinct users with a live socket in a membership set, across all instances. */
+  async memberUserIds(key: string): Promise<number[]> {
+    const members = await this.liveMembers(key);
+    return [...new Set(members.map((m) => Number(m.slice(0, m.indexOf(":")))))].filter(Number.isInteger);
+  }
+
   /** Unique per socket: "<userId>:<instanceId>:<seq>", so sets can count distinct users. */
   private memberId(userId: number): string {
     return `${userId}:${this.instanceId}:${++this.socketSeq}`;
@@ -240,6 +249,16 @@ export class RealtimeHub {
     await this.redis.publish(CHANNEL, JSON.stringify(envelope));
   }
 
+  /**
+   * Closes every socket listening on a topic, on all instances (e.g. a study
+   * room someone was removed from, or one that was deleted).
+   */
+  async closeTopicSockets(topic: string, code = 4003, reason = "Access removed"): Promise<void> {
+    this.closeTopicLocal(topic, code, reason);
+    const envelope: Envelope = { origin: this.instanceId, closeTopic: topic, code, reason };
+    await this.redis.publish(CHANNEL, JSON.stringify(envelope));
+  }
+
   async isPresent(kind: PresenceKind, userId: number): Promise<boolean> {
     if ((this.presenceSockets.get(`${kind}:${userId}`) ?? 0) > 0) return true;
     return (await this.liveMembers(presenceKey(kind, userId))).length > 0;
@@ -272,7 +291,7 @@ export class RealtimeHub {
   }
 
   private onEnvelope(raw: string): void {
-    let parsed: Partial<Envelope> & { topic?: string; message?: object; closeUser?: number };
+    let parsed: Partial<Envelope> & { topic?: string; message?: object; closeUser?: number; closeTopic?: string; code?: number; reason?: string };
     try {
       parsed = JSON.parse(raw);
     } catch {
@@ -281,6 +300,9 @@ export class RealtimeHub {
     // Already delivered locally by publish()
     if (parsed.origin === this.instanceId) return;
     if (typeof parsed.closeUser === "number") return this.closeLocal(parsed.closeUser);
+    if (typeof parsed.closeTopic === "string") {
+      return this.closeTopicLocal(parsed.closeTopic, parsed.code ?? 4003, parsed.reason ?? "Access removed");
+    }
     if (typeof parsed.topic === "string" && parsed.message) {
       this.deliverLocal(parsed.topic, JSON.stringify(parsed.message));
     }
@@ -292,6 +314,10 @@ export class RealtimeHub {
     for (const socket of sockets) {
       if (socket.readyState === socket.OPEN) socket.send(payload);
     }
+  }
+
+  private closeTopicLocal(topic: string, code: number, reason: string): void {
+    for (const socket of [...(this.local.get(topic) ?? [])]) socket.close(code, reason);
   }
 
   private closeLocal(userId: number): void {

@@ -42,7 +42,8 @@ export async function startTestApp(): Promise<{ app: FastifyInstance; baseUrl: s
 
 export async function resetDb(app: FastifyInstance) {
   await app.pg.query(
-    `TRUNCATE games, challenges, matchmaking, friends, friend_requests, user_settings, puzzle_attempts, users
+    `TRUNCATE games, series, challenges, matchmaking, friends, friend_requests, user_settings, puzzle_attempts,
+       repertoire_lines, study_rooms, study_room_members, endgame_progress, users
      RESTART IDENTITY CASCADE`
   );
   await app.redis.flushDb();

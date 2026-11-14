@@ -38,6 +38,8 @@ export function toGameListItem(game: Omit<Game, "pgn" | "fen">): GameListItem {
     endReason: game.endReason,
     rated: game.rated,
     botId: game.botId,
+    seriesId: game.seriesId,
+    seriesGame: game.seriesGame,
     whitePlayer: {
       id: game.whiteId,
       username: game.whiteUsername,
@@ -207,9 +209,16 @@ export class GameService {
  */
 export async function createGame(
   tx: Queryable,
-  params: { whiteId: number; blackId: number; time: number; increment: number }
+  params: {
+    whiteId: number;
+    blackId: number;
+    time: number;
+    increment: number;
+    /** The series this game belongs to, and its number in it */
+    series?: { id: number; game: number };
+  }
 ): Promise<LiveGame> {
-  const { whiteId, blackId, time, increment } = params;
+  const { whiteId, blackId, time, increment, series } = params;
   // Lock both players (in id order, matching finishGame) so two transactions
   // creating a game for the same player at once (a challenge accepted while
   // matchmaking pairs them) run one after the other: the second then sees the
@@ -228,11 +237,14 @@ export async function createGame(
     username: string;
     avatarUrl: string | null;
     rating: number;
-  }>(`SELECT id, username, "avatarUrl", "${col}" AS rating FROM users WHERE id = ANY($1)`, [
+  }>(`SELECT id, username, "avatarUrl", "${col}" AS rating FROM users WHERE id = ANY($1)
+        AND "clerkId" IS NOT NULL`, [
     [whiteId, blackId],
   ]);
   const white = rows.find((r) => r.id === whiteId);
   const black = rows.find((r) => r.id === blackId);
+  // A deleted account (clerkId cleared) can still have a queue row or an open
+  // challenge for a moment; it must not end up in a new game
   if (!white || !black) throw new AppError("Player not found", "USER_NOT_FOUND", 404);
 
   const now = Date.now();
@@ -249,6 +261,8 @@ export async function createGame(
     increment,
     lastMoveAt: new Date(now),
     deadlineAt: new Date(now + FIRST_MOVE_TIMEOUT_MS),
+    seriesId: series?.id ?? null,
+    seriesGame: series?.game ?? null,
   });
 }
 

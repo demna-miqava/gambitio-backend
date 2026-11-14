@@ -7,11 +7,13 @@ import { ZodError } from "zod";
 import { registerRedis } from "./plugins/redis.js";
 import { clerkAuthProvider, type AuthProvider } from "./plugins/authProvider.js";
 import { AppError } from "./errors/AppError.js";
-import { isUniqueViolation } from "./db.js";
+import { isUniqueViolation, ensureSessionTimeouts } from "./db.js";
 import { RealtimeHub } from "./realtime/hub.js";
 import { LiveGameService } from "./services/liveGameService.js";
 import { MatchmakingService } from "./services/matchmakingService.js";
 import { ChallengeService } from "./services/challengeService.js";
+import { SeriesService } from "./services/seriesService.js";
+import { StudyService } from "./services/studyService.js";
 import { createJobs } from "./jobs.js";
 import { UserLookup } from "./plugins/userLookup.js";
 import { selectWsProtocol, wsHandshakeToken } from "./middleware/wsAuth.js";
@@ -26,6 +28,10 @@ import { settingsRoutes } from "./routes/settings.js";
 import { challengeRoutes } from "./routes/challenges.js";
 import { puzzleRoutes } from "./routes/puzzles.js";
 import { leaderboardRoutes } from "./routes/leaderboard.js";
+import { seriesRoutes } from "./routes/series.js";
+import { repertoireRoutes } from "./routes/repertoire.js";
+import { studyRoutes } from "./routes/study.js";
+import { endgameRoutes } from "./routes/endgames.js";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -34,6 +40,8 @@ declare module "fastify" {
     liveGames: LiveGameService;
     matchmaking: MatchmakingService;
     challenges: ChallengeService;
+    series: SeriesService;
+    study: StudyService;
     jobs: ReturnType<typeof createJobs>;
     users: UserLookup;
   }
@@ -206,9 +214,16 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   app.decorate("liveGames", new LiveGameService(app, hub));
   app.decorate("matchmaking", new MatchmakingService(app, hub));
   app.decorate("challenges", new ChallengeService(app, hub));
+  app.decorate("series", new SeriesService(app, hub));
+  app.decorate("study", new StudyService(app, hub));
   app.decorate("jobs", createJobs(app));
 
   app.addHook("onReady", async () => {
+    await ensureSessionTimeouts(
+      app.pg,
+      { statement_timeout: config.PG_STATEMENT_TIMEOUT_MS, idle_in_transaction_session_timeout: 10_000 },
+      app.log
+    ).catch((err) => app.log.error({ err }, "Couldn't verify Postgres session timeouts"));
     await hub.start();
     if (options.jobs !== false) app.jobs.start();
   });
@@ -228,6 +243,10 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   await app.register(challengeRoutes, { prefix: "/api" });
   await app.register(puzzleRoutes, { prefix: "/api" });
   await app.register(leaderboardRoutes, { prefix: "/api" });
+  await app.register(seriesRoutes, { prefix: "/api" });
+  await app.register(repertoireRoutes, { prefix: "/api" });
+  await app.register(studyRoutes, { prefix: "/api" });
+  await app.register(endgameRoutes, { prefix: "/api" });
 
   return app;
 }

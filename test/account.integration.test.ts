@@ -94,4 +94,32 @@ describe("accounts and game creation", { skip: !integrationEnabled && "TEST_POST
     const { rows: friends } = await app.pg.query(`SELECT 1 FROM friends`);
     assert.equal(friends.length, 0);
   });
+
+  test("deleting an account while a challenge to it is being accepted doesn't deadlock", async () => {
+    const del = await createUser(app, "leaver");
+    const friend = await createUser(app, "stayer");
+    await app.pg.query(
+      `INSERT INTO challenges ("challengerId", "challengedId", "challengerUsername", "time", increment)
+       VALUES ($1, $2, 'leaver', 180, 0)`,
+      [del.id, friend.id]
+    );
+    // What accepting does (ChallengeService.accept): clear the players' queue
+    // rows, lock both players, then claim the challenge
+    const accept = await app.pg.connect();
+    try {
+      await accept.query("BEGIN");
+      await accept.query(`DELETE FROM matchmaking WHERE "userId" = ANY($1)`, [[del.id, friend.id]]);
+      await accept.query(`SELECT 1 FROM users WHERE id = ANY($1) ORDER BY id FOR UPDATE`, [[del.id, friend.id]]);
+      const removal = fetch(`http://${baseUrl}/api/users/me`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${del.clerkId}` },
+      });
+      await new Promise((r) => setTimeout(r, 200));
+      await accept.query(`DELETE FROM challenges WHERE "challengerId" = $1`, [del.id]);
+      await accept.query("COMMIT");
+      assert.equal((await removal).status, 204);
+    } finally {
+      accept.release();
+    }
+  });
 });

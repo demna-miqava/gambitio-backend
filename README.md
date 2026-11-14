@@ -79,4 +79,17 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
 - `src/jobs.ts` – backstop sweeps that only run while there's something to
   do; games end at their deadline through per-game timers
   (`LiveGameService.watchDeadline`)
+- `src/game/series.ts`, `src/services/seriesService.ts` – best-of-3/5 friend
+  series: a challenge with `bestOf` starts one; each game is scored in the
+  transaction that ends it, and the next game is the rematch (the series
+  picks the colours). Head-to-head records live here too
+- `src/game/repertoire.ts`, `src/services/repertoireService.ts` – opening
+  repertoire lines, spaced-repetition practice, and where recent games left
+  the preparation (`GET /api/repertoire/check`)
+- `src/game/studyState.ts`, `src/services/studyService.ts`,
+  `src/routes/ws/study.ts` – shared study rooms: one JSON move tree per room,
+  changed under the room's row lock with a version number; the socket sends
+  small updates (cursor, node, tree) and clients resync on a version gap
+- `src/routes/endgames.ts` – endgame lab progress (the exercises run in the
+  browser)
 - `migrations/` – SQL migrations; `scripts/migrate.ts` applies them

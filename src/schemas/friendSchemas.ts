@@ -18,7 +18,8 @@ export const sendFriendRequestSchema = z.object({
   receiverId: z
     .number({ error: "Receiver ID must be a number" })
     .int("Receiver ID must be an integer")
-    .positive("Receiver ID must be a positive number"),
+    .positive("Receiver ID must be a positive number")
+    .max(2_147_483_647, "Receiver ID is out of range"),
 });
 
 /**
@@ -34,6 +35,7 @@ export const friendIdParamSchema = z.object({
         .number()
         .int("Friend ID must be an integer")
         .positive("Friend ID must be a positive number")
+        .max(2_147_483_647, "Friend ID is out of range")
     ),
 });
 
@@ -50,6 +52,7 @@ export const requestIdParamSchema = z.object({
         .number()
         .int("Request ID must be an integer")
         .positive("Request ID must be a positive number")
+        .max(2_147_483_647, "Request ID is out of range")
     ),
 });
 

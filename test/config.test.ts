@@ -56,4 +56,25 @@ describe("originChecker", () => {
       assert.equal(allowed("http://192.168.0.102:5173"), false, String(value));
     }
   });
+
+  test("ALLOW_LAN_ORIGINS can't be enabled in production", () => {
+    assert.throws(
+      () => loadConfig({ ...base, NODE_ENV: "production", ALLOW_LAN_ORIGINS: "true" }),
+      /ALLOW_LAN_ORIGINS/
+    );
+    const config = { ...loadConfig({ ...base, NODE_ENV: "production" }), ALLOW_LAN_ORIGINS: true };
+    assert.equal(originChecker(config)("http://192.168.0.102:5173"), false);
+  });
+});
+
+describe("parsePgDuration", async () => {
+  const { parsePgDuration } = await import("../src/db.js");
+  test("reads the units SHOW uses", () => {
+    assert.equal(parsePgDuration("5s"), 5_000);
+    assert.equal(parsePgDuration("5000ms"), 5_000);
+    assert.equal(parsePgDuration("10s"), 10_000);
+    assert.equal(parsePgDuration("1min"), 60_000);
+    assert.equal(parsePgDuration("0"), 0);
+    assert.equal(parsePgDuration("off"), null);
+  });
 });

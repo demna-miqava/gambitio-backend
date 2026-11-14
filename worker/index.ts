@@ -78,9 +78,12 @@ export function instanceFor(request: Request, instances: number): string {
   return index === 0 ? "main" : `main-${index}`;
 }
 
+/** Must match max_instances in wrangler.jsonc: a higher BACKEND_INSTANCES would route to containers that can't start. */
+const MAX_INSTANCES = 4;
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const instances = Math.max(1, Math.floor(Number(env.BACKEND_INSTANCES ?? "1")) || 1);
+    const instances = Math.min(MAX_INSTANCES, Math.max(1, Math.floor(Number(env.BACKEND_INSTANCES ?? "1")) || 1));
     return getContainer(env.BACKEND, instanceFor(request, instances)).fetch(request);
   },
 } satisfies ExportedHandler<Env>;

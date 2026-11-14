@@ -8,6 +8,8 @@ import { gameRepository } from "./repositories/gameRepository.js";
 const CLOCK_SWEEP_MS = 10_000;
 const MATCHMAKING_SWEEP_MS = 2_000;
 const CHALLENGE_SWEEP_MS = 30_000;
+/** Series expire after days, so a pass every few minutes is plenty */
+const SERIES_SWEEP_MS = 5 * 60_000;
 
 /**
  * Background timers. Each pass is idempotent and uses row locks, so running
@@ -65,6 +67,12 @@ export function createJobs(app: FastifyInstance) {
         "Challenge sweep",
         () => app.hub.attachedCount > 0,
         () => app.challenges.expireStale()
+      );
+      every(
+        SERIES_SWEEP_MS,
+        "Series sweep",
+        () => app.hub.attachedCount > 0,
+        () => app.series.expireStale()
       );
     },
     stop() {

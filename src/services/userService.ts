@@ -80,20 +80,43 @@ export class UserService {
         });
       }
 
-      await this.fastify.pg.transact(async (tx) => {
+      const deletedRooms = await this.fastify.pg.transact(async (tx) => {
+        // Their unfinished series go to the opponent. Before the user lock:
+        // series rows are always locked before players' rows
+        await tx.query(
+          `UPDATE series SET status = 'finished', "endReason" = 'resignation', "endedAt" = now(),
+             "winnerId" = CASE WHEN "playerOneId" = $1 THEN "playerTwoId" ELSE "playerOneId" END
+           WHERE status = 'active' AND ("playerOneId" = $1 OR "playerTwoId" = $1)`,
+          [user.id]
+        );
+        const id = [user.id];
+        // Also before the user lock: pairing, accepting a challenge and a
+        // rematch all take queue rows first and the players after (in
+        // createGame), so taking them in the other order deadlocked. A
+        // pairing already under way finishes first and is caught by the
+        // active-game check below.
+        await tx.query(`DELETE FROM matchmaking WHERE "userId" = $1`, id);
         // Same lock createGame takes, so no new game can start meanwhile
         await tx.query(`SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, [user.id]);
         if ((await gameRepository.findActiveGameIdForUser(tx, user.id)) !== null) {
           throw new AppError("A game started while deleting; try again", "IN_GAME", 409);
         }
-        const id = [user.id];
-        await tx.query(`DELETE FROM matchmaking WHERE "userId" = $1`, id);
+        // After the user lock: accepting a challenge locks the players, then
+        // takes the challenge row
         await tx.query(`DELETE FROM challenges WHERE "challengerId" = $1 OR "challengedId" = $1`, id);
         await tx.query(`DELETE FROM friends WHERE "userOneId" = $1 OR "userTwoId" = $1`, id);
         await tx.query(`DELETE FROM friend_requests WHERE "senderId" = $1 OR "receiverId" = $1`, id);
         await tx.query(`DELETE FROM user_settings WHERE "userId" = $1`, id);
         await tx.query(`DELETE FROM solved_puzzles WHERE "userId" = $1`, id);
         await tx.query(`DELETE FROM puzzle_attempts WHERE "userId" = $1`, id);
+        await tx.query(`DELETE FROM repertoire_lines WHERE "userId" = $1`, id);
+        await tx.query(`DELETE FROM endgame_progress WHERE "userId" = $1`, id);
+        // Rooms they own go (with everyone's membership); they leave the others
+        const { rows: rooms } = await tx.query<{ id: number }>(
+          `DELETE FROM study_rooms WHERE "ownerId" = $1 RETURNING id`,
+          id
+        );
+        await tx.query(`DELETE FROM study_room_members WHERE "userId" = $1`, id);
         // "deleted-" can't clash with a real name: usernames can't contain "-"
         await tx.query(
           `UPDATE users SET "clerkId" = NULL, email = NULL, "avatarUrl" = NULL,
@@ -111,7 +134,10 @@ export class UserService {
            WHERE "blackId" = $1`,
           id
         );
+        return rooms.map((r) => r.id);
       });
+      // Members still in the deleted rooms stop listening
+      for (const roomId of deletedRooms) await this.fastify.study.closeRoomSockets(roomId);
     }
     this.fastify.users.forget(clerkId);
     // Open sockets were authenticated before; close them on every instance

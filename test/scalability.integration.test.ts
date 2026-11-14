@@ -154,6 +154,7 @@ describe("scalability changes", { skip: !integrationEnabled && "TEST_POSTGRES_UR
     const original = { ...reauthTimings };
     reauthTimings.validForMs = 300;
     reauthTimings.checkEveryMs = 50;
+    reauthTimings.minIntervalMs = 0;
     try {
       const lapsing = await open("/notifications", white.clerkId);
       const kept = await open("/notifications", black.clerkId);
@@ -356,6 +357,87 @@ describe("scalability changes", { skip: !integrationEnabled && "TEST_POSTGRES_UR
       await a.stop();
       await b.stop();
     }
+  });
+
+  test("a resignation or draw offer after the flag fell ends the game on time", async () => {
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    for (const [socket, uci] of [
+      [w, "e2e4"],
+      [b, "e7e5"],
+    ] as const) {
+      socket.send(move(uci));
+      await w.next("move", (m) => m.move.lan === uci);
+    }
+    // White's flag has fallen; black resigns before the deadline timer fires
+    await app.pg.query(
+      `UPDATE games SET "whiteTimeLeftMs" = 0, "deadlineAt" = now() - interval '1 second' WHERE id = $1`,
+      [game.id]
+    );
+    b.send({ type: "resign" });
+    const ended = await w.next("game_ended");
+    assert.equal(ended.reason, "timeout");
+    assert.equal(ended.winnerId, black.id);
+  });
+
+  test("a move that ends the game leaves no deadline timer behind", async () => {
+    await app.liveGames.startDeadlineTimers();
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    for (const [socket, uci] of [
+      [w, "f2f3"],
+      [b, "e7e5"],
+      [w, "g2g4"],
+      [b, "d8h4"],
+    ] as const) {
+      socket.send(move(uci));
+      await w.next("move", (m) => m.move.lan === uci);
+    }
+    assert.equal((await w.next("game_ended")).reason, "checkmate");
+    assert.equal(app.liveGames.watchedGameCount, 0);
+  });
+
+  test("accepting a challenge while matchmaking pairs the challenger doesn't deadlock", async () => {
+    const other = await createUser(app, "other");
+    await app.pg.query(`INSERT INTO friends ("userOneId", "userTwoId") VALUES ($1, $2)`, [white.id, black.id]);
+    const nw = await open("/notifications", white.clerkId);
+    const nb = await open("/notifications", black.clerkId);
+    await new Promise((r) => setTimeout(r, 100));
+    nw.send({ type: "challenge_sent", data: { challengedId: black.id, color: "white", time: 300, increment: 0 } });
+    await nb.next("challenge_received");
+    await app.pg.query(
+      `INSERT INTO matchmaking ("userId", rating, time, increment) VALUES ($1, 1200, 60, 0), ($2, 1200, 60, 0)`,
+      [white.id, other.id]
+    );
+
+    // A pairing of white with someone else, caught between locking the queue
+    // rows and the players' rows (see MatchmakingService.tryMatch)
+    const pairing = await app.pg.connect();
+    try {
+      await pairing.query("BEGIN");
+      await pairing.query(`SELECT id FROM matchmaking WHERE "userId" = ANY($1) FOR UPDATE`, [[white.id, other.id]]);
+      const accepted = app.challenges.accept(black.id, white.id);
+      await new Promise((r) => setTimeout(r, 200));
+      await pairing.query(`SELECT 1 FROM users WHERE id = ANY($1) ORDER BY id FOR UPDATE`, [[white.id, other.id]]);
+      await pairing.query("COMMIT");
+      await accepted;
+    } finally {
+      pairing.release();
+    }
+    const { rows } = await app.pg.query(`SELECT count(*)::int AS n FROM games`);
+    assert.equal(rows[0].n, 1);
+  });
+
+  test("ids too large for the database are rejected, not a server error", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/games/99999999999",
+      headers: { authorization: `Bearer ${white.clerkId}` },
+    });
+    assert.ok(res.statusCode >= 400 && res.statusCode < 500, `status ${res.statusCode}`);
+    const n = await open("/notifications", white.clerkId);
+    n.send({ type: "challenge_accepted", data: { challengerId: 99999999999 } });
+    assert.equal((await n.next("error")).data.code, "INVALID_MESSAGE");
   });
 
   test("the rate-limit key reads a token's subject without trusting it", () => {

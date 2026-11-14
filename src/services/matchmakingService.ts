@@ -133,8 +133,12 @@ export class MatchmakingService {
       try {
         await this.tryMatch(row.id);
       } catch (error) {
-        if (error instanceof AlreadyInGameError) await this.cancel(row.id);
-        else throw error;
+        if (!(error instanceof AlreadyInGameError)) throw error;
+        // The game may be the opponent's (one started since the opponent was
+        // picked): only a player who is in a game leaves the queue
+        if ((await gameRepository.findActiveGameIdForUser(this.fastify.pg, row.userId)) !== null) {
+          await this.cancel(row.id);
+        }
       }
     }
   }

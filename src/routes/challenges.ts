@@ -20,6 +20,9 @@ export async function challengeRoutes(fastify: FastifyInstance) {
         rating: challenge.challengerRating,
         // The color the receiving player will play
         color: challenge.challengerColor === "white" ? "black" : "white",
+        bestOf: challenge.bestOf,
+        seriesId: challenge.seriesId,
+        seriesGame: challenge.seriesGame,
       })),
     };
   });
@@ -41,6 +44,9 @@ export async function challengeRoutes(fastify: FastifyInstance) {
         time: challenge.time,
         increment: challenge.increment,
         color: challenge.challengerColor,
+        bestOf: challenge.bestOf,
+        seriesId: challenge.seriesId,
+        seriesGame: challenge.seriesGame,
       },
     };
   });

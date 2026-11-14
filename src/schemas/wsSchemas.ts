@@ -2,7 +2,8 @@ import { z } from "zod";
 import { TIME_LIMITS } from "../models/common.js";
 
 const square = z.string().regex(/^[a-h][1-8]$/);
-const userId = z.number().int().positive();
+// Ids are Postgres integers: a larger number would fail the query instead of finding nothing
+const userId = z.number().int().positive().max(2_147_483_647);
 
 export const gameClientMessageSchema = z.discriminatedUnion("type", [
   z.object({
@@ -52,6 +53,11 @@ export const notificationClientMessageSchema = z.discriminatedUnion("type", [
     data: timeSettingsSchema.extend({
       challengedId: userId,
       color: z.enum(["white", "black", "random"]),
+      // 3 or 5 plays a series (see migration 016)
+      bestOf: z.union([z.literal(1), z.literal(3), z.literal(5)]).default(1),
+      // Continues this series instead: its time control, length and colours
+      // apply, and the challenged player must be the opponent in it
+      seriesId: userId.optional(),
     }),
   }),
   z.object({ type: z.literal("challenge_declined"), data: z.object({ challengerId: userId }) }),
@@ -59,3 +65,31 @@ export const notificationClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("challenge_cancelled"), data: z.object({ challengedId: userId }) }),
 ]);
 export type NotificationClientMessage = z.infer<typeof notificationClientMessageSchema>;
+
+const nodeId = z.string().min(1).max(12);
+const boardSquare = z.string().regex(/^[a-h][1-8]$/);
+
+/** Messages a study room socket accepts (see src/game/studyState.ts). */
+export const studyClientMessageSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("move"), nodeId, uci: z.string().regex(/^[a-h][1-8][a-h][1-8][qrbn]?$/) }),
+  z.object({ type: z.literal("goto"), nodeId }),
+  z.object({ type: z.literal("comment"), nodeId, text: z.string().max(1_000) }),
+  z.object({
+    type: z.literal("shapes"),
+    nodeId,
+    shapes: z
+      .array(
+        z.object({
+          orig: boardSquare,
+          dest: boardSquare.optional(),
+          brush: z.enum(["green", "red", "blue", "yellow"]),
+        })
+      )
+      .max(40),
+  }),
+  z.object({ type: z.literal("delete"), nodeId }),
+  z.object({ type: z.literal("promote"), nodeId }),
+  // The client missed an update: send the whole room again
+  z.object({ type: z.literal("sync") }),
+]);
+export type StudyClientMessage = z.infer<typeof studyClientMessageSchema>;
