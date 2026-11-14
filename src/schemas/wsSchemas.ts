@@ -20,6 +20,9 @@ export const gameClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("abort") }),
   z.object({ type: z.literal("draw_offer") }),
   z.object({ type: z.literal("draw_response"), accepted: z.boolean() }),
+  // Asks to take back the sender's last move (and the reply after it)
+  z.object({ type: z.literal("takeback_request") }),
+  z.object({ type: z.literal("takeback_response"), accepted: z.boolean() }),
   // A hint that a clock reached zero; the server checks its own clock
   z.object({ type: z.literal("timeout") }),
   // Adds GIVE_TIME_MS to the opponent's clock

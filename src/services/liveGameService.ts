@@ -5,7 +5,9 @@ import { isLiveGame, type LiveGame, type RatingChanges } from "../models/Game.js
 import { gameRepository } from "../repositories/gameRepository.js";
 import {
   applyMoveTo,
+  takebackPlies,
   timeoutOutcome,
+  undoMoves,
   type MoveInput,
   type Outcome,
   winFor,
@@ -44,6 +46,8 @@ interface TxEffects {
   ended: number[];
   /** Games whose deadline was set or moved */
   deadlines: { gameId: number; at: Date | null }[];
+  /** Positions to cache for the next move (see PositionCache) */
+  positions: { gameId: number; chess: Chess; pgn: string; ply: number }[];
 }
 
 /** Fires a moment after the deadline, so the clock has surely run out. */
@@ -67,6 +71,8 @@ const gameOver = () => new AppError("The game is over", "GAME_OVER", 409);
 // Bot games are played in the browser and stored once finished; there is
 // nothing live about them (no moves, clock or rematch here)
 const botGame = () => new AppError("This game was played against the computer", "BOT_GAME", 409);
+const takebackNotAllowed = () =>
+  new AppError("There is no move of yours to take back yet", "TAKEBACK_NOT_ALLOWED", 409);
 
 /**
  * All live-game rules. The server owns the position, the clock and the
@@ -89,7 +95,7 @@ export class LiveGameService {
   private deadlineTimersEnabled = false;
 
   private async run(gameId: number, fn: (tx: TxClient, game: LiveGame, fx: TxEffects) => Promise<void>) {
-    const fx: TxEffects = { out: [], staleStats: [], ended: [], deadlines: [] };
+    const fx: TxEffects = { out: [], staleStats: [], ended: [], deadlines: [], positions: [] };
     if (!Number.isSafeInteger(gameId) || gameId <= 0) throw notFound();
     const tx = await this.fastify.pg.connect();
     let broken = false;
@@ -116,6 +122,9 @@ export class LiveGameService {
     // A move that ends the game also set a new deadline: no timer for it
     for (const { gameId: id, at } of fx.deadlines) {
       if (!fx.ended.includes(id)) this.watchDeadline(id, at);
+    }
+    for (const { gameId: id, chess, pgn, ply } of fx.positions) {
+      if (!fx.ended.includes(id)) this.positions.commit(id, chess, pgn, ply);
     }
     // Before publishing: players refetch their stats as soon as they hear
     // the game ended
@@ -188,8 +197,8 @@ export class LiveGameService {
 
   /**
    * Full state for a (re)connecting client. Resolves an expired clock first.
-   * Pending draw and rematch offers are between the players, so spectators
-   * don't see them.
+   * Pending draw offers, takeback requests and rematch offers are between the
+   * players, so spectators don't see them.
    */
   async getState(gameId: number, viewerId: number) {
     let game = await gameRepository.findById(this.fastify.pg, gameId);
@@ -233,6 +242,7 @@ export class LiveGameService {
         whiteTimeLeft: clock?.whiteMs ?? game.whiteTimeLeftMs,
         blackTimeLeft: clock?.blackMs ?? game.blackTimeLeftMs,
         drawOfferedBy: isPlayer ? game.drawOfferedBy : null,
+        takebackRequestedBy: isPlayer ? game.takebackRequestedBy : null,
         rematchRequestedBy: isPlayer ? game.rematchRequestedBy : null,
         rematchGameId: game.rematchGameId,
         series,
@@ -477,6 +487,121 @@ export class LiveGameService {
           message: { type: "draw_response", accepted: false, userId },
         });
       }
+    });
+  }
+
+  /**
+   * Asks the opponent to take back the user's last move (see takebackPlies).
+   * The opponent having asked too means both agree. After a decline the user
+   * can't ask again until a move is made (TAKEBACK_DECLINED).
+   */
+  async requestTakeback(gameId: number, userId: number): Promise<void> {
+    await this.run(gameId, async (tx, game, fx) => {
+      if (game.status !== "in_progress") throw gameOver();
+      const color = colorOf(game, userId);
+      if (!color) throw notAPlayer();
+      const opponentId = opponentOf(game, userId);
+      const now = Date.now();
+      if (isPastDeadline(game, now)) {
+        await this.endAtDeadline(tx, game, now, fx);
+        return;
+      }
+
+      if (game.takebackRequestedBy === opponentId) {
+        await this.takeBack(tx, game, opponentId, now, fx);
+        return;
+      }
+      if (game.takebackRequestedBy === userId) return;
+      if (game.takebackDeclinedFor === userId) {
+        throw new AppError(
+          "Your takeback request was declined; you can ask again after the next move",
+          "TAKEBACK_DECLINED",
+          409
+        );
+      }
+      if (takebackPlies(game.numMoves, color) === null) throw takebackNotAllowed();
+
+      await gameRepository.setTakebackRequest(tx, gameId, userId);
+      fx.out.push({ topic: topics.gameUser(gameId, opponentId), message: { type: "takeback_request" } });
+    });
+  }
+
+  async respondToTakeback(gameId: number, userId: number, accepted: boolean): Promise<void> {
+    await this.run(gameId, async (tx, game, fx) => {
+      if (game.status !== "in_progress") throw gameOver();
+      if (!colorOf(game, userId)) throw notAPlayer();
+      const now = Date.now();
+      if (isPastDeadline(game, now)) {
+        await this.endAtDeadline(tx, game, now, fx);
+        return;
+      }
+      const requesterId = opponentOf(game, userId);
+      // Only the opponent of whoever asked can answer
+      if (game.takebackRequestedBy !== requesterId) {
+        throw new AppError("There is no takeback request to answer", "NO_TAKEBACK_REQUEST", 409);
+      }
+
+      if (accepted) {
+        await this.takeBack(tx, game, requesterId, now, fx);
+      } else {
+        await gameRepository.declineTakeback(tx, gameId, requesterId);
+        fx.out.push({
+          topic: topics.gameUser(gameId, requesterId),
+          message: { type: "takeback_response", accepted: false },
+        });
+      }
+    });
+  }
+
+  /**
+   * Takes back `requesterId`'s last move, and the opponent's reply if there
+   * is one, once both players agree. The side to move is charged their time
+   * up to now and both clocks keep what they have left (time spent on the
+   * undone moves isn't given back); the clock then runs for whoever is to
+   * move in the restored position. Clears a pending draw offer.
+   */
+  private async takeBack(tx: TxClient, game: LiveGame, requesterId: number, now: number, fx: TxEffects) {
+    const state = clockOf(game);
+    // A flag that has fallen (but is still within the lag allowance) decides
+    // the game, not a takeback
+    if (isFlagged(state, now)) {
+      await this.endAtDeadline(tx, game, now, fx);
+      return;
+    }
+    // Checked again: the request was valid when made, but is now applied to
+    // whatever position the game is in
+    const plies = takebackPlies(game.numMoves, colorOf(game, requesterId)!);
+    if (plies === null) throw takebackNotAllowed();
+
+    const chess = this.position(game);
+    const position = undoMoves(chess, game.numMoves, plies);
+    const at = Math.max(now, state.lastMoveAt);
+    const clock: ClockState = { ...remainingAt(state, at), lastMoveAt: at, ply: position.ply };
+    const deadlineAt = new Date(deadline(clock));
+    await gameRepository.saveMove(tx, game.id, {
+      fen: position.fen,
+      pgn: position.pgn,
+      numMoves: position.ply,
+      whiteTimeLeftMs: clock.whiteMs,
+      blackTimeLeftMs: clock.blackMs,
+      lastMoveAt: new Date(at),
+      deadlineAt,
+      drawOfferedBy: null,
+    });
+    fx.deadlines.push({ gameId: game.id, at: deadlineAt });
+    fx.positions.push({ gameId: game.id, chess, pgn: position.pgn, ply: position.ply });
+    fx.out.push({
+      topic: topics.game(game.id),
+      message: {
+        type: "takeback",
+        // The PGN too (unlike a move): the client drops moves it already has
+        fen: position.fen,
+        pgn: position.pgn,
+        moveNumber: position.ply,
+        clockRunning: isClockRunning(clock.ply),
+        whiteTimeLeft: clock.whiteMs,
+        blackTimeLeft: clock.blackMs,
+      },
     });
   }
 

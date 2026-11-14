@@ -127,6 +127,35 @@ export function applyMoveTo(chess: Chess, pgn: string, ply: number, input: MoveI
 }
 
 /**
+ * Least ply a takeback may go back to: both players have moved, so the clock
+ * keeps running and the first-move window (abort, FIRST_MOVE_TIMEOUT_MS)
+ * never opens again.
+ */
+export const MIN_TAKEBACK_PLY = 2;
+
+/**
+ * Half-moves undone when `requester` asks for a takeback at `ply`: their own
+ * last move, plus the opponent's reply when there is one (it's the
+ * requester's turn). Null when that would go back before MIN_TAKEBACK_PLY,
+ * which also covers a requester who hasn't moved yet.
+ */
+export function takebackPlies(ply: number, requester: PlayerColor): number | null {
+  const toMove: PlayerColor = ply % 2 === 0 ? "white" : "black";
+  const plies = toMove === requester ? 2 : 1;
+  return ply - plies >= MIN_TAKEBACK_PLY ? plies : null;
+}
+
+/**
+ * Takes back the last `plies` half-moves of `chess` in place, which must be
+ * the position after `ply` half-moves. chess.js's pgn() after undo() is in
+ * the same format appendToPgn writes.
+ */
+export function undoMoves(chess: Chess, ply: number, plies: number): { fen: string; pgn: string; ply: number } {
+  for (let i = 0; i < plies; i++) chess.undo();
+  return { fen: chess.fen(), pgn: chess.pgn(), ply: ply - plies };
+}
+
+/**
  * chess.js's pgn() output for a game started from the initial position with
  * no headers set: the seven-tag roster, a blank line, the moves, then the
  * result token, which stays "*" (chess.js never sets Result).
