@@ -70,6 +70,11 @@
 		// server; raise it when one instance runs out of CPU. Each instance adds
 		// its own container cost and a Redis heartbeat.
 		"BACKEND_INSTANCES": "1",
+		// Raise by one (and deploy) after adding or changing a secret, or after
+		// changing the Backend class in worker/index.ts: a running backend
+		// keeps the settings it started with, and this moves everyone to
+		// freshly created ones. See generationOf in worker/index.ts.
+		"BACKEND_GENERATION": "2",
 	},
 	"observability": {
 		"enabled": true,

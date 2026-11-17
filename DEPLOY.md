@@ -35,6 +35,12 @@ WebSockets) to this backend, which runs in a Cloudflare Container. Postgres
   npx wrangler secret put CLERK_SECRET_KEY             # sk_live_...
   ```
 
+- A secret added or changed later doesn't reach a backend that is already
+  running (it keeps the settings it started with for as long as anyone has
+  the site open). After `wrangler secret put`, raise `BACKEND_GENERATION` in
+  `wrangler.jsonc` by one and deploy: requests then go to freshly created
+  backends and the old ones are stopped.
+
 ## 3. Database
 
 Migrations are not run by the deploy. Run them from your machine against the
