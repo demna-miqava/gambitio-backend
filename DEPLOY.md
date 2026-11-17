@@ -40,6 +40,20 @@ WebSockets) to this backend, which runs in a Cloudflare Container. Postgres
   the site open). After `wrangler secret put`, raise `BACKEND_GENERATION` in
   `wrangler.jsonc` by one and deploy: requests then go to freshly created
   backends and the old ones are stopped.
+- Optional, for web push notifications (challenges, friend requests, "your
+  game has started"). Without these two secrets push is simply off and the
+  switch in Settings says so. Make one key pair and keep it: changing it
+  later drops every browser's subscription.
+
+  ```bash
+  npm run generate-vapid-keys                          # prints a public and a private key
+  npx wrangler secret put VAPID_PUBLIC_KEY
+  npx wrangler secret put VAPID_PRIVATE_KEY
+  npx wrangler secret put VAPID_SUBJECT                # optional: mailto:you@example.com (default: the site's address)
+  ```
+
+  To check after deploying: `curl https://<your domain>/api/push/key` shows the
+  public key, or `null` if the backend doesn't have the keys.
 
 ## 3. Database
 

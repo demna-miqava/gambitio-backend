@@ -1,5 +1,11 @@
 import { z } from "zod";
 
+// An empty value (KEY= in a .env file) counts as not set
+const optionalText = z
+  .string()
+  .optional()
+  .transform((value) => (value?.trim() ? value.trim() : undefined));
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   PORT: z.coerce.number().int().positive().default(8080),
@@ -35,9 +41,33 @@ const envSchema = z.object({
     .optional()
     .transform((value) => value === "true" || value === "1")
     .optional(),
+  // Web push (notifications when the tab is in the background or closed).
+  // Both keys or neither: without them push is simply off. Make a pair with
+  // `npm run generate-vapid-keys`. The subject is how a push service can
+  // reach the site's owner: a mailto: or https: address (default: FRONTEND_URL).
+  VAPID_PUBLIC_KEY: optionalText.optional(),
+  VAPID_PRIVATE_KEY: optionalText.optional(),
+  VAPID_SUBJECT: optionalText
+    .pipe(
+      z
+        .string()
+        .regex(/^(mailto:|https:\/\/)/, "must start with mailto: or https://")
+        .optional()
+    )
+    .optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
+
+/** The VAPID keys push messages are signed with, or null when push isn't configured. */
+export function vapidKeys(config: Config): { subject: string; publicKey: string; privateKey: string } | null {
+  if (!config.VAPID_PUBLIC_KEY || !config.VAPID_PRIVATE_KEY) return null;
+  return {
+    subject: config.VAPID_SUBJECT ?? config.FRONTEND_URL,
+    publicKey: config.VAPID_PUBLIC_KEY,
+    privateKey: config.VAPID_PRIVATE_KEY,
+  };
+}
 
 /** Every frontend origin allowed to call the API and mint session tokens for it. */
 export function allowedOrigins(config: Config): string[] {
@@ -82,6 +112,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       .map((issue) => `  ${issue.path.join(".")}: ${issue.message}`)
       .join("\n");
     throw new Error(`Invalid environment configuration:\n${problems}`);
+  }
+  if (Boolean(result.data.VAPID_PUBLIC_KEY) !== Boolean(result.data.VAPID_PRIVATE_KEY)) {
+    throw new Error(
+      "Invalid environment configuration:\n  VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY: set both or neither"
+    );
   }
   if (result.data.NODE_ENV === "production" && result.data.ALLOW_LAN_ORIGINS) {
     throw new Error("Invalid environment configuration:\n  ALLOW_LAN_ORIGINS: not allowed in production");

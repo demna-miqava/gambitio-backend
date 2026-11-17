@@ -112,6 +112,7 @@ export class UserService {
         await tx.query(`DELETE FROM repertoire_lines WHERE "userId" = $1`, id);
         await tx.query(`DELETE FROM endgame_progress WHERE "userId" = $1`, id);
         await tx.query(`DELETE FROM game_chat_messages WHERE "senderId" = $1`, id);
+        await tx.query(`DELETE FROM push_subscriptions WHERE "userId" = $1`, id);
         // Rooms they own go (with everyone's membership); they leave the others
         const { rows: rooms } = await tx.query<{ id: number }>(
           `DELETE FROM study_rooms WHERE "ownerId" = $1 RETURNING id`,

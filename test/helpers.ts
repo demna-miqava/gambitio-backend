@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import WebSocket from "ws";
-import { buildApp } from "../src/app.js";
+import { buildApp, type BuildOptions } from "../src/app.js";
 import type { AuthProvider } from "../src/plugins/authProvider.js";
 
 /**
@@ -19,7 +19,9 @@ export const fakeAuth: AuthProvider = {
   deleteUser: async () => {},
 };
 
-export async function startTestApp(): Promise<{ app: FastifyInstance; baseUrl: string }> {
+export async function startTestApp(
+  options: Pick<BuildOptions, "pushSender"> = {}
+): Promise<{ app: FastifyInstance; baseUrl: string }> {
   const app = await buildApp(
     {
       NODE_ENV: "test",
@@ -32,7 +34,7 @@ export async function startTestApp(): Promise<{ app: FastifyInstance; baseUrl: s
       CLERK_SECRET_KEY: "sk_test",
       FRONTEND_URL: "http://localhost:5173",
     },
-    { authProvider: fakeAuth, jobs: false, logger: false }
+    { authProvider: fakeAuth, jobs: false, logger: false, ...options }
   );
   await app.listen({ port: 0, host: "127.0.0.1" });
   const address = app.server.address();

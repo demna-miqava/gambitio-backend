@@ -15,10 +15,11 @@ import { ChallengeService } from "./services/challengeService.js";
 import { SeriesService } from "./services/seriesService.js";
 import { StudyService } from "./services/studyService.js";
 import { GameChatService } from "./services/gameChatService.js";
+import { PushService, webPushSender, type PushSender } from "./services/pushService.js";
 import { createJobs } from "./jobs.js";
 import { UserLookup } from "./plugins/userLookup.js";
 import { selectWsProtocol, wsHandshakeToken } from "./middleware/wsAuth.js";
-import { originChecker, type Config } from "./config.js";
+import { originChecker, vapidKeys, type Config } from "./config.js";
 import { userRoutes } from "./routes/users.js";
 import { gameRoutes } from "./routes/games.js";
 import { liveGameRoutes } from "./routes/liveGames.js";
@@ -33,6 +34,7 @@ import { seriesRoutes } from "./routes/series.js";
 import { repertoireRoutes } from "./routes/repertoire.js";
 import { studyRoutes } from "./routes/study.js";
 import { endgameRoutes } from "./routes/endgames.js";
+import { pushRoutes } from "./routes/push.js";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -44,6 +46,7 @@ declare module "fastify" {
     series: SeriesService;
     study: StudyService;
     gameChat: GameChatService;
+    push: PushService;
     jobs: ReturnType<typeof createJobs>;
     users: UserLookup;
   }
@@ -52,6 +55,8 @@ declare module "fastify" {
 export interface BuildOptions {
   /** Replaces Clerk token verification (tests). */
   authProvider?: AuthProvider;
+  /** Replaces delivery to the browsers' push services (tests); turns push on without VAPID keys. */
+  pushSender?: PushSender;
   /** Start background sweepers (default true). */
   jobs?: boolean;
   logger?: boolean;
@@ -219,6 +224,14 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   app.decorate("series", new SeriesService(app, hub));
   app.decorate("study", new StudyService(app, hub));
   app.decorate("gameChat", new GameChatService(app, hub));
+  const vapid = vapidKeys(config);
+  app.decorate(
+    "push",
+    new PushService(app, {
+      publicKey: vapid?.publicKey ?? (options.pushSender ? "test-public-key" : null),
+      sender: options.pushSender ?? (vapid ? webPushSender(vapid) : null),
+    })
+  );
   app.decorate("jobs", createJobs(app));
 
   app.addHook("onReady", async () => {
@@ -250,6 +263,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   await app.register(repertoireRoutes, { prefix: "/api" });
   await app.register(studyRoutes, { prefix: "/api" });
   await app.register(endgameRoutes, { prefix: "/api" });
+  await app.register(pushRoutes, { prefix: "/api" });
 
   return app;
 }

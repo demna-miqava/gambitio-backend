@@ -3,6 +3,7 @@ import type { MatchmakingRequest } from "../models/Matchmaking.js";
 import { getTimeControl, ratingColumns } from "../models/common.js";
 import { gameRepository } from "../repositories/gameRepository.js";
 import { createGame, matchFoundData, AlreadyInGameError } from "./gameService.js";
+import { timeControlLabel } from "./pushService.js";
 import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
 
 const INITIAL_RATING_RANGE = 50;
@@ -109,6 +110,19 @@ export class MatchmakingService {
         data: matchFoundData(created, playerId),
       });
       await this.hub.publish(topics.notifications(playerId), activeGameMessage(created.id));
+      // Someone waiting for an opponent has often switched to another tab
+      void this.fastify.push.notify(
+        playerId,
+        {
+          title: "Your game has started",
+          body: `${timeControlLabel(created.time, created.increment)} against ${
+            playerId === created.whiteId ? created.blackUsername : created.whiteUsername
+          }. Your clock is running.`,
+          url: `/game/${created.id}`,
+          tag: `game-${created.id}`,
+        },
+        60
+      );
     }
     return created.id;
   }

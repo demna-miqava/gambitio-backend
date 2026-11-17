@@ -8,6 +8,7 @@ import { seriesColors } from "../game/series.js";
 import { seriesRepository, type SeriesRow } from "./seriesService.js";
 import type { AllowedFrom } from "../models/Settings.js";
 import { withinLimit } from "../utils/rateLimit.js";
+import { timeControlLabel } from "./pushService.js";
 
 export interface Challenge {
   id: number;
@@ -228,6 +229,20 @@ export class ChallengeService {
         createdAt: new Date(challenge.createdAt).toISOString(),
       },
     });
+    // For a tab in the background. Only useful while the challenge is open
+    void this.fastify.push.notify(
+      data.challengedId,
+      {
+        title: `${challenger.username} challenged you`,
+        body:
+          `${timeControlLabel(challenge.time, challenge.increment)}` +
+          (challenge.bestOf > 1 ? `, best of ${challenge.bestOf}` : "") +
+          `. You play ${challengerColor === "white" ? "Black" : "White"}.`,
+        url: "/home",
+        tag: `challenge-${challenger.id}`,
+      },
+      CHALLENGE_TTL_MS / 1000
+    );
   }
 
   /**
@@ -484,5 +499,17 @@ export class ChallengeService {
       });
       await this.hub.publish(topics.notifications(playerId), activeGameMessage(game.id));
     }
+    // The challenger may have switched tabs while waiting for the answer
+    const data = matchFoundData(game, challengerId);
+    void this.fastify.push.notify(
+      challengerId,
+      {
+        title: `${data.opponentUsername} accepted your challenge`,
+        body: `Your ${timeControlLabel(game.time, game.increment)} game has started.`,
+        url: `/game/${game.id}`,
+        tag: `game-${game.id}`,
+      },
+      60
+    );
   }
 }

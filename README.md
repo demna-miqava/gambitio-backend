@@ -22,7 +22,10 @@ Optional: `EXTRA_FRONTEND_ORIGINS`, comma-separated origins allowed besides
 `PG_POOL_MAX` (Postgres connections, default 15); `PG_STATEMENT_TIMEOUT_MS`
 (longest a query may run, default 5000); `ALLOW_LAN_ORIGINS=true` (local dev
 only) also allows any private-network origin, so a phone keeps working when
-the Mac's IP changes.
+the Mac's IP changes; `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` (both or
+neither, from `npm run generate-vapid-keys`) turn web push notifications on,
+with `VAPID_SUBJECT` as the contact address push services see (a `mailto:` or
+`https:` address, default `FRONTEND_URL`).
 
 To open the dev server from a phone on the same Wi-Fi, run the backend with
 `ALLOW_LAN_ORIGINS=true` and the frontend with `VITE_API_BASE_URL` and
@@ -103,4 +106,8 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
 - `src/services/challengeService.ts` – challenges. Who may challenge a player
   is their `challengesAllowedFrom` setting (anyone, friends, no one);
   challenges to non-friends are rate-limited and have a cooldown after a decline
+- `src/services/pushService.ts`, `src/routes/push.ts` – web push: browsers
+  register a subscription, and challenges, friend requests and game starts
+  are also sent as notifications. Endpoints are only accepted on the
+  browsers' own push services
 - `migrations/` – SQL migrations; `scripts/migrate.ts` applies them

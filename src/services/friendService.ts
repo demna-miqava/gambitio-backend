@@ -118,6 +118,16 @@ export class FriendService {
         avatarUrl: context.senderAvatarUrl,
       })
     );
+    void this.fastify.push.notify(
+      created.receiverId,
+      {
+        title: "New friend request",
+        body: `${senderUsername} wants to be friends.`,
+        url: `/profile/${created.receiverId}/friends`,
+        tag: `friend-request-${senderId}`,
+      },
+      24 * 60 * 60
+    );
     return created;
   }
 
@@ -157,6 +167,16 @@ export class FriendService {
           id: friendship.userTwoId,
           username: friendship.userTwoUsername,
         })
+      );
+      void this.fastify.push.notify(
+        friendship.userOneId,
+        {
+          title: "Friend request accepted",
+          body: `You and ${friendship.userTwoUsername} are now friends.`,
+          url: `/profile/${friendship.userTwoId}`,
+          tag: `friend-accepted-${friendship.userTwoId}`,
+        },
+        24 * 60 * 60
       );
       return friendship;
     }

@@ -20,6 +20,10 @@ interface Env {
   REDIS_URL: string;
   CLERK_PUBLISHABLE_KEY: string;
   CLERK_SECRET_KEY: string;
+  // Optional secrets: web push is off without the two keys (see DEPLOY.md)
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_KEY?: string;
+  VAPID_SUBJECT?: string;
 }
 
 /**
@@ -45,6 +49,12 @@ export class Backend extends Container<Env> {
       REDIS_URL: env.REDIS_URL,
       CLERK_PUBLISHABLE_KEY: env.CLERK_PUBLISHABLE_KEY,
       CLERK_SECRET_KEY: env.CLERK_SECRET_KEY,
+      ...(env.VAPID_PUBLIC_KEY &&
+        env.VAPID_PRIVATE_KEY && {
+          VAPID_PUBLIC_KEY: env.VAPID_PUBLIC_KEY,
+          VAPID_PRIVATE_KEY: env.VAPID_PRIVATE_KEY,
+          ...(env.VAPID_SUBJECT && { VAPID_SUBJECT: env.VAPID_SUBJECT }),
+        }),
     };
   }
 }
