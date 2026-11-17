@@ -100,4 +100,7 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
   Each player's `gameChatAllowedFrom` setting must allow the other; changing
   it during a game sends both players a `chat_status`, so the opponent sees
   that chat went off. Messages are deleted an hour after their game ends
+- `src/services/challengeService.ts` – challenges. Who may challenge a player
+  is their `challengesAllowedFrom` setting (anyone, friends, no one);
+  challenges to non-friends are rate-limited and have a cooldown after a decline
 - `migrations/` – SQL migrations; `scripts/migrate.ts` applies them

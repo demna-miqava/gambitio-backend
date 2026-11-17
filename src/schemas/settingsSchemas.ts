@@ -17,6 +17,8 @@ export const updateSettingsSchema = z
     emailNotificationsEnabled: z.boolean().optional(),
     messagesAllowedFrom: z.enum(ALLOWED_FROM).optional(),
     gameChatAllowedFrom: z.enum(ALLOWED_FROM).optional(),
+    challengesAllowedFrom: z.enum(ALLOWED_FROM).optional(),
+    focusModeEnabled: z.boolean().optional(),
     colorPalette: z.enum(COLOR_PALETTES).optional(),
   })
   .strict()

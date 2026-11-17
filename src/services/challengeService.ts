@@ -6,6 +6,8 @@ import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js"
 import { getTimeControl, ratingColumns, type PlayerColor } from "../models/common.js";
 import { seriesColors } from "../game/series.js";
 import { seriesRepository, type SeriesRow } from "./seriesService.js";
+import type { AllowedFrom } from "../models/Settings.js";
+import { withinLimit } from "../utils/rateLimit.js";
 
 export interface Challenge {
   id: number;
@@ -42,6 +44,17 @@ export const challengeTimings = { offlineGraceMs: 15_000 };
 
 /** Why a challenge ended without being answered, as told to its sender */
 type WithdrawReason = "expired" | "offline";
+
+/**
+ * Limits on challenging someone who isn't a friend, so "anyone can challenge
+ * me" can't be used to pester: after a decline the same player can't be
+ * challenged again for a while, and one player can only challenge so many
+ * strangers in a row.
+ */
+const STRANGER_DECLINE_COOLDOWN_SECONDS = 5 * 60;
+const STRANGER_CHALLENGES = { max: 10, windowSeconds: 10 * 60 };
+const declinedKey = (challengerId: number, challengedId: number) =>
+  `challenge:declined:${challengerId}:${challengedId}`;
 
 const unavailable = () =>
   new AppError("Player is currently unavailable", "OPPONENT_UNAVAILABLE", 409);
@@ -159,18 +172,13 @@ export class ChallengeService {
         color: colors.whiteId === challenger.id ? "white" : "black",
       };
     }
-    const { rows: friendship } = await this.fastify.pg.query(
-      `SELECT 1 FROM friends
-       WHERE LEAST("userOneId", "userTwoId") = LEAST($1::int, $2::int)
-         AND GREATEST("userOneId", "userTwoId") = GREATEST($1::int, $2::int)`,
-      [challenger.id, data.challengedId]
-    );
-    if (friendship.length === 0) {
-      throw new AppError("You can only challenge friends", "NOT_FRIENDS", 403);
-    }
+    // The next game of a series needs no permission: the two are playing it
+    const areFriends = series ? true : await this.assertMayChallenge(challenger.id, data.challengedId);
     const ownGameId = await gameRepository.findActiveGameIdForUser(this.fastify.pg, challenger.id);
     if (ownGameId !== null) throw new AlreadyInGameError(ownGameId);
     if (!(await this.isAvailable(data.challengedId))) throw unavailable();
+    // Counted only for challenges that would reach the other player
+    if (!areFriends) await this.assertStrangerLimits(challenger.id, data.challengedId);
 
     const challengerColor: PlayerColor =
       data.color === "random" ? (Math.random() < 0.5 ? "white" : "black") : data.color;
@@ -222,6 +230,57 @@ export class ChallengeService {
     });
   }
 
+  /**
+   * Whether the challenged player's settings let this player challenge them
+   * (throws if not). Returns whether the two are friends.
+   */
+  private async assertMayChallenge(challengerId: number, challengedId: number): Promise<boolean> {
+    const { rows } = await this.fastify.pg.query<{ allowed: AllowedFrom; areFriends: boolean }>(
+      `SELECT COALESCE(s."challengesAllowedFrom", 'everyone') AS allowed,
+         EXISTS (
+           SELECT 1 FROM friends f
+           WHERE LEAST(f."userOneId", f."userTwoId") = LEAST($1::int, $2::int)
+             AND GREATEST(f."userOneId", f."userTwoId") = GREATEST($1::int, $2::int)
+         ) AS "areFriends"
+       FROM users u LEFT JOIN user_settings s ON s."userId" = u.id
+       WHERE u.id = $2::int AND u."clerkId" IS NOT NULL -- not a deleted account`,
+      [challengerId, challengedId]
+    );
+    const target = rows[0];
+    if (!target) throw new AppError("Challenged user not found", "USER_NOT_FOUND", 404);
+    if (target.allowed === "nobody") {
+      throw new AppError("This player isn't accepting challenges", "CHALLENGES_OFF", 403);
+    }
+    if (target.allowed === "only_friends" && !target.areFriends) {
+      throw new AppError("This player only accepts challenges from friends", "NOT_FRIENDS", 403);
+    }
+    return target.areFriends;
+  }
+
+  /** See STRANGER_CHALLENGES. Throws when the challenger has to wait. */
+  private async assertStrangerLimits(challengerId: number, challengedId: number): Promise<void> {
+    if (await this.fastify.redis.exists(declinedKey(challengerId, challengedId))) {
+      throw new AppError(
+        "This player declined your challenge. You can ask again in a few minutes.",
+        "CHALLENGE_DECLINED_RECENTLY",
+        429
+      );
+    }
+    const allowed = await withinLimit(
+      this.fastify.redis,
+      `challenge:strangers:${challengerId}`,
+      STRANGER_CHALLENGES.max,
+      STRANGER_CHALLENGES.windowSeconds
+    );
+    if (!allowed) {
+      throw new AppError(
+        "You've sent a lot of challenges. Try again in a few minutes.",
+        "CHALLENGE_RATE_LIMITED",
+        429
+      );
+    }
+  }
+
   /** The series a player wants to continue, if they may: theirs, active, between games. */
   private async continuation(seriesId: number, userId: number): Promise<SeriesRow> {
     const series = await seriesRepository.find(this.fastify.pg, seriesId);
@@ -251,6 +310,12 @@ export class ChallengeService {
       [challengerId, challengedId]
     );
     if (rowCount) {
+      // Only checked for players who aren't friends (see assertStrangerLimits)
+      await this.fastify.redis
+        .set(declinedKey(challengerId, challengedId), "1", {
+          expiration: { type: "EX", value: STRANGER_DECLINE_COOLDOWN_SECONDS },
+        })
+        .catch((err) => this.fastify.log.warn({ err }, "Recording a declined challenge failed"));
       await this.hub.publish(topics.notifications(challengerId), {
         type: "challenge_declined",
         data: { challengedId },

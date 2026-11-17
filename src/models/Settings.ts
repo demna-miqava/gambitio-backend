@@ -23,6 +23,10 @@ export interface Settings {
   messagesAllowedFrom: AllowedFrom;
   /** Who the user chats with during games; both players must allow the other */
   gameChatAllowedFrom: AllowedFrom;
+  /** Who may challenge the user to a game */
+  challengesAllowedFrom: AllowedFrom;
+  /** During a live game, show only the board, the clocks and the game actions */
+  focusModeEnabled: boolean;
   colorPalette: ColorPalette;
 }
 

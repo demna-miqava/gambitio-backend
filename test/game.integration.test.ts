@@ -699,13 +699,91 @@ describe("matchmaking and challenges", { skip: !integrationEnabled && "TEST_POST
     await assert.rejects(connect(baseUrl, "/notifications", ""), /401/);
   });
 
-  test("only friends can be challenged", async () => {
+  const allowChallengesFrom = (user: { id: number }, from: "everyone" | "only_friends" | "nobody") =>
+    app.pg.query(
+      `INSERT INTO user_settings ("userId", "challengesAllowedFrom") VALUES ($1, $2)
+       ON CONFLICT ("userId") DO UPDATE SET "challengesAllowedFrom" = EXCLUDED."challengesAllowedFrom"`,
+      [user.id, from]
+    );
+  const challengeTo = (to: { id: number }) => ({
+    type: "challenge_sent",
+    data: { challengedId: to.id, color: "white", time: 300, increment: 0 },
+  });
+
+  test("anyone can be challenged unless their settings say otherwise", async () => {
     const a = await createUser(app, "alice");
     const b = await createUser(app, "bobby");
     const na = await open("/notifications", a.clerkId);
-    await open("/notifications", b.clerkId);
-    na.send({ type: "challenge_sent", data: { challengedId: b.id, color: "white", time: 300, increment: 0 } });
+    const nb = await open("/notifications", b.clerkId);
+
+    // No settings row at all: the default lets a stranger challenge
+    na.send(challengeTo(b));
+    assert.equal((await nb.next("challenge_received")).data.challengerId, a.id);
+
+    await allowChallengesFrom(b, "only_friends");
+    na.send(challengeTo(b));
     assert.equal((await na.next("error")).data.code, "NOT_FRIENDS");
+    await befriend(a, b);
+    na.send(challengeTo(b));
+    await nb.next("challenge_received");
+
+    // "Nobody" means friends too
+    await allowChallengesFrom(b, "nobody");
+    na.send(challengeTo(b));
+    assert.equal((await na.next("error")).data.code, "CHALLENGES_OFF");
+    await nb.none("challenge_received");
+  });
+
+  test("a stranger who was declined has to wait before challenging again", async () => {
+    const a = await createUser(app, "alice");
+    const b = await createUser(app, "bobby");
+    const c = await createUser(app, "carol");
+    await befriend(c, b);
+    const na = await open("/notifications", a.clerkId);
+    const nb = await open("/notifications", b.clerkId);
+    const nc = await open("/notifications", c.clerkId);
+
+    na.send(challengeTo(b));
+    await nb.next("challenge_received");
+    nb.send({ type: "challenge_declined", data: { challengerId: a.id } });
+    await na.next("challenge_declined");
+    na.send(challengeTo(b));
+    assert.equal((await na.next("error")).data.code, "CHALLENGE_DECLINED_RECENTLY");
+    await nb.none("challenge_received");
+
+    // A friend can ask again straight away
+    nc.send(challengeTo(b));
+    await nb.next("challenge_received");
+    nb.send({ type: "challenge_declined", data: { challengerId: c.id } });
+    await nc.next("challenge_declined");
+    nc.send(challengeTo(b));
+    await nb.next("challenge_received");
+  });
+
+  test("one player can't challenge strangers without end", async () => {
+    const a = await createUser(app, "alice");
+    const na = await open("/notifications", a.clerkId);
+    const strangers = [];
+    for (let i = 0; i < 11; i++) {
+      const user = await createUser(app, `stranger${i}`);
+      strangers.push({ user, socket: await open("/notifications", user.clerkId) });
+    }
+    for (const { user, socket } of strangers.slice(0, 10)) {
+      na.send(challengeTo(user));
+      await socket.next("challenge_received");
+    }
+    na.send(challengeTo(strangers[10]!.user));
+    assert.equal((await na.next("error")).data.code, "CHALLENGE_RATE_LIMITED");
+    await strangers[10]!.socket.none("challenge_received");
+  });
+
+  test("a deleted account can't be challenged", async () => {
+    const a = await createUser(app, "alice");
+    const b = await createUser(app, "bobby");
+    await app.pg.query(`UPDATE users SET "clerkId" = NULL WHERE id = $1`, [b.id]);
+    const na = await open("/notifications", a.clerkId);
+    na.send(challengeTo(b));
+    assert.equal((await na.next("error")).data.code, "USER_NOT_FOUND");
   });
 
   test("a challenge can only be accepted once", async () => {
