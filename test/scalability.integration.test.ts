@@ -16,6 +16,7 @@ import { createGame } from "../src/services/gameService.js";
 import { RealtimeHub } from "../src/realtime/hub.js";
 import { reauthTimings } from "../src/realtime/socket.js";
 import { unverifiedSubject } from "../src/app.js";
+import { COLOR_PALETTES } from "../src/models/Settings.js";
 
 /** Covers the scalability pass: deadline timers, presence, sockets, friend requests. */
 describe("scalability changes", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_REDIS_URL not set" }, () => {
@@ -267,6 +268,13 @@ describe("scalability changes", { skip: !integrationEnabled && "TEST_POSTGRES_UR
     const changed = await patch({ colorPalette: "midnight" });
     assert.equal(changed.statusCode, 200, changed.body);
     assert.equal(changed.json().data.colorPalette, "midnight");
+    // Every palette the API accepts is one the database accepts too
+    for (const colorPalette of COLOR_PALETTES) {
+      const res = await patch({ colorPalette });
+      assert.equal(res.statusCode, 200, res.body);
+      assert.equal(res.json().data.colorPalette, colorPalette);
+    }
+    await patch({ colorPalette: "midnight" });
     assert.equal((await patch({ colorPalette: "neon" })).statusCode, 400);
     const res = await app.inject({
       method: "GET",

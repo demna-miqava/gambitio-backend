@@ -1,5 +1,15 @@
-/** Same values as the CHECK in migrations/015_color_palette.sql */
-export const COLOR_PALETTES = ["emerald", "club", "midnight", "walnut"] as const;
+/** Same values as the CHECK in migrations/026_more_color_palettes.sql */
+export const COLOR_PALETTES = [
+  "emerald",
+  "club",
+  "midnight",
+  "walnut",
+  "ink",
+  "fjord",
+  "plum",
+  "tide",
+  "olive",
+] as const;
 export type ColorPalette = (typeof COLOR_PALETTES)[number];
 
 /** Same values as the messages_allowed_from enum (migration 001) */
