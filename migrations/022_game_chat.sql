@@ -3,7 +3,7 @@
 -- Messages are plain text, cleaned by the server before they are stored (see
 -- src/game/chatText.ts); the length check here is the last line of defence.
 -- Only the two players ever receive them. They are deleted with the sender's
--- account and by a sweep an hour after their game ended.
+-- account and by a sweep some weeks after they were written.
 
 CREATE TABLE game_chat_messages (
   id bigserial PRIMARY KEY,
@@ -15,6 +15,8 @@ CREATE TABLE game_chat_messages (
 );
 -- A game's messages in order (history, and the per-player count)
 CREATE INDEX game_chat_messages_game_idx ON game_chat_messages ("gameId", id);
+-- The retention sweep
+CREATE INDEX game_chat_messages_created_idx ON game_chat_messages ("createdAt");
 
 -- Who a player chats with during games. Both players' settings must allow
 -- the other for a game to have chat.
