@@ -10,6 +10,8 @@ const MATCHMAKING_SWEEP_MS = 2_000;
 const CHALLENGE_SWEEP_MS = 30_000;
 /** Series expire after days, so a pass every few minutes is plenty */
 const SERIES_SWEEP_MS = 5 * 60_000;
+/** Chat messages go an hour after their game ends: an hourly pass is close enough */
+const CHAT_SWEEP_MS = 60 * 60_000;
 
 /**
  * Background timers. Each pass is idempotent and uses row locks, so running
@@ -73,6 +75,12 @@ export function createJobs(app: FastifyInstance) {
         "Series sweep",
         () => app.hub.attachedCount > 0,
         () => app.series.expireStale()
+      );
+      every(
+        CHAT_SWEEP_MS,
+        "Chat sweep",
+        () => app.hub.attachedCount > 0,
+        () => app.gameChat.sweep()
       );
     },
     stop() {

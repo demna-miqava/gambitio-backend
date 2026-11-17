@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { COLOR_PALETTES } from "../models/Settings.js";
+import { ALLOWED_FROM, COLOR_PALETTES } from "../models/Settings.js";
 
 export const updateSettingsSchema = z
   .object({
@@ -15,9 +15,8 @@ export const updateSettingsSchema = z
     showRatingsDuringGameEnabled: z.boolean().optional(),
     pieceIconNotationEnabled: z.boolean().optional(),
     emailNotificationsEnabled: z.boolean().optional(),
-    messagesAllowedFrom: z
-      .enum(["nobody", "everyone", "only_friends"])
-      .optional(),
+    messagesAllowedFrom: z.enum(ALLOWED_FROM).optional(),
+    gameChatAllowedFrom: z.enum(ALLOWED_FROM).optional(),
     colorPalette: z.enum(COLOR_PALETTES).optional(),
   })
   .strict()

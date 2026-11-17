@@ -14,6 +14,7 @@ import { MatchmakingService } from "./services/matchmakingService.js";
 import { ChallengeService } from "./services/challengeService.js";
 import { SeriesService } from "./services/seriesService.js";
 import { StudyService } from "./services/studyService.js";
+import { GameChatService } from "./services/gameChatService.js";
 import { createJobs } from "./jobs.js";
 import { UserLookup } from "./plugins/userLookup.js";
 import { selectWsProtocol, wsHandshakeToken } from "./middleware/wsAuth.js";
@@ -42,6 +43,7 @@ declare module "fastify" {
     challenges: ChallengeService;
     series: SeriesService;
     study: StudyService;
+    gameChat: GameChatService;
     jobs: ReturnType<typeof createJobs>;
     users: UserLookup;
   }
@@ -216,6 +218,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   app.decorate("challenges", new ChallengeService(app, hub));
   app.decorate("series", new SeriesService(app, hub));
   app.decorate("study", new StudyService(app, hub));
+  app.decorate("gameChat", new GameChatService(app, hub));
   app.decorate("jobs", createJobs(app));
 
   app.addHook("onReady", async () => {

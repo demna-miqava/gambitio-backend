@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { TIME_LIMITS } from "../models/common.js";
+import { CHAT_MAX_RAW_LENGTH } from "../game/chatText.js";
 
 const square = z.string().regex(/^[a-h][1-8]$/);
 // Ids are Postgres integers: a larger number would fail the query instead of finding nothing
@@ -39,6 +40,9 @@ export const gameClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("cancel_rematch") }),
   // The client's board drifted (a missed move): send the full state again
   z.object({ type: z.literal("sync") }),
+  // A chat message to the other player. Only bounded here: the text is
+  // cleaned and its real length checked in GameChatService
+  z.object({ type: z.literal("chat"), text: z.string().min(1).max(CHAT_MAX_RAW_LENGTH) }),
 ]);
 export type GameClientMessage = z.infer<typeof gameClientMessageSchema>;
 

@@ -2,6 +2,10 @@
 export const COLOR_PALETTES = ["emerald", "club", "midnight", "walnut"] as const;
 export type ColorPalette = (typeof COLOR_PALETTES)[number];
 
+/** Same values as the messages_allowed_from enum (migration 001) */
+export const ALLOWED_FROM = ["everyone", "only_friends", "nobody"] as const;
+export type AllowedFrom = (typeof ALLOWED_FROM)[number];
+
 export interface Settings {
   userId: number;
   boardCoordinatesEnabled: boolean;
@@ -16,7 +20,9 @@ export interface Settings {
   showRatingsDuringGameEnabled: boolean;
   pieceIconNotationEnabled: boolean;
   emailNotificationsEnabled: boolean;
-  messagesAllowedFrom: "nobody" | "everyone" | "only_friends";
+  messagesAllowedFrom: AllowedFrom;
+  /** Who the user chats with during games; both players must allow the other */
+  gameChatAllowedFrom: AllowedFrom;
   colorPalette: ColorPalette;
 }
 

@@ -7,7 +7,7 @@ import { AppError } from "../../errors/AppError.js";
 import { spectatorsKey } from "../../services/liveGameService.js";
 
 export async function gameWebSocketRoute(fastify: FastifyInstance) {
-  const { hub, liveGames } = fastify;
+  const { hub, liveGames, gameChat } = fastify;
 
   fastify.get<{ Params: { id: string } }>(
     "/game/:id",
@@ -64,6 +64,8 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
           case "sync":
             await sendState();
             return;
+          case "chat":
+            return gameChat.send(gameId, userId, message.text);
         }
       });
 
@@ -97,7 +99,15 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
             });
         }
         const spectators = live ? await liveGames.spectatorCount(gameId).catch(() => undefined) : undefined;
-        sendJson(socket, { ...state, data: { ...data, spectators } });
+        // Chat is between the players: spectators get none of it. A failure
+        // here leaves the game without chat rather than without a board
+        const chat = isPlayer
+          ? await gameChat.state(gameId, user.id).catch((err) => {
+              request.log.error({ err }, "Failed to load game chat");
+              return null;
+            })
+          : null;
+        sendJson(socket, { ...state, data: { ...data, spectators, ...(chat && { chat }) } });
       }
 
       try {

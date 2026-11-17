@@ -92,4 +92,12 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
   small updates (cursor, node, tree) and clients resync on a version gap
 - `src/routes/endgames.ts` – endgame lab progress (the exercises run in the
   browser)
+- `src/game/chatText.ts`, `src/services/gameChatService.ts` – chat between
+  the two players of a live game, over the game socket (`{ type: "chat" }`).
+  Text is cleaned (invisible and control characters, length) and stored as
+  typed; it is never escaped or put into SQL, only bound as a parameter.
+  Messages go to the two players' own topics, so spectators never get them.
+  Each player's `gameChatAllowedFrom` setting must allow the other; changing
+  it during a game sends both players a `chat_status`, so the opponent sees
+  that chat went off. Messages are deleted an hour after their game ends
 - `migrations/` – SQL migrations; `scripts/migrate.ts` applies them
