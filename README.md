@@ -78,6 +78,37 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
   transaction holding the game row lock
 - `src/services/gameService.ts` – game creation (the only place games are
   created), ending games and rating updates
+- `src/utils/glicko2.ts`, `src/utils/ratingHelpers.ts` – ratings are Glicko-2,
+  one per time control: besides the rating a player has a deviation (how
+  unsure the rating is: 350 for a new player, down to 50 with games, back up
+  with time away) and a volatility (migration 032). A game is rated as it
+  ends, under both players' row locks (`finishGame`); a new player moves by
+  100 points and more a game and settles in ten to twenty games, an
+  established one by about 7 against an equal. One game never moves a rating
+  by more than 300, ratings are whole numbers and never drop below 100. A
+  rating with a deviation above 110 is provisional: users, stats and each
+  game's players carry a `provisional` flag, shown as "1500?". Puzzle
+  ratings are separate (`src/utils/puzzleRating.ts`)
+- `src/utils/shareToken.ts`, `GameService.shareGame` – share links. A player
+  of a finished game gets a link (`POST /api/games/:id/share`, the same one
+  for both players until either turns it off with `DELETE`); the token is
+  random, not the game's id. `GET /api/shared-games/:token` is the one route
+  that serves a game without sign-in, limited per address. On Cloudflare the
+  Worker writes the game into the `<head>` of `/share/<token>` pages so links
+  unfurl as that game (`worker/shareMeta.ts`)
+- `src/game/arena.ts`, `src/services/tournamentService.ts`,
+  `src/routes/ws/tournament.ts` – arena tournaments (migration 034; the design
+  is in `TOURNAMENTS.md`). A tournament runs for a fixed time; a tick
+  (`src/jobs.ts`, every 3 s while one is running or due) starts it, pairs the
+  waiting players who have its lobby socket open, and closes it once its
+  last game has ended. A pairing is an ordinary live game with a
+  `tournamentId`; it is scored in the transaction that ends it
+  (`recordTournamentResult`): 2 / 1 / 0, doubled after two wins in a row.
+  Tournament games have no abort, takeback, rematch or given time, and not
+  making the first move loses the game (unrated) and pauses the player. The
+  tournament row's lock (`FOR NO KEY UPDATE SKIP LOCKED`; see "Lock order"
+  in `TOURNAMENTS.md` for why not `FOR UPDATE`) decides which instance
+  does a tick's work. A player can create 10 tournaments a day
 - `src/services/matchmakingService.ts` – queue pairing with `FOR UPDATE SKIP LOCKED`
 - `src/game/positionCache.ts` – parsed positions of live games, so a move
   doesn't replay the game from its PGN

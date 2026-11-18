@@ -97,10 +97,17 @@ export class UserService {
   async deleteAccount(clerkId: string): Promise<void> {
     const user = await this.userRepository.findByClerkId(clerkId);
     if (user) {
+      // Out of their tournaments first, so no new game is paired for them
+      // while the rest is removed (a game under way is resigned just below
+      // and still counts for the opponent)
+      const tournaments = await this.fastify.pg.transact((tx) => this.fastify.tournaments.removeUser(tx, user.id));
+      await this.fastify.tournaments.announceRemoval(tournaments);
+
       const gameId = await gameRepository.findActiveGameIdForUser(this.fastify.pg, user.id);
       if (gameId !== null) {
         const game = await gameRepository.findById(this.fastify.pg, gameId);
-        await (game && game.numMoves < 2
+        // A tournament game can't be aborted: it is resigned whatever the move
+        await (game && game.numMoves < 2 && game.tournamentId === null
           ? this.fastify.liveGames.abort(gameId, user.id)
           : this.fastify.liveGames.resign(gameId, user.id)
         ).catch((error) => {
@@ -122,6 +129,16 @@ export class UserService {
         return rooms;
       });
       for (const roomId of lateRooms) await this.fastify.study.closeRoomSockets(roomId);
+
+      // Tournaments they joined or set up while all of that ran. From here
+      // on none lets them in (the account is gone: see
+      // tournamentRepository.holdAccount), so this sweep is the last one
+      // needed. A failure leaves at worst a line nobody can pair; it
+      // mustn't keep the Clerk user from being deleted below.
+      await this.fastify.pg
+        .transact((tx) => this.fastify.tournaments.removeUser(tx, user.id))
+        .then((late) => this.fastify.tournaments.announceRemoval(late))
+        .catch((err) => this.fastify.log.error({ err, userId: user.id }, "Leaving tournaments after deletion failed"));
     }
     this.fastify.users.forget(clerkId);
     // Open sockets were authenticated before; close them on every instance

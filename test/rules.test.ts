@@ -14,7 +14,7 @@ import {
   MAX_LAG_COMPENSATION_MS,
   remainingAt,
 } from "../src/game/clock.js";
-import { calculateRatingChanges, RATING_FLOOR } from "../src/utils/ratingHelpers.js";
+import { MAX_RATING_CHANGE, rateGame, RATING_FLOOR } from "../src/utils/ratingHelpers.js";
 import { ratingRangeFor } from "../src/services/matchmakingService.js";
 import { redactUrl } from "../src/app.js";
 import { toSolverFirst } from "../scripts/import-lichess-puzzles.js";
@@ -121,34 +121,66 @@ test("given time is added to time left now and moves the deadline", () => {
   assert.equal(addTime({ ...state, whiteMs: MAX_CLOCK_MS + 5 }, "white", 10_000).whiteMs, MAX_CLOCK_MS + 5);
 });
 
-test("winner always gains and loser always loses", () => {
+const NOW = new Date("2026-11-18T12:00:00Z");
+/** A rating that has settled: a low deviation, last played a moment ago. */
+const settled = (rating: number) => ({ rating, rd: 60, volatility: 0.06, ratedAt: NOW });
+/** A rating nobody has played for yet. */
+const fresh = (rating: number) => ({ rating, rd: 350, volatility: 0.06, ratedAt: null });
+
+test("the winner never loses points and the loser never gains any", () => {
   for (const [white, black] of [
     [1400, 800],
     [800, 1400],
     [1200, 1200],
   ] as const) {
-    const whiteWins = calculateRatingChanges(white, black, "white_win");
-    assert.ok(whiteWins.whiteRatingChange > 0, `${white} beating ${black} gains`);
-    assert.ok(whiteWins.blackRatingChange < 0);
-    const blackWins = calculateRatingChanges(white, black, "black_win");
-    assert.ok(blackWins.blackRatingChange > 0);
-    assert.ok(blackWins.whiteRatingChange < 0);
+    for (const make of [settled, fresh]) {
+      const whiteWins = rateGame(make(white), make(black), "white_win", NOW);
+      assert.ok(whiteWins.white.rating >= white, `${white} beating ${black} doesn't lose points`);
+      assert.ok(whiteWins.black.rating <= black);
+      const blackWins = rateGame(make(white), make(black), "black_win", NOW);
+      assert.ok(blackWins.black.rating >= black);
+      assert.ok(blackWins.white.rating <= white);
+    }
   }
-  assert.equal(calculateRatingChanges(1200, 1200, "white_win").whiteRatingChange, 8);
-  assert.equal(calculateRatingChanges(1400, 800, "black_win").blackRatingChange, 16, "upsets are capped");
+  const even = rateGame(settled(1200), settled(1200), "white_win", NOW);
+  assert.ok(even.white.rating > 1200 && even.black.rating < 1200);
+  // An upset moves both players more than the expected result does
+  const upset = rateGame(settled(1400), settled(800), "black_win", NOW);
+  const expected = rateGame(settled(1400), settled(800), "white_win", NOW);
+  assert.ok(upset.black.rating - 800 > expected.white.rating - 1400);
+  assert.ok(1400 - upset.white.rating > 800 - expected.black.rating);
 });
 
-test("ratings never drop below the floor", () => {
-  const result = calculateRatingChanges(RATING_FLOOR + 2, RATING_FLOOR + 2, "black_win");
-  assert.equal(result.whiteNewRating, RATING_FLOOR);
-  assert.equal(result.whiteRatingChange, -2);
+test("a new player's rating moves far more than a settled one's", () => {
+  const { white, black } = rateGame(fresh(1000), settled(1000), "white_win", NOW);
+  assert.ok(white.rating - 1000 > 100, `the newcomer gains ${white.rating - 1000}`);
+  assert.ok(1000 - black.rating < 10, `the settled player loses ${1000 - black.rating}`);
+  // And the game makes the newcomer's rating less uncertain
+  assert.ok(white.rd < 350);
+  assert.deepEqual(white.ratedAt, NOW);
 });
 
-test("draws move ratings toward each other", () => {
-  const r = calculateRatingChanges(1300, 1000, "draw");
-  assert.equal(r.whiteRatingChange, -6);
-  assert.equal(r.blackRatingChange, 6);
-  assert.deepEqual(calculateRatingChanges(1000, 1000, "draw").whiteRatingChange, 0);
+test("one game never moves a rating by more than the cap", () => {
+  const { white, black } = rateGame(fresh(400), settled(1600), "white_win", NOW);
+  assert.equal(white.rating, 400 + MAX_RATING_CHANGE);
+  assert.ok(1600 - black.rating < 20);
+  assert.equal(rateGame(settled(1600), fresh(400), "black_win", NOW).black.rating, 400 + MAX_RATING_CHANGE);
+});
+
+test("ratings are whole numbers and never drop below the floor", () => {
+  const result = rateGame(settled(RATING_FLOOR + 2), settled(RATING_FLOOR + 2), "black_win", NOW);
+  assert.equal(result.white.rating, RATING_FLOOR);
+  const other = rateGame(fresh(1234), settled(1300), "draw", NOW);
+  assert.ok(Number.isInteger(other.white.rating) && Number.isInteger(other.black.rating));
+});
+
+test("a draw moves the lower-rated player up and the higher-rated one down", () => {
+  const r = rateGame(settled(1300), settled(1000), "draw", NOW);
+  assert.ok(r.white.rating < 1300);
+  assert.ok(r.black.rating > 1000);
+  const even = rateGame(settled(1000), settled(1000), "draw", NOW);
+  assert.equal(even.white.rating, 1000);
+  assert.equal(even.black.rating, 1000);
 });
 
 test("matchmaking rating range widens with wait time", () => {

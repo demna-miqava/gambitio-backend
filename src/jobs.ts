@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { gameRepository } from "./repositories/gameRepository.js";
 import { CHALLENGE_TTL_MS } from "./services/challengeService.js";
+import { TOURNAMENT_TICK_MS } from "./services/tournamentService.js";
 
 /**
  * Backstop for the per-game deadline timers (LiveGameService.watchDeadline):
@@ -117,6 +118,19 @@ export function createJobs(app: FastifyInstance) {
         "Series sweep",
         () => app.hub.attachedCount > 0,
         () => app.series.expireStale()
+      );
+      // Tournaments: start the ones that are due, pair the waiting players
+      // of the running ones, close the ones whose time is up. Only while
+      // this instance knows of one that is running or about to start
+      // (TournamentService.needsTick), so an idle server asks nothing.
+      app.tournaments
+        .loadOpen()
+        .catch((err) => app.log.error({ err }, "Reading the open tournaments failed"));
+      every(
+        TOURNAMENT_TICK_MS,
+        "Tournament tick",
+        () => app.tournaments.needsTick,
+        () => app.tournaments.tick()
       );
       every(
         CHAT_SWEEP_MS,

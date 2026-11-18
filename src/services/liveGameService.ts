@@ -40,6 +40,11 @@ import {
   seriesRepository,
   type SeriesSummary,
 } from "./seriesService.js";
+import {
+  lockTournamentPlayers,
+  recordTournamentResult,
+  type TournamentGameResult,
+} from "./tournamentService.js";
 
 /** What a game transaction does once it has committed. */
 interface TxEffects {
@@ -53,6 +58,8 @@ interface TxEffects {
   deadlines: { gameId: number; at: Date | null }[];
   /** Positions to cache for the next move (see PositionCache) */
   positions: { gameId: number; chess: Chess; pgn: string; ply: number }[];
+  /** Tournaments whose standings a finished game changed, with the game's two players */
+  tournaments: { id: number; userIds: number[] }[];
   /**
    * The transaction's last statement, sent in the same simple query as
    * COMMIT to save a round trip. Only for a statement nothing else follows
@@ -129,6 +136,10 @@ const drawDeclined = () =>
   new AppError("Your draw offer was declined; you can offer again after your next move", "DRAW_DECLINED", 409);
 const rematchAlreadyRequested = () =>
   new AppError("You can only ask for a rematch once per game", "REMATCH_ALREADY_REQUESTED", 409);
+// A tournament pairs its own games and scores them as played: no rematch,
+// no takeback, no abort, no time given
+const tournamentGame = (what: string) =>
+  new AppError(`${what} isn't available in a tournament game`, "TOURNAMENT_GAME", 409);
 
 /**
  * All live-game rules. The server owns the position, the clock and the
@@ -165,7 +176,7 @@ export class LiveGameService {
   private spectatorWindows = new Map<number, { timer: NodeJS.Timeout; pending: boolean }>();
 
   private async run(gameId: number, fn: (tx: TxClient, game: LiveGame, fx: TxEffects) => Promise<void>) {
-    const fx: TxEffects = { out: [], staleStats: [], ended: [], deadlines: [], positions: [] };
+    const fx: TxEffects = { out: [], staleStats: [], ended: [], deadlines: [], positions: [], tournaments: [] };
     if (!Number.isSafeInteger(gameId) || gameId <= 0) throw notFound();
     const tx = await this.fastify.pg.connect();
     let broken = false;
@@ -224,6 +235,8 @@ export class LiveGameService {
           .catch((err) => this.fastify.log.error({ err, topic }, "Failed to publish game update"))
       )
     );
+    // The lobby gets the new standings (throttled; never throws)
+    for (const { id, userIds } of fx.tournaments) this.fastify.tournaments.noteChanged(id, userIds);
   }
 
   /**
@@ -480,12 +493,14 @@ export class LiveGameService {
           id: game.whiteId,
           username: game.whiteUsername,
           rating: game.whiteRating,
+          provisional: game.whiteProvisional,
           avatarUrl: game.whiteAvatarUrl,
         },
         blackPlayer: {
           id: game.blackId,
           username: game.blackUsername,
           rating: game.blackRating,
+          provisional: game.blackProvisional,
           avatarUrl: game.blackAvatarUrl,
         },
         time: game.time,
@@ -506,6 +521,8 @@ export class LiveGameService {
         rematchGameId: game.rematchGameId,
         series,
         seriesGame: game.seriesGame,
+        // Set for a game an arena tournament paired
+        tournamentId: game.tournamentId,
         ...(game.status === "finished" && {
           result: game.result,
           reason: game.endReason,
@@ -573,7 +590,9 @@ export class LiveGameService {
     game: LiveGame,
     outcome: Outcome,
     clock: { whiteMs: number; blackMs: number } | null,
-    fx: TxEffects
+    fx: TxEffects,
+    /** The player who never made their first move, when that ended a tournament game */
+    noShowUserId: number | null = null
   ) {
     // The series row is locked before the players' rows (finishGame), the
     // same order a rematch takes them in; recordSeriesResult reuses the row
@@ -581,12 +600,30 @@ export class LiveGameService {
       game.seriesId !== null && game.status === "in_progress"
         ? await seriesRepository.lockSummary(tx, game.seriesId)
         : null;
-    const finished = await finishGame(tx, game, outcome, clock);
+    // So are the players' tournament rows, the order the pairing pass takes
+    // them in (TournamentService.pair)
+    const tournamentRows = game.status === "in_progress" ? await lockTournamentPlayers(tx, game) : [];
+    // A tournament game that ends before both sides have moved (a no-show,
+    // or a resignation on move one) still counts in the tournament, but it
+    // wasn't a game of chess: it changes no ratings
+    const played =
+      game.tournamentId !== null && game.rated && game.numMoves < 2 && game.status === "in_progress"
+        ? await gameRepository.makeUnrated(tx, game)
+        : game;
+    const finished = await finishGame(tx, played, outcome, clock);
     if (!finished) return;
     const series = await recordSeriesResult(tx, game, outcome.result, lockedSeries);
+    const tournament = await recordTournamentResult(tx, game, outcome.result, tournamentRows, {
+      noShowUserId,
+      now: new Date(),
+    });
+    if (tournament) fx.tournaments.push({ id: tournament.tournamentId, userIds: [game.whiteId, game.blackId] });
     fx.staleStats.push(game.whiteId, game.blackId);
     fx.ended.push(game.id);
-    fx.out.push({ topic: topics.game(game.id), message: gameEndedMessage(outcome, finished, series) });
+    fx.out.push({
+      topic: topics.game(game.id),
+      message: gameEndedMessage(outcome, finished, series, tournament),
+    });
     for (const playerId of [game.whiteId, game.blackId]) {
       fx.out.push({ topic: topics.notifications(playerId), message: activeGameMessage(null) });
     }
@@ -629,9 +666,13 @@ export class LiveGameService {
         rejected = { reason: "The position changed", fen: game.fen ?? "", pgn: game.pgn ?? "" };
         return;
       }
-      // A move that arrives after the deadline doesn't count
+      // A first move that arrives after its deadline doesn't count: the game
+      // ends as its timer would have ended it (aborted; in a tournament the
+      // late player loses it and is paused, so a move sent in the moment
+      // before the timer fires can't turn a no-show into a game that scores
+      // nothing)
       if (!isClockRunning(state.ply) && game.deadlineAt && game.deadlineAt.getTime() <= now) {
-        await this.end(tx, game, { result: "aborted", reason: "aborted" }, null, fx);
+        await this.endAtDeadline(tx, game, now, fx);
         return;
       }
       const chess = this.position(game);
@@ -765,6 +806,7 @@ export class LiveGameService {
     await this.run(gameId, async (tx, game, fx) => {
       if (game.status !== "in_progress") throw gameOver();
       if (!colorOf(game, userId)) throw notAPlayer();
+      if (game.tournamentId !== null) throw tournamentGame("Aborting");
       if (game.numMoves >= 2) {
         throw new AppError("The game can no longer be aborted", "ABORT_NOT_ALLOWED", 409);
       }
@@ -836,6 +878,7 @@ export class LiveGameService {
       if (game.status !== "in_progress") throw gameOver();
       const color = colorOf(game, userId);
       if (!color) throw notAPlayer();
+      if (game.tournamentId !== null) throw tournamentGame("A takeback");
       const opponentId = opponentOf(game, userId);
       const now = Date.now();
       if (isPastDeadline(game, now)) {
@@ -981,6 +1024,21 @@ export class LiveGameService {
   private async endAtDeadline(tx: TxClient, game: LiveGame, now: number, fx: TxEffects) {
     const state = clockOf(game);
     if (!isClockRunning(state.ply)) {
+      // A tournament game isn't aborted: whoever didn't show up loses it
+      // (unrated, see end) and is paused, so the opponent gets the points
+      // and the absent player isn't paired again
+      if (game.tournamentId !== null) {
+        const absent = activeColor(state.ply);
+        await this.end(
+          tx,
+          game,
+          { result: winFor(absent === "white" ? "black" : "white"), reason: "timeout" },
+          null,
+          fx,
+          absent === "white" ? game.whiteId : game.blackId
+        );
+        return;
+      }
       await this.end(tx, game, { result: "aborted", reason: "aborted" }, null, fx);
       return;
     }
@@ -999,6 +1057,7 @@ export class LiveGameService {
       if (game.status !== "in_progress") throw gameOver();
       const color = colorOf(game, userId);
       if (!color) throw notAPlayer();
+      if (game.tournamentId !== null) throw tournamentGame("Giving time");
       const now = Date.now();
       if (isPastDeadline(game, now)) {
         await this.endAtDeadline(tx, game, now, fx);
@@ -1051,6 +1110,7 @@ export class LiveGameService {
       if (game.status !== "finished") throw new AppError("The game is still in progress", "GAME_IN_PROGRESS", 409);
       const color = colorOf(game, userId);
       if (!color) throw notAPlayer();
+      if (game.tournamentId !== null) throw tournamentGame("A rematch");
       if (game.rematchGameId) return;
       const opponentId = opponentOf(game, userId);
       await assertNoBlock(tx, userId, opponentId);
@@ -1149,7 +1209,8 @@ function isPastDeadline(game: LiveGame, now: number): boolean {
 function gameEndedMessage(
   outcome: Outcome,
   finished: { winnerId: number | null; ratingChanges: RatingChanges | null },
-  series: SeriesSummary | null
+  series: SeriesSummary | null,
+  tournament: TournamentGameResult | null = null
 ) {
   return {
     type: "game_ended",
@@ -1159,5 +1220,7 @@ function gameEndedMessage(
     ...(finished.ratingChanges && { ratingChanges: finished.ratingChanges }),
     // The series score after this game
     ...(series && { series }),
+    // What the game scored in its tournament
+    ...(tournament && { tournament }),
   };
 }

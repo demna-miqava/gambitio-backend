@@ -116,3 +116,7 @@ export const studyClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("sync") }),
 ]);
 export type StudyClientMessage = z.infer<typeof studyClientMessageSchema>;
+
+/** Messages a tournament lobby socket accepts: only a request for the whole state again. */
+export const tournamentClientMessageSchema = z.object({ type: z.literal("sync") });
+export type TournamentClientMessage = z.infer<typeof tournamentClientMessageSchema>;

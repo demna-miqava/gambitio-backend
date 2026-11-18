@@ -67,6 +67,7 @@ describe("bot games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_R
       id: null,
       username: "Casual Carl",
       rating: 600,
+      provisional: false,
       avatarUrl: null,
       ratingChange: null,
     });

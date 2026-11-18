@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { ratingColumns, type TimeControl } from "../models/common.js";
 import { AppError } from "../errors/AppError.js";
+import { PROVISIONAL_COLUMNS } from "../repositories/userRepository.js";
 import { cachedField, cachedValue, invalidateCacheGroups, type CacheGroup } from "../utils/cache.js";
 import { LISTED_TOTAL_CACHE_SECONDS, listedTotalCacheKey, myPositionCacheKey } from "./leaderboardService.js";
 
@@ -17,6 +18,9 @@ interface UserRatings {
   highestBulletRating: number;
   highestBlitzRating: number;
   highestRapidRating: number;
+  bulletProvisional: boolean;
+  blitzProvisional: boolean;
+  rapidProvisional: boolean;
 }
 
 const ratingOf = (user: UserRatings, variant: TimeControl) =>
@@ -89,7 +93,8 @@ export class StatsService {
   private async loadUser(userId: number): Promise<UserRatings> {
     const { rows } = await this.fastify.pg.query<UserRatings>(
       `SELECT "createdAt", "bulletRating", "blitzRating", "rapidRating",
-              "highestBulletRating", "highestBlitzRating", "highestRapidRating"
+              "highestBulletRating", "highestBlitzRating", "highestRapidRating",
+              ${PROVISIONAL_COLUMNS}
        FROM users WHERE id = $1`,
       [userId]
     );
@@ -151,6 +156,8 @@ export class StatsService {
           variant,
           {
             rating: ratingOf(user, variant),
+            // Still settling: shown as "1500?" (src/utils/glicko2.ts)
+            provisional: user[ratingColumns(variant).provisional],
             delta: row?.delta ?? 0,
             highestRating: highestOf(user, variant),
             highestDate: formatDate(row?.peakAt ?? user.createdAt),

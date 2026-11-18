@@ -27,6 +27,8 @@ export const topics = {
   matchmaking: (userId: number) => `matchmaking:user:${userId}`,
   study: (roomId: number) => `study:${roomId}`,
   studyUser: (roomId: number, userId: number) => `study:${roomId}:user:${userId}`,
+  /** Everyone with a tournament's lobby open */
+  tournament: (tournamentId: number) => `tournament:${tournamentId}`,
 };
 
 /**
@@ -151,6 +153,11 @@ export class RealtimeHub {
       onDetach?: (() => Promise<void>) | undefined;
     }
   ): Promise<void> {
+    // Closed while the route was still preparing (a lookup it awaited before
+    // attaching): its "close" event has already fired, so nothing would ever
+    // detach it. It would stay on its topics, and in its presence sets, for
+    // as long as this instance runs
+    if (socket.readyState === socket.CLOSED) return;
     const entry: Attached = {
       userId: options.userId,
       topics: options.topics,

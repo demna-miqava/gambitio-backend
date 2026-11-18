@@ -1,15 +1,20 @@
 import { Container, getContainer } from "@cloudflare/containers";
 import { backendHeaders } from "./clientRtt.js";
+import { describeSharedGame, parseSharedGame, shareTokenFromPath, withShareMeta } from "./shareMeta.js";
 
 /*
  * Gambitio on Cloudflare: this Worker serves the built frontend
  * (../gambitio-frontend/dist) and hands every /api request, WebSockets
  * included, to the Fastify backend running unchanged in a container.
- * Static files never reach this code; see "assets" in wrangler.jsonc.
+ * Static files never reach this code; see "assets" in wrangler.jsonc. The
+ * one page that does is a shared game (/share/<token>), which gets the
+ * game written into its <head> for link previews (sharePage).
  */
 
 interface Env {
   BACKEND: DurableObjectNamespace<Backend>;
+  /** The built frontend ("assets" in wrangler.jsonc) */
+  ASSETS: Fetcher;
   // Plain vars, from wrangler.jsonc
   SITE_ORIGIN: string;
   /** How many backend containers share the load (at most max_instances) */
@@ -89,7 +94,14 @@ export function instanceFor(request: Request, instances: number, generation = 1)
   if (instances <= 1) return instanceName(0, generation);
   const { pathname } = new URL(request.url);
   const game = /^\/api\/ws\/game\/(\d+)/.exec(pathname);
-  const key = game ? `game:${game[1]}` : `ip:${request.headers.get("cf-connecting-ip") ?? ""}`;
+  // A tournament's lobby sockets go to one instance too, so the standings
+  // reach them without a Redis hop
+  const tournament = game ? null : /^\/api\/ws\/tournament\/(\d+)/.exec(pathname);
+  const key = game
+    ? `game:${game[1]}`
+    : tournament
+      ? `tournament:${tournament[1]}`
+      : `ip:${request.headers.get("cf-connecting-ip") ?? ""}`;
   return instanceName(hash(key) % instances, generation);
 }
 
@@ -164,6 +176,57 @@ function toBackend(request: Request): Request {
   return headers ? new Request(request, { headers }) : request;
 }
 
+/**
+ * How long a share page waits for the backend before it is sent without the
+ * game in its <head>. A backend that was asleep takes a few seconds to
+ * start; the page itself then loads the game the usual way.
+ */
+const SHARE_META_TIMEOUT_MS = 3_000;
+
+/**
+ * A page of the site that reaches the Worker (only /share/* does, see
+ * run_worker_first in wrangler.jsonc): index.html, with the shared game's
+ * players and result in its <head> so the link unfurls as that game. Any
+ * failure on the way (no such game, a slow or failing backend) sends the
+ * page as it is; the app then shows the game or says the link is off.
+ */
+async function sharePage(request: Request, env: Env, backend: { fetch(request: Request): Promise<Response> }): Promise<Response> {
+  const page = await env.ASSETS.fetch(request);
+  const url = new URL(request.url);
+  const token = request.method === "GET" ? shareTokenFromPath(url.pathname) : null;
+  if (!token || !page.ok || !(page.headers.get("content-type") ?? "").includes("text/html")) return page;
+
+  let meta = null;
+  try {
+    const headers = new Headers({ accept: "application/json" });
+    // The backend's rate limit counts the visitor, not this Worker
+    const ip = request.headers.get("cf-connecting-ip");
+    if (ip) headers.set("cf-connecting-ip", ip);
+    const response = await Promise.race([
+      backend.fetch(new Request(new URL(`/api/shared-games/${token}`, url), { headers })),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), SHARE_META_TIMEOUT_MS)),
+    ]);
+    const game = response?.ok ? parseSharedGame(await response.json()) : null;
+    if (game) meta = describeSharedGame(game);
+  } catch (error) {
+    console.log("Share page sent without its preview", String(error));
+  }
+
+  const html = withShareMeta(await page.text(), {
+    url: `${url.origin}${url.pathname}`,
+    image: `${url.origin}/logo-mark.png`,
+    meta,
+  });
+  // The page's own headers (public/_headers: CSP and the rest), minus the
+  // ones that described the unchanged file
+  const headers = new Headers(page.headers);
+  headers.delete("content-length");
+  headers.delete("etag");
+  headers.set("cache-control", "no-cache");
+  headers.set("x-robots-tag", "noindex");
+  return new Response(html, { status: page.status, headers });
+}
+
 /** Must match max_instances in wrangler.jsonc: a higher BACKEND_INSTANCES would route to containers that can't start. */
 const MAX_INSTANCES = 4;
 
@@ -172,6 +235,8 @@ export default {
     const instances = Math.min(MAX_INSTANCES, Math.max(1, Math.floor(Number(env.BACKEND_INSTANCES ?? "1")) || 1));
     const generation = generationOf(env.BACKEND_GENERATION);
     ctx.waitUntil(retirePrevious(env, instances, generation));
-    return getContainer(env.BACKEND, instanceFor(request, instances, generation)).fetch(toBackend(request));
+    const backend = getContainer(env.BACKEND, instanceFor(request, instances, generation));
+    if (!new URL(request.url).pathname.startsWith("/api/")) return sharePage(request, env, backend);
+    return backend.fetch(toBackend(request));
   },
 } satisfies ExportedHandler<Env>;

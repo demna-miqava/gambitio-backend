@@ -11,13 +11,15 @@ import type {
 } from "../models/Game.js";
 import { gameRepository } from "../repositories/gameRepository.js";
 import { getTimeControl, ratingColumns, type PlayerColor } from "../models/common.js";
-import { calculateRatingChanges, RATING_FLOOR } from "../utils/ratingHelpers.js";
+import { rateGame, type PlayerRating } from "../utils/ratingHelpers.js";
+import { PROVISIONAL_COLUMNS } from "../repositories/userRepository.js";
 import { FIRST_MOVE_TIMEOUT_MS } from "../game/clock.js";
 import type { Outcome } from "../game/engine.js";
 import { replayBotGame } from "../game/botGame.js";
 import { getBotById } from "../game/bots.js";
 import { AppError } from "../errors/AppError.js";
 import { withinLimit } from "../utils/rateLimit.js";
+import { newShareToken } from "../utils/shareToken.js";
 
 /**
  * Bot games one user can save a day. A bot game takes a few minutes, so 200
@@ -49,10 +51,12 @@ export function toGameListItem(game: Omit<Game, "pgn" | "fen">): GameListItem {
     botId: game.botId,
     seriesId: game.seriesId,
     seriesGame: game.seriesGame,
+    tournamentId: game.tournamentId,
     whitePlayer: {
       id: game.whiteId,
       username: game.whiteUsername,
       rating: game.whiteRating,
+      provisional: game.whiteProvisional,
       avatarUrl: game.whiteAvatarUrl,
       ratingChange: game.whiteRatingChange,
     },
@@ -60,6 +64,7 @@ export function toGameListItem(game: Omit<Game, "pgn" | "fen">): GameListItem {
       id: game.blackId,
       username: game.blackUsername,
       rating: game.blackRating,
+      provisional: game.blackProvisional,
       avatarUrl: game.blackAvatarUrl,
       ratingChange: game.blackRatingChange,
     },
@@ -81,12 +86,14 @@ export function toLiveGameSummary(game: Omit<LiveGame, "pgn">): LiveGameSummary 
       id: game.whiteId,
       username: game.whiteUsername,
       rating: game.whiteRating,
+      provisional: game.whiteProvisional,
       avatarUrl: game.whiteAvatarUrl,
     },
     blackPlayer: {
       id: game.blackId,
       username: game.blackUsername,
       rating: game.blackRating,
+      provisional: game.blackProvisional,
       avatarUrl: game.blackAvatarUrl,
     },
   };
@@ -126,6 +133,8 @@ export function matchFoundData(game: LiveGame, userId: number) {
     ownTime: isWhite ? game.whiteTime : game.blackTime,
     opponentTime: isWhite ? game.blackTime : game.whiteTime,
     rated: game.rated,
+    // Set for a game an arena tournament paired
+    tournamentId: game.tournamentId,
   };
 }
 
@@ -135,6 +144,44 @@ export class GameService {
   async getGameById(gameId: number): Promise<GameResponse | null> {
     const game = await gameRepository.findById(this.fastify.pg, gameId);
     return game ? toGameResponse(game) : null;
+  }
+
+  /** The game behind a share link, for anyone: GET /shared-games/:token. */
+  async getSharedGame(token: string): Promise<GameResponse | null> {
+    const game = await gameRepository.findByShareToken(this.fastify.pg, token);
+    return game ? toGameResponse(game) : null;
+  }
+
+  /**
+   * The share link of a game the user played, made on first use: the same
+   * link every time, for either player, until one of them turns it off. Only
+   * a finished game can be shared: a link to one in progress would show the
+   * position to people the players can't see, and an aborted game was never
+   * played.
+   */
+  async shareGame(gameId: number, userId: number): Promise<string> {
+    const token = await gameRepository.share(this.fastify.pg, gameId, userId, newShareToken());
+    if (token) return token;
+    const game = await this.requireOwnGame(gameId, userId);
+    throw game.status === "finished"
+      ? new AppError("An aborted game can't be shared", "GAME_ABORTED", 409)
+      : new AppError("The game can be shared once it's over", "GAME_NOT_FINISHED", 409);
+  }
+
+  /** Turns the game's share link off; links already sent stop working. */
+  async unshareGame(gameId: number, userId: number): Promise<void> {
+    if (await gameRepository.unshare(this.fastify.pg, gameId, userId)) return;
+    await this.requireOwnGame(gameId, userId);
+  }
+
+  /** The game, or the error that says why the user can't manage its link. */
+  private async requireOwnGame(gameId: number, userId: number) {
+    const game = await gameRepository.findById(this.fastify.pg, gameId);
+    if (!game) throw new AppError("Game not found", "GAME_NOT_FOUND", 404);
+    if (game.whiteId !== userId && game.blackId !== userId) {
+      throw new AppError("Only the players can share a game", "NOT_YOUR_GAME", 403);
+    }
+    return game;
   }
 
   async getGamesByUserId(
@@ -240,6 +287,9 @@ export interface LockedPlayer {
   bulletRating: number;
   blitzRating: number;
   rapidRating: number;
+  bulletProvisional: boolean;
+  blitzProvisional: boolean;
+  rapidProvisional: boolean;
 }
 
 /**
@@ -252,7 +302,8 @@ export interface LockedPlayer {
  */
 export async function lockPlayers(tx: Queryable, ids: number[]): Promise<Map<number, LockedPlayer>> {
   const { rows } = await tx.query<LockedPlayer>(
-    `SELECT id, username, "avatarUrl", "bulletRating", "blitzRating", "rapidRating"
+    `SELECT id, username, "avatarUrl", "bulletRating", "blitzRating", "rapidRating",
+       ${PROVISIONAL_COLUMNS}
      FROM users WHERE id = ANY($1) AND "clerkId" IS NOT NULL
      ORDER BY id FOR UPDATE`,
     [ids]
@@ -331,6 +382,8 @@ export async function createGame(
     odds?: { whiteTime: number; blackTime: number } | null;
     /** The series this game belongs to, and its number in it */
     series?: { id: number; game: number };
+    /** The arena tournament pairing this game, and whether its games are rated */
+    tournament?: { id: number; rated: boolean };
   },
   options: {
     /**
@@ -348,7 +401,7 @@ export async function createGame(
   const black = players.get(blackId);
   if (!white || !black) throw new AppError("Player not found", "USER_NOT_FOUND", 404);
 
-  const col = ratingColumns(getTimeControl(time)).rating;
+  const { rating: col, provisional } = ratingColumns(getTimeControl(time));
   const now = Date.now();
   return gameRepository.insert(tx, {
     whiteId,
@@ -357,6 +410,8 @@ export async function createGame(
     blackUsername: black.username,
     whiteRating: white[col],
     blackRating: black[col],
+    whiteProvisional: white[provisional],
+    blackProvisional: black[provisional],
     whiteAvatarUrl: white.avatarUrl,
     blackAvatarUrl: black.avatarUrl,
     time: odds ? Math.max(odds.whiteTime, odds.blackTime) : time,
@@ -366,6 +421,8 @@ export async function createGame(
     deadlineAt: new Date(now + FIRST_MOVE_TIMEOUT_MS),
     seriesId: series?.id ?? null,
     seriesGame: series?.game ?? null,
+    tournamentId: params.tournament?.id ?? null,
+    ...(params.tournament && { rated: params.tournament.rated }),
   });
 }
 
@@ -374,11 +431,11 @@ export async function createGame(
  * Returns null if the game was already finished, so ending twice (both
  * clients claiming a timeout, resign after checkmate, ...) is a no-op.
  *
- * Unrated games (time odds) change no ratings. For rated ones, the deltas
- * are computed from the ratings at game start, then added to the
- * players' current ratings, so concurrent games don't overwrite each other.
- * The stored and reported change is what was actually applied (it differs
- * from the computed delta when the rating floor kicks in).
+ * Unrated games (time odds) change no ratings. For rated ones both players'
+ * rows are locked and their ratings as they stand are fed to Glicko-2
+ * (rateGame): a player is in one game at a time, so that is the rating the
+ * game started with. The stored and reported change is what was actually
+ * applied (new rating minus the one read under the lock).
  */
 export async function finishGame(
   tx: Queryable,
@@ -397,33 +454,43 @@ export async function finishGame(
   // (migration 030); an unrated one (time odds) leaves ratings and the
   // per-time-control game counters alone.
   if (outcome.result !== "aborted" && game.rated) {
-    const deltas = calculateRatingChanges(game.whiteRating, game.blackRating, outcome.result);
-    const { rating, highest, games } = ratingColumns(getTimeControl(game.time));
-    // Both players in one statement. The subquery locks them in id order, so
-    // two games finishing at once can't deadlock, and reads the rating
-    // before this game under the lock. The peak also takes that rating, so a
-    // row whose peak fell behind (written by older code, see migration 013)
-    // heals itself.
-    const { rows } = await tx.query<{ id: number; rating: number; previous: number }>(
+    const { rating, highest, games, rd, volatility, ratedAt } = ratingColumns(getTimeControl(game.time));
+    // Locked in id order, the order every path that locks two players takes
+    // (lockPlayers), so two games finishing at once can't deadlock
+    const { rows: before } = await tx.query<PlayerRating & { id: number }>(
+      `SELECT id, "${rating}" AS rating, "${rd}" AS rd, "${volatility}" AS volatility, "${ratedAt}" AS "ratedAt"
+       FROM users WHERE id = ANY($1) ORDER BY id FOR UPDATE`,
+      [[game.whiteId, game.blackId]]
+    );
+    const whiteBefore = before.find((r) => r.id === game.whiteId)!;
+    const blackBefore = before.find((r) => r.id === game.blackId)!;
+    const now = new Date();
+    const rated = rateGame(whiteBefore, blackBefore, outcome.result, now);
+    // The peak also takes the rating before this game, so a row whose peak
+    // fell behind (written by older code, see migration 013) heals itself.
+    await tx.query(
       `UPDATE users u SET
-         "${rating}" = GREATEST($5, u."${rating}" + v.delta),
-         "${highest}" = GREATEST(u."${highest}", u."${rating}", GREATEST($5, u."${rating}" + v.delta)),
+         "${rating}" = v.rating,
+         "${highest}" = GREATEST(u."${highest}", u."${rating}", v.rating),
+         "${rd}" = v.rd,
+         "${volatility}" = v.volatility,
+         "${ratedAt}" = $9,
          "${games}" = u."${games}" + 1,
          "listedGames" = u."listedGames" + 1
-       FROM (SELECT id, "${rating}" AS previous FROM users WHERE id = ANY(ARRAY[$1, $3]::int[])
-             ORDER BY id FOR UPDATE) old
-       JOIN (VALUES ($1::int, $2::int), ($3::int, $4::int)) v(id, delta) ON v.id = old.id
-       WHERE u.id = old.id
-       RETURNING u.id, u."${rating}" AS rating, old.previous`,
-      [game.whiteId, deltas.whiteRatingChange, game.blackId, deltas.blackRatingChange, RATING_FLOOR]
+       FROM (VALUES ($1::int, $2::int, $3::real, $4::real), ($5::int, $6::int, $7::real, $8::real))
+         v(id, rating, rd, volatility)
+       WHERE u.id = v.id`,
+      [
+        game.whiteId, rated.white.rating, rated.white.rd, rated.white.volatility,
+        game.blackId, rated.black.rating, rated.black.rd, rated.black.volatility,
+        now,
+      ]
     );
-    const white = rows.find((r) => r.id === game.whiteId)!;
-    const black = rows.find((r) => r.id === game.blackId)!;
     ratingChanges = {
-      whiteRatingChange: white.rating - white.previous,
-      blackRatingChange: black.rating - black.previous,
-      whiteNewRating: white.rating,
-      blackNewRating: black.rating,
+      whiteRatingChange: rated.white.rating - whiteBefore.rating,
+      blackRatingChange: rated.black.rating - blackBefore.rating,
+      whiteNewRating: rated.white.rating,
+      blackNewRating: rated.black.rating,
     };
   } else if (outcome.result !== "aborted") {
     await tx.query(

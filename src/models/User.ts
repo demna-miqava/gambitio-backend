@@ -35,6 +35,13 @@ export interface UserResponse {
   highestBulletRating: number;
   puzzleRating: number;
   highestPuzzleRating: number;
+  /**
+   * Whether each rating is still provisional: too few rated games, or too
+   * long without one, to trust it (src/utils/glicko2.ts)
+   */
+  rapidProvisional: boolean;
+  blitzProvisional: boolean;
+  bulletProvisional: boolean;
 }
 
 // Data needed to create a new user from Clerk

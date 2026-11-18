@@ -141,6 +141,42 @@ describe("push notifications", { skip: !integrationEnabled && "TEST_POSTGRES_URL
     refusing.clear();
   });
 
+  test("players of a tournament that starts are told, wherever they are", async () => {
+    const a = await createUser(app, "alice");
+    const b = await createUser(app, "bob");
+    const c = await createUser(app, "carol");
+    await subscribe(a.clerkId, "alice");
+    await subscribe(b.clerkId, "bob");
+    await subscribe(c.clerkId, "carol");
+    const { tournament } = await app.tournaments.create(a.id, {
+      name: "Friday Blitz",
+      time: 180,
+      increment: 0,
+      minutes: 30,
+      startsAt: new Date(),
+      rated: true,
+      maxPlayers: 100,
+    });
+    await app.tournaments.join(tournament.id, b.id);
+    // Carol joined and then paused: not waiting for a game, not told
+    await app.tournaments.join(tournament.id, c.id);
+    await app.tournaments.pause(tournament.id, c.id);
+
+    assert.equal(await app.tournaments.start(tournament.id), "running");
+    await delivered(2);
+    assert.deepEqual(sent.map((s) => s.subscription.endpoint).sort(), [endpointFor("alice"), endpointFor("bob")]);
+    assert.deepEqual(sent[0]!.payload, {
+      title: "Friday Blitz has started",
+      body: "Open the tournament to get your first game.",
+      url: `/tournaments/${tournament.id}`,
+      tag: `tournament-${tournament.id}`,
+    });
+    // Starting is done once: a second look at it sends nothing more
+    assert.equal(await app.tournaments.start(tournament.id), "running");
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(sent.length, 2);
+  });
+
   test("subscribing needs a session and a real push service", async () => {
     const a = await createUser(app, "alice");
     // The key itself is public; subscribing is not

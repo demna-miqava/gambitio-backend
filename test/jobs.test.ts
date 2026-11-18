@@ -3,14 +3,22 @@ import assert from "node:assert/strict";
 import type { FastifyInstance } from "fastify";
 import { createJobs } from "../src/jobs.js";
 import { CHALLENGE_TTL_MS } from "../src/services/challengeService.js";
+import { TOURNAMENT_TICK_MS } from "../src/services/tournamentService.js";
 
 /** Lets passes that already started finish (setImmediate isn't mocked) */
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 /** Just what createJobs touches, with a counter for every database pass. */
 function fakeApp() {
-  const calls = { clockSweep: 0, challenges: 0, series: 0, chat: 0, matchmaking: 0 };
-  const state = { needsClockSweep: false, liveDeadlinesPending: false, othersAlive: false, attachedCount: 0, searching: 0 };
+  const calls = { clockSweep: 0, challenges: 0, series: 0, chat: 0, matchmaking: 0, tournaments: 0 };
+  const state = {
+    needsClockSweep: false,
+    liveDeadlinesPending: false,
+    othersAlive: false,
+    attachedCount: 0,
+    searching: 0,
+    tournamentDue: false,
+  };
   const app = {
     log: { error: () => {} },
     pg: {
@@ -46,6 +54,13 @@ function fakeApp() {
     challenges: { expireStale: async () => void calls.challenges++ },
     series: { expireStale: async () => void calls.series++ },
     gameChat: { sweep: async () => void calls.chat++ },
+    tournaments: {
+      loadOpen: async () => {},
+      get needsTick() {
+        return state.tournamentDue;
+      },
+      tick: async () => void calls.tournaments++,
+    },
   };
   return { app: app as unknown as FastifyInstance, calls, state };
 }
@@ -66,6 +81,7 @@ test("one idle tab doesn't make the sweeps query the database", async (t) => {
     assert.equal(calls.clockSweep, settled.clockSweep, "no clock sweep");
     assert.equal(calls.challenges, settled.challenges, "no challenge sweep");
     assert.equal(calls.matchmaking, 0);
+    assert.equal(calls.tournaments, 0, "no tournament tick");
     // 37 minutes in: once, at the half hour
     assert.equal(calls.series, 1, "the series sweep runs only every half hour");
 
@@ -79,6 +95,16 @@ test("one idle tab doesn't make the sweeps query the database", async (t) => {
     t.mock.timers.tick(10_000);
     await flush();
     assert.equal(calls.clockSweep, settled.clockSweep + 2);
+
+    // A tournament running or about to start: its tick runs, and stops with it
+    state.tournamentDue = true;
+    t.mock.timers.tick(TOURNAMENT_TICK_MS);
+    await flush();
+    assert.equal(calls.tournaments, 1);
+    state.tournamentDue = false;
+    t.mock.timers.tick(10 * TOURNAMENT_TICK_MS);
+    await flush();
+    assert.equal(calls.tournaments, 1);
 
     // A challenge stored here: the challenge sweep runs until it can have expired
     jobs.noteChallenge();

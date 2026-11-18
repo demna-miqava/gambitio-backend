@@ -13,6 +13,17 @@ import {
 import { createGame, finishGame } from "../src/services/gameService.js";
 import { gameRepository } from "../src/repositories/gameRepository.js";
 import { challengeTimings } from "../src/services/challengeService.js";
+import { rateGame } from "../src/utils/ratingHelpers.js";
+
+/**
+ * What the first rated game between two brand-new 1200 players moves their
+ * ratings by (createUser's defaults; neither has a rated game yet).
+ */
+const FIRST_GAME = (() => {
+  const fresh = { rating: 1200, rd: 350, volatility: 0.06, ratedAt: null };
+  const { white: loser, black: winner } = rateGame(fresh, fresh, "black_win", new Date());
+  return { win: winner.rating - 1200, loss: loser.rating - 1200 };
+})();
 
 describe("live games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_REDIS_URL not set" }, () => {
   let app: FastifyInstance;
@@ -71,14 +82,81 @@ describe("live games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_
     const ended = await w.next("game_ended");
     assert.equal(ended.reason, "checkmate");
     assert.equal(ended.winnerId, black.id);
-    assert.equal(ended.ratingChanges.blackRatingChange, 8);
+    assert.ok(FIRST_GAME.win > 100, "a first game moves a rating a lot");
+    assert.equal(ended.ratingChanges.blackRatingChange, FIRST_GAME.win);
+    assert.equal(ended.ratingChanges.whiteRatingChange, FIRST_GAME.loss);
     await b.next("game_ended");
 
     // Ending again is a no-op
     w.send({ type: "resign" });
     assert.equal((await w.next("error")).data.code, "GAME_OVER");
-    assert.equal(await ratingOf(black.id), 1208);
-    assert.equal(await ratingOf(white.id), 1192);
+    assert.equal(await ratingOf(black.id), 1200 + FIRST_GAME.win);
+    assert.equal(await ratingOf(white.id), 1200 + FIRST_GAME.loss);
+  });
+
+  test("a rated game settles both ratings a little: deviation, last-rated time, provisional flags", async () => {
+    const rating = async (userId: number) =>
+      (
+        await app.pg.query(
+          `SELECT "blitzRd", "blitzVolatility", "blitzRatedAt", "rapidRd", "rapidRatedAt" FROM users WHERE id = $1`,
+          [userId]
+        )
+      ).rows[0];
+    const profile = async () =>
+      (await app.inject({ url: `/api/users/${white.id}`, headers: { authorization: `Bearer ${black.clerkId}` } })).json()
+        .user;
+    assert.deepEqual(await rating(white.id), {
+      blitzRd: 350,
+      blitzVolatility: 0.06,
+      blitzRatedAt: null,
+      rapidRd: 350,
+      rapidRatedAt: null,
+    });
+    assert.equal((await profile()).blitzProvisional, true);
+
+    // The game records that both ratings were provisional when it started
+    const first = await newGame();
+    assert.equal(first.whiteProvisional, true);
+    assert.equal(first.blackProvisional, true);
+    const w = await open(`/game/${first.id}`, white.clerkId);
+    const b = await open(`/game/${first.id}`, black.clerkId);
+    assert.equal((await w.next("initial_game_state")).data.whitePlayer.provisional, true);
+    await b.next("initial_game_state");
+    const startedAt = Date.now();
+    w.send({ type: "resign" });
+    await b.next("game_ended");
+
+    for (const player of [white, black]) {
+      const after = await rating(player.id);
+      assert.ok(after.blitzRd < 350 && after.blitzRd > 200, `deviation ${after.blitzRd}`);
+      assert.ok(after.blitzRatedAt.getTime() >= startedAt - 1_000);
+      // Another time control is its own rating
+      assert.equal(after.rapidRd, 350);
+      assert.equal(after.rapidRatedAt, null);
+    }
+    const stored = (await app.inject({ url: `/api/games/${first.id}`, headers: { authorization: `Bearer ${black.clerkId}` } })).json();
+    assert.equal(stored.whitePlayer.provisional, true);
+
+    // A settled rating isn't provisional, and barely moves against a newcomer
+    await app.pg.query(`UPDATE users SET "blitzRd" = 60, "blitzRating" = 1200 WHERE id = $1`, [white.id]);
+    assert.equal((await profile()).blitzProvisional, false);
+    assert.equal((await profile()).rapidProvisional, true);
+    await app.pg.query(`UPDATE users SET "blitzRd" = 350, "blitzRating" = 1200 WHERE id = $1`, [black.id]);
+    const second = await newGame();
+    assert.equal(second.whiteProvisional, false);
+    assert.equal(second.blackProvisional, true);
+    const sockets2 = await joinGame(second.id);
+    sockets2.w.send({ type: "resign" });
+    const ended = await sockets2.b.next("game_ended");
+    assert.ok(ended.ratingChanges.blackRatingChange > 100);
+    assert.ok(ended.ratingChanges.whiteRatingChange < 0 && ended.ratingChanges.whiteRatingChange > -15);
+
+    // Long without a rated game: provisional again
+    await app.pg.query(
+      `UPDATE users SET "blitzRd" = 60, "blitzRatedAt" = now() - interval '3 years' WHERE id = $1`,
+      [white.id]
+    );
+    assert.equal((await profile()).blitzProvisional, true);
   });
 
   test("a game's end updates both players in one go, and only what it should", async () => {
@@ -158,7 +236,7 @@ describe("live games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_
     const after = await get();
     assert.equal(after.numberOfGames, 1);
     assert.equal(after.stats.blitz.losses, 1);
-    assert.equal(after.stats.blitz.rating, 1192);
+    assert.equal(after.stats.blitz.rating, 1200 + FIRST_GAME.loss);
   });
 
   test("active game lookup returns the game in progress, then null", async () => {
@@ -234,7 +312,7 @@ describe("live games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_
     assert.equal(ended.reason, "timeout");
     assert.equal(ended.winnerId, black.id);
     await b.none("game_ended");
-    assert.equal(await ratingOf(black.id), 1208);
+    assert.equal(await ratingOf(black.id), 1200 + FIRST_GAME.win);
   });
 
   test("a move that reaches the server just after its flag still counts (lag compensation)", async () => {

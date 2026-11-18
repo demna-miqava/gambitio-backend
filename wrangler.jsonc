@@ -20,12 +20,17 @@
 	],
 	// The frontend, built with `npm --prefix ../gambitio-frontend run build`.
 	// /api goes to the Worker; any other path the files don't have gets
-	// index.html, so React Router's routes work.
+	// index.html, so React Router's routes work. A shared game's page
+	// (/share/<token>) goes through the Worker too, which writes the game into
+	// the page's <head> for link previews and reads the file through the
+	// ASSETS binding (sharePage in worker/index.ts).
 	"assets": {
 		"directory": "../gambitio-frontend/dist",
+		"binding": "ASSETS",
 		"not_found_handling": "single-page-application",
 		"run_worker_first": [
-			"/api/*"
+			"/api/*",
+			"/share/*"
 		],
 	},
 	// The backend (Dockerfile). "basic" is 1/4 vCPU and 1 GiB. ("lite", 1/16

@@ -1,6 +1,14 @@
 import type { FastifyInstance } from "fastify";
 import type { Queryable } from "../db.js";
 import type { User, UserResponse, CreateClerkUserData } from "../models/User.js";
+import { TIME_CONTROLS, ratingColumns } from "../models/common.js";
+import { provisionalSql } from "../utils/glicko2.js";
+
+/** "<x>Provisional" for each time control, computed as of now (see provisionalSql). */
+export const PROVISIONAL_COLUMNS = TIME_CONTROLS.map((timeControl) => {
+  const columns = ratingColumns(timeControl);
+  return `${provisionalSql(columns)} AS "${columns.provisional}"`;
+}).join(",\n  ");
 
 /** Peaks are never reported below the current rating (see migration 013). */
 const USER_RESPONSE_COLUMNS = `id, "clerkId", username, "avatarUrl", "createdAt",
@@ -8,7 +16,8 @@ const USER_RESPONSE_COLUMNS = `id, "clerkId", username, "avatarUrl", "createdAt"
   GREATEST("highestRapidRating", "rapidRating") AS "highestRapidRating",
   GREATEST("highestBlitzRating", "blitzRating") AS "highestBlitzRating",
   GREATEST("highestBulletRating", "bulletRating") AS "highestBulletRating",
-  "puzzleRating", GREATEST("highestPuzzleRating", "puzzleRating") AS "highestPuzzleRating"`;
+  "puzzleRating", GREATEST("highestPuzzleRating", "puzzleRating") AS "highestPuzzleRating",
+  ${PROVISIONAL_COLUMNS}`;
 
 export class UserRepository {
   constructor(private fastify: FastifyInstance) {}

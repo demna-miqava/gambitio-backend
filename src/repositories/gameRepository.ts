@@ -5,12 +5,13 @@ import { MAX_PAUSE_MS } from "../game/clock.js";
 
 const GAME_COLUMNS = `
   id, "createdAt", pgn, fen, "winnerId", "numMoves", "whiteRating", "blackRating",
+  "whiteProvisional", "blackProvisional",
   time, increment, "whiteTime", "blackTime", "whiteId", "blackId", "whiteUsername", "blackUsername",
   "whiteAvatarUrl", "blackAvatarUrl", status, result, "endReason", "endedAt",
   "whiteTimeLeftMs", "blackTimeLeftMs", "lastMoveAt", "deadlineAt",
   "drawOfferedBy", "rematchRequestedBy", "rematchGameId",
   "takebackRequestedBy", "takebackDeclinedFor",
-  "whiteRatingChange", "blackRatingChange", "botId", rated, "seriesId", "seriesGame",
+  "whiteRatingChange", "blackRatingChange", "botId", rated, "seriesId", "seriesGame", "tournamentId",
   "whiteLagBudgetMs", "blackLagBudgetMs", "pausedAt", "drawDeclinedFor",
   "whiteRematchAsked", "blackRematchAsked"`;
 
@@ -37,6 +38,9 @@ export interface NewGame {
   blackUsername: string;
   whiteRating: number;
   blackRating: number;
+  /** Whether each rating is provisional as the game starts */
+  whiteProvisional: boolean;
+  blackProvisional: boolean;
   whiteAvatarUrl: string | null;
   blackAvatarUrl: string | null;
   time: number;
@@ -47,6 +51,10 @@ export interface NewGame {
   deadlineAt: Date;
   seriesId?: number | null;
   seriesGame?: number | null;
+  /** The arena tournament that paired the game */
+  tournamentId?: number | null;
+  /** False makes an even game unrated too (an unrated tournament). Default: rated unless it has odds */
+  rated?: boolean;
 }
 
 /** A finished game against a computer bot; one side is the bot (no user id). */
@@ -131,6 +139,40 @@ export const gameRepository = {
     return rows[0] ?? null;
   },
 
+  /** The finished game behind a share link (migration 033), or null. */
+  async findByShareToken(db: Queryable, token: string): Promise<Game | null> {
+    const { rows } = await db.query<Game>(
+      `SELECT ${GAME_COLUMNS} FROM games WHERE "shareToken" = $1 AND status = 'finished'`,
+      [token]
+    );
+    return rows[0] ?? null;
+  },
+
+  /**
+   * Gives a finished game `token` as its share link unless it has one
+   * already, and returns the link it now has. Null when the game isn't one
+   * `userId` may share: not theirs, not over, aborted, or not there at all.
+   */
+  async share(db: Queryable, gameId: number, userId: number, token: string): Promise<string | null> {
+    const { rows } = await db.query<{ shareToken: string }>(
+      `UPDATE games SET "shareToken" = COALESCE("shareToken", $3)
+       WHERE id = $1 AND ("whiteId" = $2 OR "blackId" = $2)
+         AND status = 'finished' AND result <> 'aborted'
+       RETURNING "shareToken"`,
+      [gameId, userId, token]
+    );
+    return rows[0]?.shareToken ?? null;
+  },
+
+  /** Turns a game's share link off. False when it isn't `userId`'s game. */
+  async unshare(db: Queryable, gameId: number, userId: number): Promise<boolean> {
+    const { rowCount } = await db.query(
+      `UPDATE games SET "shareToken" = NULL WHERE id = $1 AND ("whiteId" = $2 OR "blackId" = $2)`,
+      [gameId, userId]
+    );
+    return (rowCount ?? 0) > 0;
+  },
+
   /**
    * Opens a transaction on `client` and locks the game row, in one round
    * trip: both statements go out as a single simple query, which can't
@@ -162,9 +204,9 @@ export const gameRepository = {
         "whiteRating", "blackRating", "whiteAvatarUrl", "blackAvatarUrl",
         time, increment, status, "numMoves",
         "whiteTimeLeftMs", "blackTimeLeftMs", "lastMoveAt", "deadlineAt", "seriesId", "seriesGame",
-        "whiteTime", "blackTime", rated
+        "whiteTime", "blackTime", rated, "whiteProvisional", "blackProvisional", "tournamentId"
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'in_progress', 0, $11, $12, $13, $14, $15, $16,
-        $17, $18, $19)
+        $17, $18, $19, $20, $21, $22)
       RETURNING ${GAME_COLUMNS}`,
       [
         game.whiteId,
@@ -185,7 +227,10 @@ export const gameRepository = {
         game.seriesGame ?? null,
         game.odds?.whiteTime ?? null,
         game.odds?.blackTime ?? null,
-        !game.odds,
+        !game.odds && game.rated !== false,
+        game.whiteProvisional,
+        game.blackProvisional,
+        game.tournamentId ?? null,
       ]
     );
     return rows[0]!;
@@ -232,6 +277,12 @@ export const gameRepository = {
    */
   async saveMove(db: TxClient, gameId: number, update: SavedMove): Promise<void> {
     await db.query(saveMoveStatement(db, gameId, update));
+  },
+
+  /** Makes a game unrated (a tournament game nobody really played) and returns it as it now is. */
+  async makeUnrated<G extends Game>(db: Queryable, game: G): Promise<G> {
+    await db.query(`UPDATE games SET rated = false WHERE id = $1`, [game.id]);
+    return { ...game, rated: false };
   },
 
   /** Marks the game finished. Returns false if it was already finished. */

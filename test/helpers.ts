@@ -45,12 +45,13 @@ export async function startTestApp(
 export async function resetDb(app: FastifyInstance) {
   await app.pg.query(
     `TRUNCATE games, series, challenges, matchmaking, friends, friend_requests, user_settings, puzzle_attempts,
-       repertoire_lines, study_rooms, study_room_members, endgame_progress, users
+       repertoire_lines, study_rooms, study_room_members, endgame_progress, tournaments, tournament_players, users
      RESTART IDENTITY CASCADE`
   );
   await app.redis.flushDb();
   // Ids restart, so cached Clerk id -> user entries would point at old rows
   app.users.clear();
+  app.tournaments.clear();
 }
 
 export async function createUser(

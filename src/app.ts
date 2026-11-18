@@ -17,6 +17,7 @@ import { SeriesService } from "./services/seriesService.js";
 import { StudyService } from "./services/studyService.js";
 import { GameChatService } from "./services/gameChatService.js";
 import { ModerationService } from "./services/moderationService.js";
+import { TournamentService } from "./services/tournamentService.js";
 import { PushService, webPushSender, type PushSender } from "./services/pushService.js";
 import { createJobs } from "./jobs.js";
 import { UserLookup } from "./plugins/userLookup.js";
@@ -38,6 +39,7 @@ import { studyRoutes } from "./routes/study.js";
 import { endgameRoutes } from "./routes/endgames.js";
 import { pushRoutes } from "./routes/push.js";
 import { moderationRoutes } from "./routes/moderation.js";
+import { tournamentRoutes } from "./routes/tournaments.js";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -50,6 +52,7 @@ declare module "fastify" {
     study: StudyService;
     gameChat: GameChatService;
     moderation: ModerationService;
+    tournaments: TournamentService;
     push: PushService;
     jobs: ReturnType<typeof createJobs>;
     users: UserLookup;
@@ -297,6 +300,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   app.decorate("study", new StudyService(app, hub));
   app.decorate("gameChat", new GameChatService(app, hub));
   app.decorate("moderation", new ModerationService(app, hub));
+  app.decorate("tournaments", new TournamentService(app, hub));
   const vapid = vapidKeys(config);
   app.decorate(
     "push",
@@ -319,6 +323,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   // Hooks run in reverse order, so this runs before Redis/Postgres close
   app.addHook("onClose", async () => {
     app.jobs.stop();
+    app.tournaments.stop();
     await hub.stop();
   });
 
@@ -338,6 +343,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   await app.register(endgameRoutes, { prefix: "/api" });
   await app.register(pushRoutes, { prefix: "/api" });
   await app.register(moderationRoutes, { prefix: "/api" });
+  await app.register(tournamentRoutes, { prefix: "/api" });
 
   return app;
 }

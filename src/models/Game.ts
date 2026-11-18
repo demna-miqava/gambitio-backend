@@ -13,6 +13,9 @@ export interface Game {
   numMoves: number;
   whiteRating: number;
   blackRating: number;
+  /** Whether each rating was provisional when the game started (migration 032) */
+  whiteProvisional: boolean;
+  blackProvisional: boolean;
   /** Starting clock in seconds; null for bot games, which are untimed */
   time: number | null;
   increment: number;
@@ -54,6 +57,8 @@ export interface Game {
   seriesId: number | null;
   /** 1-based number of the game within its series */
   seriesGame: number | null;
+  /** Set when the game was paired by an arena tournament (migration 034) */
+  tournamentId: number | null;
   /** What is left of each player's lag allowance (src/game/clock.ts, migration 029) */
   whiteLagBudgetMs: number;
   blackLagBudgetMs: number;
@@ -82,6 +87,8 @@ export interface PlayerResponse {
   id: number | null;
   username: string;
   rating: number;
+  /** The rating was provisional when the game started: shown as "1500?" */
+  provisional: boolean;
   avatarUrl: string | null;
   ratingChange: number | null;
 }
@@ -110,6 +117,8 @@ export interface GameResponse {
   /** Set when the game is part of a friend series */
   seriesId: number | null;
   seriesGame: number | null;
+  /** Set when the game was played in a tournament */
+  tournamentId: number | null;
   whitePlayer: PlayerResponse;
   blackPlayer: PlayerResponse;
 }
@@ -138,6 +147,7 @@ export interface LivePlayerResponse {
   id: number;
   username: string;
   rating: number;
+  provisional: boolean;
   avatarUrl: string | null;
 }
 

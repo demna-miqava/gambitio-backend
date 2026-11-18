@@ -1,4 +1,5 @@
 import type { UserSkill } from "../models/User.js";
+import { ratePlayer, type GameScore, type RatingState } from "./glicko2.js";
 
 export function getRatingsBySkill(skill: UserSkill): number {
   const ratingMap: Record<UserSkill, number> = {
@@ -10,70 +11,47 @@ export function getRatingsBySkill(skill: UserSkill): number {
   return ratingMap[skill];
 }
 
-export interface RatingChange {
-  whiteRatingChange: number;
-  blackRatingChange: number;
-  whiteNewRating: number;
-  blackNewRating: number;
+export const RATING_FLOOR = 100;
+
+/** A player's rating in one time control, as stored on their users row. */
+export type PlayerRating = RatingState;
+
+export interface RatedGame {
+  white: PlayerRating;
+  black: PlayerRating;
 }
 
-export const RATING_FLOOR = 100;
-const BASE_CHANGE = 8;
-const MIN_WIN_CHANGE = 1;
-const MAX_WIN_CHANGE = 16;
-const MAX_DRAW_CHANGE = 8;
-const POINTS_PER_BRACKET = 50;
-
-const clamp = (value: number, min: number, max: number) =>
-  Math.min(max, Math.max(min, value));
+/**
+ * The most one game can move a rating. Glicko-2 alone lets a brand-new
+ * player gain over 600 points for one win against someone rated far above
+ * them (a friend's challenge, an opponent who lost on time); with the cap a
+ * player whose rating is far off still gets where they belong in a few games.
+ */
+export const MAX_RATING_CHANGE = 300;
 
 /**
- * Rating deltas for a finished game, from the ratings both players had when it
- * started.
- * - Win: 8 points, ±1 per 50-point gap (upsets gain more), clamped to 1..16 so
- *   the winner always gains and the loser always loses.
- * - Draw: the lower-rated player gains 1 per 50-point gap (max 8), the higher
- *   loses the same.
- * New ratings never drop below RATING_FLOOR.
+ * Both players' ratings after a rated game, by Glicko-2 (src/utils/glicko2.ts)
+ * from what they had when it ended. Ratings are whole numbers, move by at
+ * most MAX_RATING_CHANGE a game and never drop below RATING_FLOOR.
+ *
+ * The winner never loses points and the loser never gains any, but the two
+ * changes differ in size: each depends on how settled that player's own
+ * rating is. A heavy favourite can gain 0 for a win.
  */
-export function calculateRatingChanges(
-  whiteRating: number,
-  blackRating: number,
-  result: "white_win" | "black_win" | "draw" | "aborted"
-): RatingChange {
-  if (result === "aborted") {
-    return {
-      whiteRatingChange: 0,
-      blackRatingChange: 0,
-      whiteNewRating: whiteRating,
-      blackNewRating: blackRating,
-    };
-  }
-
-  const brackets = Math.floor(Math.abs(whiteRating - blackRating) / POINTS_PER_BRACKET);
-  const whiteIsHigher = whiteRating > blackRating;
-
-  let whiteDelta: number;
-  if (result === "draw") {
-    const change = Math.min(brackets, MAX_DRAW_CHANGE);
-    whiteDelta = whiteIsHigher ? -change : change;
-  } else {
-    const winnerIsHigher = (result === "white_win") === whiteIsHigher && whiteRating !== blackRating;
-    const change = clamp(
-      winnerIsHigher ? BASE_CHANGE - brackets : BASE_CHANGE + brackets,
-      MIN_WIN_CHANGE,
-      MAX_WIN_CHANGE
-    );
-    whiteDelta = result === "white_win" ? change : -change;
-  }
-
-  const whiteNewRating = Math.max(RATING_FLOOR, whiteRating + whiteDelta);
-  const blackNewRating = Math.max(RATING_FLOOR, blackRating - whiteDelta);
-
+export function rateGame(
+  white: PlayerRating,
+  black: PlayerRating,
+  result: "white_win" | "black_win" | "draw",
+  now: Date
+): RatedGame {
+  const whiteScore = result === "white_win" ? 1 : result === "black_win" ? 0 : 0.5;
+  const settle = (before: PlayerRating, rated: RatingState): PlayerRating => {
+    const change = Math.round(rated.rating) - before.rating;
+    const capped = Math.min(MAX_RATING_CHANGE, Math.max(-MAX_RATING_CHANGE, change));
+    return { ...rated, rating: Math.max(RATING_FLOOR, before.rating + capped) };
+  };
   return {
-    whiteRatingChange: whiteNewRating - whiteRating,
-    blackRatingChange: blackNewRating - blackRating,
-    whiteNewRating,
-    blackNewRating,
+    white: settle(white, ratePlayer(white, black, whiteScore, now)),
+    black: settle(black, ratePlayer(black, white, (1 - whiteScore) as GameScore, now)),
   };
 }
