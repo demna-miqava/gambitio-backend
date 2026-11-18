@@ -35,17 +35,19 @@ export async function userRoutes(fastify: FastifyInstance) {
   const statsService = new StatsService(fastify);
 
   /**
-   * POST /users/sync - Create the chess profile after Clerk sign-up
+   * POST /users/sync - Create the chess profile after Clerk sign-up.
+   * A new profile costs a Clerk API call (the email), so this is limited per
+   * Clerk user to a few tries a minute: plenty for picking a free username.
    */
-  fastify.post("/users/sync", { preHandler: clerkAuthMiddleware }, async (request, reply) => {
-    const data = syncUserSchema.parse(request.body);
-    const clerkId = request.clerkId!;
-    const email = await fastify.authProvider.getEmail(clerkId);
-    if (!email) throw new AppError("Email not found for user", "EMAIL_NOT_FOUND", 400);
-
-    const user = await userService.syncUser(clerkId, email, data);
-    return reply.status(201).send({ message: "Profile created successfully", user });
-  });
+  fastify.post(
+    "/users/sync",
+    { preHandler: clerkAuthMiddleware, config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      const data = syncUserSchema.parse(request.body);
+      const user = await userService.syncUser(request.clerkId!, data);
+      return reply.status(201).send({ message: "Profile created successfully", user });
+    }
+  );
 
   /**
    * GET /users/check-username?username=xxx

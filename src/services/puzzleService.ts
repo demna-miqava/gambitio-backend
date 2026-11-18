@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { Chess, type Square } from "chess.js";
 import { AppError } from "../errors/AppError.js";
 import { calculatePuzzleRating } from "../utils/puzzleRating.js";
-import { statsCacheKey } from "./statsService.js";
+import { invalidatePuzzleStats } from "./statsService.js";
 import { cachedValue } from "../utils/cache.js";
 
 export interface PuzzleRow {
@@ -45,7 +45,7 @@ export interface ThemeCount {
  * opens at about their level (expected score ~0.57) and climbs from there.
  */
 const RATED_START_BELOW = 50;
-const THEMES_CACHE_KEY = "puzzles:themes";
+const THEMES_CACHE_KEY = "puzzles:theme-counts";
 
 /**
  * The puzzles are split in two by id. Rated mode only serves (and only
@@ -53,7 +53,8 @@ const THEMES_CACHE_KEY = "puzzles:themes";
  * move. Rush and Survival serve the other half with solutions, to play
  * locally. Otherwise one account could read a solution from the unrated
  * feed and play it for rating. (Lichess ids use [0-9A-Za-z], which splits
- * evenly by character code parity.)
+ * evenly by character code parity.) Each half has its own index on
+ * (rating, id), whose WHERE is exactly these expressions (migration 031).
  */
 export const RATED_POOL_SQL = (alias: string) => `ascii(right(${alias}.id, 1)) % 2 = 0`;
 export const isRatedPool = (puzzleId: string) => puzzleId.charCodeAt(puzzleId.length - 1) % 2 === 0;
@@ -70,8 +71,13 @@ function play(chess: Chess, uci: string) {
     return null;
   }
 }
-/** Themes only change when puzzles are imported. */
-const THEMES_CACHE_SECONDS = 6 * 60 * 60;
+/**
+ * Themes only change when puzzles are imported, and the counts are read
+ * from a small table the import fills, so a stale entry is served while it
+ * is refreshed.
+ */
+const THEMES_CACHE_SECONDS = 60 * 60;
+const THEMES_STALE_SECONDS = 24 * 60 * 60;
 
 export class PuzzleService {
   constructor(private fastify: FastifyInstance) {}
@@ -259,20 +265,33 @@ export class PuzzleService {
       return { rated: true, ...updated[0]!, ratingChange };
     });
 
-    // Profile stats show the puzzle rating
-    if (result.rated) await this.fastify.redis.del(statsCacheKey(userId)).catch(() => {});
+    // Profile stats show the puzzle rating (cached apart from the game stats)
+    if (result.rated) {
+      await invalidatePuzzleStats(this.fastify.redis, userId).catch((err) =>
+        this.fastify.log.warn({ err }, "Failed to clear puzzle stats cache")
+      );
+    }
     return result;
   }
 
-  /** Every theme with its puzzle count, most common first. Cached in Redis. */
+  /**
+   * Every theme with its puzzle count, most common first. Counted when
+   * puzzles are imported (puzzle_theme_counts, migration 031), not here:
+   * counting means reading every puzzle. Cached in Redis.
+   */
   async themes(): Promise<ThemeCount[]> {
-    return cachedValue(this.fastify.redis, this.fastify.log, THEMES_CACHE_KEY, THEMES_CACHE_SECONDS, async () => {
-      const { rows } = await this.fastify.pg.query<ThemeCount>(
-        `SELECT t AS theme, COUNT(*)::int AS count
-         FROM puzzles, unnest(themes) AS t
-         GROUP BY t ORDER BY count DESC, theme`
-      );
-      return rows;
-    });
+    return cachedValue(
+      this.fastify.redis,
+      this.fastify.log,
+      THEMES_CACHE_KEY,
+      THEMES_CACHE_SECONDS,
+      async () => {
+        const { rows } = await this.fastify.pg.query<ThemeCount>(
+          `SELECT theme, count FROM puzzle_theme_counts ORDER BY count DESC, theme`
+        );
+        return rows;
+      },
+      { staleSeconds: THEMES_STALE_SECONDS }
+    );
   }
 }

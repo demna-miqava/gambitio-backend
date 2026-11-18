@@ -14,11 +14,14 @@ WebSockets) to this backend, which runs in a Cloudflare Container. Postgres
    the **pooled** connection string (host contains `-pooler`), with
    `?sslmode=require`.
 3. **Upstash Redis** – create a database in a nearby region and copy the
-   `rediss://` URL (TLS). Each backend instance sends one heartbeat command
+   `rediss://` URL (TLS). Each backend instance sends two heartbeat commands
    every 25 seconds, plus a few commands per connection, game move and page
-   view; check the plan's command limit.
+   view; check the plan's command limit. With one instance, messages to
+   sockets aren't sent through Redis at all.
 4. **Clerk** – create a *production* instance for your domain and finish its
-   DNS setup. You need its `pk_live_...` and `sk_live_...` keys.
+   DNS setup. You need its `pk_live_...` and `sk_live_...` keys, and its JWT
+   public key (dashboard, **API keys**, "JWT public key": the PEM text
+   starting `-----BEGIN PUBLIC KEY-----`).
 
 ## 2. Configuration
 
@@ -33,13 +36,33 @@ WebSockets) to this backend, which runs in a Cloudflare Container. Postgres
   npx wrangler secret put REDIS_URL                    # Upstash rediss:// URL
   npx wrangler secret put CLERK_PUBLISHABLE_KEY        # pk_live_...
   npx wrangler secret put CLERK_SECRET_KEY             # sk_live_...
+  npx wrangler secret put CLERK_JWT_KEY                # the PEM public key (paste all lines)
   ```
+
+  `CLERK_JWT_KEY` is optional but recommended: with it the backend checks
+  session tokens locally and never calls Clerk to do so. Without it, the
+  backend fetches Clerk's signing keys itself (at most once a minute for an
+  unknown key, plus a refresh every few minutes). If the value is
+  malformed the backend refuses to start, and `npx wrangler tail` shows
+  `CLERK_JWT_KEY: must be the PEM public key...`. A value stored as one line
+  with literal `\n` escapes is accepted.
 
 - A secret added or changed later doesn't reach a backend that is already
   running (it keeps the settings it started with for as long as anyone has
   the site open). After `wrangler secret put`, raise `BACKEND_GENERATION` in
   `wrangler.jsonc` by one and deploy: requests then go to freshly created
-  backends and the old ones are stopped.
+  backends and the old ones are stopped. For example, to add `CLERK_JWT_KEY`
+  to a running site:
+
+  ```bash
+  npx wrangler secret put CLERK_JWT_KEY    # paste the PEM from the Clerk dashboard
+  # wrangler.jsonc: "BACKEND_GENERATION": "<current + 1>"
+  npm run deploy
+  ```
+
+  If you rotate the instance's keys in Clerk later, put the new public key
+  the same way (secret, generation, deploy): a backend with the old
+  `CLERK_JWT_KEY` rejects every new session token.
 - Optional, for web push notifications (challenges, friend requests, "your
   game has started"). Without these two secrets push is simply off and the
   switch in Settings says so. Make one key pair and keep it: changing it
@@ -110,7 +133,9 @@ builds the container image and deploys the Worker.
   sends all of a game's sockets to the same instance (by game id) and other
   requests by client IP; the instances coordinate through Postgres and Redis.
   Each one is billed separately. Rate limits and small caches are kept per
-  instance.
+  instance. Instances tell each other they're alive on the Redis channel
+  every 25 seconds; one that hears nobody else stops sending socket
+  messages through Redis, and a new one announces itself as it starts.
 - An idle instance sends no queries (Neon can suspend). Containers sleep 15
   minutes after the last connection closes and start again on the next
   request (a few seconds).

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { gameRepository } from "./repositories/gameRepository.js";
+import { CHALLENGE_TTL_MS } from "./services/challengeService.js";
 
 /**
  * Backstop for the per-game deadline timers (LiveGameService.watchDeadline):
@@ -8,8 +9,12 @@ import { gameRepository } from "./repositories/gameRepository.js";
 const CLOCK_SWEEP_MS = 10_000;
 const MATCHMAKING_SWEEP_MS = 2_000;
 const CHALLENGE_SWEEP_MS = 30_000;
-/** Series expire after days, so a pass every few minutes is plenty */
-const SERIES_SWEEP_MS = 5 * 60_000;
+/**
+ * Series expire after days, so a pass every half hour is plenty. Kept well
+ * apart from Neon's suspend delay (5 minutes without a query): a pass every
+ * 5 minutes, as before, kept the database awake for one idle tab.
+ */
+const SERIES_SWEEP_MS = 30 * 60_000;
 /** Chat messages go an hour after their game ends: an hourly pass is close enough */
 const CHAT_SWEEP_MS = 60 * 60_000;
 
@@ -18,15 +23,38 @@ const CHAT_SWEEP_MS = 60 * 60_000;
  * them on every server instance at once is safe.
  *
  * A pass only runs when there is something for it to do on this instance
- * (games being watched, players searching, anyone connected), so an idle
- * server sends the database nothing and Neon can suspend it. Games are
- * resolved at their deadline by per-game timers, not by polling.
+ * (live games, players searching, challenges sent here, anyone connected),
+ * so an idle server sends the database nothing and Neon can suspend it after
+ * its 5 minutes without a query. An open tab alone doesn't count: it keeps
+ * a socket open, but sockets don't touch the database. (The pool's idle
+ * connections close after 30 seconds, idleTimeoutMillis in app.ts, well
+ * within those 5 minutes, so they don't hold the database up either.) Games
+ * are resolved at their deadline by per-game timers, not by polling.
  */
 export function createJobs(app: FastifyInstance) {
   const timers: NodeJS.Timeout[] = [];
 
+  /**
+   * Until when the challenge sweep runs. Challenges are sent over the
+   * challenger's notifications socket, so the instance that stored one holds
+   * its challenger, and a challenge only outlives its challenger's
+   * connection for a short grace (ChallengeService.withdrawIfStillOffline):
+   * this instance only has challenges to expire for CHALLENGE_TTL_MS after
+   * it last stored one. Starts open for challenges a previous process
+   * stored before a restart.
+   */
+  const challengeWindow = () => Date.now() + CHALLENGE_TTL_MS + 2 * CHALLENGE_SWEEP_MS;
+  let challengesUntil = challengeWindow();
+
   /** Ends games whose clock ran out or whose first move never came. */
   async function runClockSweep(): Promise<void> {
+    // The startup read of the live games failed: retry it, so games whose
+    // deadline is still ahead get their timers
+    if (app.liveGames.liveDeadlinesPending) {
+      await app.liveGames
+        .armLiveDeadlines()
+        .catch((err) => app.log.error({ err }, "Reading live game deadlines failed again"));
+    }
     const ids = await gameRepository.findIdsPastDeadline(app.pg, new Date(), 50);
     for (const id of ids) await app.liveGames.resolveDeadline(id);
   }
@@ -48,14 +76,28 @@ export function createJobs(app: FastifyInstance) {
 
   return {
     runClockSweep,
+    /** Called when a challenge is stored, so the challenge sweep runs until it can expire. */
+    noteChallenge() {
+      challengesUntil = challengeWindow();
+    },
     start() {
       app.liveGames
         .startDeadlineTimers()
         .catch((err) => app.log.error({ err }, "Arming game deadline timers failed"));
+      // Queue entries an instance that crashed left behind
+      app.matchmaking
+        .removeLeftovers()
+        .catch((err) => app.log.error({ err }, "Removing leftover matchmaking entries failed"));
+      // Only while there are live games this instance knows of (a timer or
+      // a player's socket here, or a failed startup read of them: see
+      // LiveGameService.needsClockSweep), or another instance is running
+      // (its games are the ones the sweep is for). An instance that dies
+      // without the others noticing in time leaves its games to its own
+      // restart, which arms a timer for every live game.
       every(
         CLOCK_SWEEP_MS,
         "Clock sweep",
-        () => app.liveGames.watchedGameCount > 0 || app.hub.attachedCount > 0,
+        () => app.liveGames.needsClockSweep || app.hub.othersAlive,
         runClockSweep
       );
       every(
@@ -67,7 +109,7 @@ export function createJobs(app: FastifyInstance) {
       every(
         CHALLENGE_SWEEP_MS,
         "Challenge sweep",
-        () => app.hub.attachedCount > 0,
+        () => Date.now() < challengesUntil && app.hub.attachedCount > 0,
         () => app.challenges.expireStale()
       );
       every(
@@ -86,7 +128,7 @@ export function createJobs(app: FastifyInstance) {
     stop() {
       for (const timer of timers) clearInterval(timer);
       timers.length = 0;
-      app.liveGames.stopDeadlineTimers();
+      app.liveGames.stop();
     },
   };
 }

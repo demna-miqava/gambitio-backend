@@ -17,12 +17,15 @@ export async function gameRoutes(fastify: FastifyInstance) {
     return { gameId };
   });
 
-  // POST /games/bot - Store a finished (unrated) game against a computer bot
+  // POST /games/bot - Store a finished (unrated) game against a computer bot.
+  // At most BOT_GAMES_PER_DAY a day per user (GameService.saveBotGame)
   fastify.post(
     "/games/bot",
     {
       preHandler: authMiddleware,
-      bodyLimit: 32 * 1024,
+      // The PGN (MAX_BOT_GAME_PGN_LENGTH characters) as JSON, with room for
+      // escaped newlines and names outside ASCII
+      bodyLimit: 16 * 1024,
       config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
     },
     async (request, reply) => {

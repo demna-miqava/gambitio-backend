@@ -22,8 +22,15 @@ import { GAME_LIST_COLUMNS, type GameListRow } from "../repositories/gameReposit
 export interface SeriesRow extends SeriesScore {
   id: number;
   createdAt: Date;
+  /** The longer clock when the series has time odds */
   time: number;
   increment: number;
+  /**
+   * Each player's starting clock in seconds when they differ (time odds,
+   * migration 027); null for an even series
+   */
+  playerOneTime: number | null;
+  playerTwoTime: number | null;
   status: SeriesStatus;
   winnerId: number | null;
   endReason: SeriesEndReason | null;
@@ -36,6 +43,8 @@ interface SeriesPlayer {
   avatarUrl: string | null;
   /** Points (a draw is half a point) */
   score: number;
+  /** Their starting clock in seconds, when the series has time odds; null otherwise */
+  time: number | null;
 }
 
 /** A series as sent to clients. */
@@ -58,7 +67,7 @@ export interface SeriesSummary {
 }
 
 const SERIES_COLUMNS = `s.id, s."createdAt", s."playerOneId", s."playerTwoId", s."playerOneStartsWhite",
-  s."bestOf", s.time, s.increment, s.status, s."playerOneHalfPoints", s."playerTwoHalfPoints",
+  s."bestOf", s.time, s.increment, s."playerOneTime", s."playerTwoTime", s.status, s."playerOneHalfPoints", s."playerTwoHalfPoints",
   s."gamesPlayed", s."winnerId", s."endReason", s."endedAt"`;
 
 const SUMMARY_SELECT = `SELECT ${SERIES_COLUMNS},
@@ -96,12 +105,14 @@ export function toSeriesSummary(row: SummaryRow): SeriesSummary {
       username: row.playerOneUsername,
       avatarUrl: row.playerOneAvatarUrl,
       score: row.playerOneHalfPoints / 2,
+      time: row.playerOneTime,
     },
     playerTwo: {
       id: row.playerTwoId,
       username: row.playerTwoUsername,
       avatarUrl: row.playerTwoAvatarUrl,
       score: row.playerTwoHalfPoints / 2,
+      time: row.playerTwoTime,
     },
     next,
   };
@@ -120,11 +131,14 @@ export const seriesRepository = {
       bestOf: number;
       time: number;
       increment: number;
+      /** Time odds: the challenger's and the challenged player's clocks */
+      odds?: { challengerTime: number; challengedTime: number } | null;
     }
   ): Promise<SeriesRow> {
     const { rows } = await tx.query<SeriesRow>(
-      `INSERT INTO series ("playerOneId", "playerTwoId", "playerOneStartsWhite", "bestOf", time, increment)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO series ("playerOneId", "playerTwoId", "playerOneStartsWhite", "bestOf", time, increment,
+         "playerOneTime", "playerTwoTime")
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING ${SERIES_COLUMNS.replace(/s\./g, "")}`,
       [
         params.challengerId,
@@ -133,6 +147,8 @@ export const seriesRepository = {
         params.bestOf,
         params.time,
         params.increment,
+        params.odds?.challengerTime ?? null,
+        params.odds?.challengedTime ?? null,
       ]
     );
     return rows[0]!;
@@ -162,21 +178,38 @@ export const seriesRepository = {
     return rows[0] ?? null;
   },
 
+  /**
+   * Locks the series row like lock(), and reads it with its players' names,
+   * so a caller that needs the summary afterwards doesn't read it again.
+   * Only the series row is locked, not the players'.
+   */
+  async lockSummary(tx: Queryable, seriesId: number): Promise<SummaryRow | null> {
+    const { rows } = await tx.query<SummaryRow>(`${SUMMARY_SELECT} WHERE s.id = $1 FOR UPDATE OF s`, [
+      seriesId,
+    ]);
+    return rows[0] ?? null;
+  },
+
   async summary(db: Queryable, seriesId: number): Promise<SeriesSummary | null> {
     const { rows } = await db.query<SummaryRow>(`${SUMMARY_SELECT} WHERE s.id = $1`, [seriesId]);
     return rows[0] ? toSeriesSummary(rows[0]) : null;
   },
 
+  /** Saves the score and returns the series as it now stands, in one statement. */
   async saveScore(
     tx: Queryable,
     seriesId: number,
     score: SeriesScore,
     end: { winnerId: number | null; endReason: SeriesEndReason } | null
-  ): Promise<void> {
-    await tx.query(
-      `UPDATE series SET "playerOneHalfPoints" = $2, "playerTwoHalfPoints" = $3, "gamesPlayed" = $4,
-         status = $5, "winnerId" = $6, "endReason" = $7, "endedAt" = CASE WHEN $5 = 'finished' THEN now() END
-       WHERE id = $1`,
+  ): Promise<SeriesSummary | null> {
+    const { rows } = await tx.query<SummaryRow>(
+      `WITH s AS (
+         UPDATE series SET "playerOneHalfPoints" = $2, "playerTwoHalfPoints" = $3, "gamesPlayed" = $4,
+           status = $5, "winnerId" = $6, "endReason" = $7, "endedAt" = CASE WHEN $5 = 'finished' THEN now() END
+         WHERE id = $1
+         RETURNING *
+       )
+       ${SUMMARY_OF_UPDATED}`,
       [
         seriesId,
         score.playerOneHalfPoints,
@@ -187,33 +220,47 @@ export const seriesRepository = {
         end?.endReason ?? null,
       ]
     );
+    return rows[0] ? toSeriesSummary(rows[0]) : null;
   },
 };
+
+/** SUMMARY_SELECT reading the series from a CTE named `s` instead of the table. */
+const SUMMARY_OF_UPDATED = SUMMARY_SELECT.replace("FROM series s", "FROM s");
+if (SUMMARY_OF_UPDATED === SUMMARY_SELECT) throw new Error("SUMMARY_SELECT must read FROM series s");
+
+const isSummaryRow = (row: SeriesRow): row is SummaryRow => "playerOneUsername" in row;
 
 /**
  * Scores a finished series game inside the transaction that ended it (the
  * game row is locked; the series row is locked here, after it, which is the
  * order every series path takes). Returns the series as it now stands.
+ *
+ * `locked` is the series row when the caller has already locked it in this
+ * transaction (it has to, before the players' rows: see finishGame), so it
+ * isn't locked and read a second time. From lockSummary, a series that is
+ * already over needs no query at all.
  */
 export async function recordSeriesResult(
   tx: Queryable,
   game: LiveGame,
-  result: GameResult
+  result: GameResult,
+  locked?: SeriesRow | null
 ): Promise<SeriesSummary | null> {
   if (game.seriesId === null) return null;
-  const series = await seriesRepository.lock(tx, game.seriesId);
+  const series =
+    locked && locked.id === game.seriesId ? locked : await seriesRepository.lockSummary(tx, game.seriesId);
   if (!series) return null;
   if (series.status === "active") {
     const score = scoreGame(series, { whiteId: game.whiteId, blackId: game.blackId, result });
     const decision = seriesDecision(score);
-    await seriesRepository.saveScore(
+    return seriesRepository.saveScore(
       tx,
       series.id,
       score,
       decision.decided ? { winnerId: decision.winnerId, endReason: "played_out" } : null
     );
   }
-  return seriesRepository.summary(tx, series.id);
+  return isSummaryRow(series) ? toSeriesSummary(series) : seriesRepository.summary(tx, series.id);
 }
 
 /**
@@ -295,8 +342,7 @@ export class SeriesService {
         throw new AppError("Finish the current game first", "SERIES_GAME_IN_PROGRESS", 409);
       }
       const winnerId = series.playerOneId === userId ? series.playerTwoId : series.playerOneId;
-      await seriesRepository.saveScore(tx, seriesId, series, { winnerId, endReason: "resignation" });
-      return (await seriesRepository.summary(tx, seriesId))!;
+      return (await seriesRepository.saveScore(tx, seriesId, series, { winnerId, endReason: "resignation" }))!;
     });
     await this.ended(summary);
     return summary;
@@ -336,8 +382,7 @@ export class SeriesService {
       );
       if (!rows[0]?.idle) return null;
       const { winnerId } = expiredSeriesDecision(series);
-      await seriesRepository.saveScore(tx, seriesId, series, { winnerId, endReason: "expired" });
-      return (await seriesRepository.summary(tx, seriesId))!;
+      return (await seriesRepository.saveScore(tx, seriesId, series, { winnerId, endReason: "expired" }))!;
     });
     if (summary) await this.ended(summary);
   }
@@ -372,9 +417,13 @@ export class SeriesService {
     const opponent = users[0];
     if (!opponent) throw new AppError("User not found", "USER_NOT_FOUND", 404);
 
-    // Each side scans its (player, createdAt) index
-    const pair = `(("whiteId" = $1 AND "blackId" = $2) OR ("whiteId" = $2 AND "blackId" = $1))
-      AND status = 'finished' AND result IS DISTINCT FROM 'aborted'`;
+    // The pair's games only, newest first, from games_pair_finished_idx
+    // (migration 030): the expressions and the conditions must stay the
+    // index's own for Postgres to use it. Bot games have one player, so they
+    // could never match anyway.
+    const pair = `LEAST("whiteId", "blackId") = LEAST($1::int, $2::int)
+      AND GREATEST("whiteId", "blackId") = GREATEST($1::int, $2::int)
+      AND status = 'finished' AND result IS DISTINCT FROM 'aborted' AND "botId" IS NULL`;
     const { rows: totals } = await this.fastify.pg.query<{ wins: string; draws: string; losses: string }>(
       `SELECT
          COUNT(*) FILTER (WHERE "winnerId" = $1) AS wins,

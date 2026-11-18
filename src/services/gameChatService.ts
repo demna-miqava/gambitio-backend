@@ -23,6 +23,7 @@ const SWEEP_BATCH = 1_000;
 const OFF_MESSAGES: Record<ChatOffReason, string> = {
   off_by_you: "Chat is turned off in your settings",
   off_by_opponent: "Your opponent has chat turned off",
+  blocked: "You've blocked this player",
   closed: "This chat has closed",
 };
 
@@ -66,8 +67,8 @@ export class GameChatService {
     const access = await gameChatRepository.access(this.fastify.pg, gameId);
     if (!access || (viewerId !== access.whiteId && viewerId !== access.blackId)) return null;
     const reason = chatOffReason(access, viewerId, Date.now());
-    // With chat off by a setting, earlier messages stay hidden too
-    const hidden = reason === "off_by_you" || reason === "off_by_opponent";
+    // With chat off by a setting or a block, earlier messages stay hidden too
+    const hidden = reason === "off_by_you" || reason === "off_by_opponent" || reason === "blocked";
     const rows = hidden ? [] : await gameChatRepository.recent(this.fastify.pg, gameId, HISTORY_LIMIT);
     return { enabled: reason === null, reason, messages: rows.map(toMessage) };
   }
@@ -118,8 +119,8 @@ export class GameChatService {
   }
 
   /**
-   * A player changed who they chat with: if they are in a game, both players
-   * are told at once how its chat stands for them now ("chat_status", the
+   * A player changed who they chat with (a setting, a block or an unblock):
+   * if they are in a game, both players are told at once how its chat stands for them now ("chat_status", the
    * same shape as the chat part of the game state), so the opponent sees
    * that chat was turned off, or back on, without reloading.
    */

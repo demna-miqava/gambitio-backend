@@ -135,6 +135,14 @@ describe("series, repertoire, study rooms and endgames", { skip }, () => {
 
       // Head to head, from Alice's side: 1 win, 2 losses, 1 series lost
       await app.liveGames.abort((await app.pg.query(`SELECT id FROM games WHERE status = 'in_progress'`)).rows[0].id, alice.id);
+      // Games against someone else don't count
+      const carol = await createUser(app, "carol");
+      await app.pg.query(
+        `INSERT INTO games ("whiteId", "blackId", "whiteUsername", "blackUsername", "whiteRating", "blackRating",
+           time, increment, status, result, "endReason", "winnerId", "numMoves")
+         VALUES ($1, $2, 'alice', 'carol', 1200, 1200, 180, 0, 'finished', 'white_win', 'resignation', $1, 10)`,
+        [alice.id, carol.id]
+      );
       const h2h = (await request("GET", `/api/users/${bob.id}/head-to-head`, alice.clerkId)).json();
       assert.deepEqual([h2h.wins, h2h.draws, h2h.losses], [1, 0, 2]);
       assert.deepEqual(h2h.series, { won: 0, lost: 1, drawn: 0, active: 0 });
@@ -462,7 +470,9 @@ describe("series, repertoire, study rooms and endgames", { skip }, () => {
       assert.equal((await request("DELETE", `/api/friend-requests/${requestId}`, alice.clerkId)).statusCode, 200);
       assert.equal((await updated(nb, "request_cancelled")).data.user.id, alice.id);
 
-      // Sent, then declined by the receiver
+      // Sent, then declined by the receiver (past the cooldown a cancel
+      // starts, see the next test)
+      await app.redis.del(`friendreq:cooldown:${alice.id}:${bob.id}`);
       sent = await request("POST", "/api/friend-requests", alice.clerkId, { receiverId: bob.id });
       requestId = sent.json().data.id;
       await updated(nb, "request_received");
@@ -470,6 +480,7 @@ describe("series, repertoire, study rooms and endgames", { skip }, () => {
       assert.equal((await updated(na, "request_declined")).data.user.id, bob.id);
 
       // Sent and accepted
+      await app.redis.del(`friendreq:cooldown:${alice.id}:${bob.id}`);
       sent = await request("POST", "/api/friend-requests", alice.clerkId, { receiverId: bob.id });
       requestId = sent.json().data.id;
       await updated(nb, "request_received");
@@ -483,6 +494,39 @@ describe("series, repertoire, study rooms and endgames", { skip }, () => {
       // The one acting isn't told about their own action
       await na.none("friends_updated");
       assert.equal(nb.messages.filter((m) => m.type === "friends_updated").length, 4);
+    });
+
+    test("send-then-cancel can't be looped, and a decline holds for a day", async () => {
+      const send = (from: { clerkId: string }, to: { id: number }) =>
+        request("POST", "/api/friend-requests", from.clerkId, { receiverId: to.id });
+      const sent = await send(alice, bob);
+      assert.equal(sent.statusCode, 201);
+      await request("DELETE", `/api/friend-requests/${sent.json().data.id}`, alice.clerkId);
+      const again = await send(alice, bob);
+      assert.equal(again.statusCode, 429);
+      assert.equal(again.json().code, "FRIEND_REQUEST_COOLDOWN");
+      // An hour, per (sender, receiver): Bob can still ask Alice
+      const ttl = await app.redis.ttl(`friendreq:cooldown:${alice.id}:${bob.id}`);
+      assert.ok(ttl > 3500 && ttl <= 3600, String(ttl));
+      const fromBob = await send(bob, alice);
+      assert.equal(fromBob.statusCode, 201);
+
+      // Alice declines Bob's: Bob waits a day, and a cancel doesn't shorten it
+      await request("POST", `/api/friend-requests/${fromBob.json().data.id}/decline`, alice.clerkId);
+      assert.equal((await send(bob, alice)).json().code, "FRIEND_REQUEST_COOLDOWN");
+      assert.ok((await app.redis.ttl(`friendreq:cooldown:${bob.id}:${alice.id}`)) > 23 * 3600);
+    });
+
+    test("one account can send only so many friend requests a day", async () => {
+      await app.redis.set(`friendreq:sent:${alice.id}`, "50", { expiration: { type: "EX", value: 3600 } });
+      const refused = await request("POST", "/api/friend-requests", alice.clerkId, { receiverId: bob.id });
+      assert.equal(refused.statusCode, 429);
+      assert.equal(refused.json().code, "FRIEND_REQUEST_RATE_LIMITED");
+      assert.equal((await app.pg.query(`SELECT 1 FROM friend_requests`)).rowCount, 0);
+      // Refusals that don't create a request aren't counted
+      await app.redis.del(`friendreq:sent:${alice.id}`);
+      await request("POST", "/api/friend-requests", alice.clerkId, { receiverId: alice.id });
+      assert.equal(await app.redis.get(`friendreq:sent:${alice.id}`), null);
     });
   });
 

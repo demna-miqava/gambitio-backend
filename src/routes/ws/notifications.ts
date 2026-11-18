@@ -28,7 +28,11 @@ export async function notificationWebSocketRoute(fastify: FastifyInstance) {
             case "challenge_declined":
               return await challenges.decline(user.id, message.data.challengerId);
             case "challenge_accepted":
-              return await challenges.accept(user.id, message.data.challengerId);
+              return await challenges.accept(
+                user.id,
+                message.data.challengerId,
+                message.data.version ?? undefined
+              );
             case "challenge_cancelled":
               return await challenges.cancel(user.id, message.data.challengedId);
           }

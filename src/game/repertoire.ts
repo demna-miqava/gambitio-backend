@@ -48,30 +48,100 @@ export interface BookLine {
 /** Moves the repertoire has at a position, each with the lines that play it. */
 export type Book = Map<string, Map<string, { lineIds: number[]; lineNames: string[] }>>;
 
-/** Every position the lines pass through, with the moves played from it. */
-export function buildBook(lines: BookLine[]): Book {
-  const book: Book = new Map();
-  for (const line of lines) {
-    const chess = new Chess();
+const STARTING_FEN = new Chess().fen();
+
+/**
+ * Every position lines pass through, with the moves played from it, built
+ * one line at a time (so a caller can let other work run in between: a few
+ * hundred lines take a while on a small CPU). Lines that start the same way
+ * (most of a repertoire) share their opening moves, which are played once:
+ * a move is only played on a board when no earlier line already went that way.
+ */
+export class BookBuilder {
+  readonly book: Book = new Map();
+  // Moves from the start, joined by spaces -> the position they lead to
+  private reached = new Map<string, { fen: string; san: string }>();
+
+  add(line: BookLine): void {
+    let path = "";
+    let fen = STARTING_FEN;
+    // A board at `fen`, made only when a move must actually be played
+    let chess: Chess | null = null;
     for (const san of line.moves) {
-      const key = positionKey(chess.fen());
-      let moves = book.get(key);
-      if (!moves) book.set(key, (moves = new Map()));
-      let move;
-      try {
-        move = chess.move(san);
-      } catch {
-        break; // stored lines are normalised; a bad one just stops here
+      const next = path ? `${path} ${san}` : san;
+      let step = this.reached.get(next);
+      if (step) {
+        chess = null; // the board would now be behind; made again from the FEN if needed
+      } else {
+        chess ??= new Chess(fen);
+        let move;
+        try {
+          move = chess.move(san);
+        } catch {
+          break; // stored lines are normalised; a bad one just stops here
+        }
+        step = { fen: chess.fen(), san: move.san };
+        this.reached.set(next, step);
       }
-      const entry = moves.get(move.san) ?? { lineIds: [], lineNames: [] };
+
+      const key = positionKey(fen);
+      let moves = this.book.get(key);
+      if (!moves) this.book.set(key, (moves = new Map()));
+      const entry = moves.get(step.san) ?? { lineIds: [], lineNames: [] };
       if (!entry.lineIds.includes(line.id)) {
         entry.lineIds.push(line.id);
         entry.lineNames.push(line.name);
       }
-      moves.set(move.san, entry);
+      moves.set(step.san, entry);
+      path = next;
+      fen = step.fen;
     }
   }
-  return book;
+}
+
+/** Every position the lines pass through, with the moves played from it. */
+export function buildBook(lines: BookLine[]): Book {
+  const builder = new BookBuilder();
+  for (const line of lines) builder.add(line);
+  return builder.book;
+}
+
+/** Result tokens that end PGN movetext. */
+const PGN_RESULT = /^(1-0|0-1|1\/2-1\/2|\*)$/;
+
+/**
+ * The moves of a stored game, in SAN, read from its PGN text without
+ * replaying it (checkGame plays them, once). Stored PGNs are written by the
+ * server (appendToPgn, chess.js's pgn()): tag lines, then "1. e4 e5 2. Nf3 *".
+ * Comments, variations, annotations and NAGs are skipped as well, in case a
+ * PGN has them. A game set up from another position has no moves here (the
+ * repertoire starts from the standard one). At most `max` moves are read:
+ * checkGame never looks further than a line can be long.
+ */
+export function pgnSans(pgn: string, max = Infinity): string[] {
+  // The tag pairs, one per line
+  const tags = pgn.match(/^\s*\[.*\]\s*$/gm) ?? [];
+  if (tags.some((tag) => /^\s*\[\s*(FEN|SetUp)\s/.test(tag))) return [];
+  let text = pgn
+    .replace(/^\s*\[.*\]\s*$/gm, " ")
+    .replace(/\{[^}]*\}/g, " ") // {comments}
+    .replace(/;[^\n]*/g, " "); // comments to the end of the line
+  // (Variations), which can be nested: innermost first
+  for (let previous = ""; previous !== text; ) {
+    previous = text;
+    text = text.replace(/\([^()]*\)/g, " ");
+  }
+
+  const sans: string[] = [];
+  for (const token of text.split(/\s+/)) {
+    if (sans.length >= max) break;
+    // A move number ("12." or "12...") may be written against its move ("12.e4")
+    const move = token.replace(/^\d+\.+/, "").replace(/[!?]+$/, "");
+    if (!move || move.startsWith("$")) continue;
+    if (PGN_RESULT.test(move)) break;
+    sans.push(move);
+  }
+  return sans;
 }
 
 export type GameCheckStatus =

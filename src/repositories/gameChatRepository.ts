@@ -17,7 +17,10 @@ export const CHAT_MAX_PER_PLAYER = 100;
  * parameter; message text is never part of the SQL.
  */
 export const gameChatRepository = {
-  /** The players of a live game (not a bot game), what each allows, and whether they are friends. */
+  /**
+   * The players of a live game (not a bot game), what each allows, whether
+   * they are friends, and whether either has blocked the other.
+   */
   async access(db: Queryable, gameId: number): Promise<ChatAccess | null> {
     const { rows } = await db.query<ChatAccess>(
       `SELECT g."whiteId", g."blackId", g.status, g."endedAt",
@@ -27,7 +30,11 @@ export const gameChatRepository = {
            SELECT 1 FROM friends f
            WHERE LEAST(f."userOneId", f."userTwoId") = LEAST(g."whiteId", g."blackId")
              AND GREATEST(f."userOneId", f."userTwoId") = GREATEST(g."whiteId", g."blackId")
-         ) AS "areFriends"
+         ) AS "areFriends",
+         EXISTS (SELECT 1 FROM user_blocks b WHERE b."blockerId" = g."whiteId" AND b."blockedId" = g."blackId")
+           AS "whiteBlockedBlack",
+         EXISTS (SELECT 1 FROM user_blocks b WHERE b."blockerId" = g."blackId" AND b."blockedId" = g."whiteId")
+           AS "blackBlockedWhite"
        FROM games g
        LEFT JOIN user_settings ws ON ws."userId" = g."whiteId"
        LEFT JOIN user_settings bs ON bs."userId" = g."blackId"

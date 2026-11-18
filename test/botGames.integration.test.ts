@@ -2,6 +2,8 @@ import { after, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type { FastifyInstance } from "fastify";
 import { connect, createUser, integrationEnabled, resetDb, startTestApp } from "./helpers.js";
+import { BOT_GAMES_PER_DAY } from "../src/services/gameService.js";
+import { MAX_BOT_GAME_PGN_LENGTH } from "../src/game/botGame.js";
 
 describe("bot games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_REDIS_URL not set" }, () => {
   let app: FastifyInstance;
@@ -79,6 +81,9 @@ describe("bot games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_R
     const history = await request(player.clerkId, "GET", `/users/${player.id}/games`);
     assert.equal(history.body.pagination.total, 1);
     assert.equal(history.body.data[0].id, game.id);
+    // Counted in the history total kept on the user (migration 030)
+    const { rows: counted } = await app.pg.query(`SELECT "listedGames" FROM users WHERE id = $1`, [player.id]);
+    assert.equal(counted[0].listedGames, 1);
 
     // Nothing rating-related moves
     assert.deepEqual(await userRow(player.id), before);
@@ -122,6 +127,33 @@ describe("bot games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_R
 
     const { rows } = await app.pg.query(`SELECT COUNT(*)::int AS n FROM games`);
     assert.equal(rows[0].n, 0);
+  });
+
+  test("one player can save only so many bot games a day", async () => {
+    const game = { botId: "club-bot", color: "white", pgn: "1. e4 e5", endReason: "resignation" };
+    await app.redis.set(`botgames:saved:${player.id}`, String(BOT_GAMES_PER_DAY - 1), {
+      expiration: { type: "EX", value: 3600 },
+    });
+    assert.equal((await save(game)).status, 201);
+    const refused = await save(game);
+    assert.equal(refused.status, 429);
+    assert.equal(refused.body.code, "BOT_GAME_LIMIT");
+    const { rows } = await app.pg.query(`SELECT COUNT(*)::int AS n FROM games`);
+    assert.equal(rows[0].n, 1);
+    // Someone else's allowance is their own
+    const other = await createUser(app, "otherfan");
+    assert.equal((await save(game, other.clerkId)).status, 201);
+  });
+
+  test("a PGN over the size limit is refused before it is read", async () => {
+    const tooLong = await save({
+      botId: "club-bot",
+      color: "white",
+      pgn: "1. e4 e5 ".padEnd(MAX_BOT_GAME_PGN_LENGTH + 1, " "),
+      endReason: "resignation",
+    });
+    assert.equal(tooLong.status, 400);
+    assert.equal(tooLong.body.code, "VALIDATION_ERROR");
   });
 
   test("a bot game can't be opened as a live game", async () => {

@@ -16,6 +16,12 @@ export interface Game {
   /** Starting clock in seconds; null for bot games, which are untimed */
   time: number | null;
   increment: number;
+  /**
+   * Each side's starting clock in seconds when they differ (time odds,
+   * migration 027); `time` is then the longer one. Null for an even game.
+   */
+  whiteTime: number | null;
+  blackTime: number | null;
   /** Null on the bot's side of a bot game (and only there) */
   whiteId: number | null;
   blackId: number | null;
@@ -42,12 +48,22 @@ export interface Game {
   blackRatingChange: number | null;
   /** The computer opponent (src/game/bots.ts) when this is a bot game */
   botId: string | null;
-  /** False for bot games: they never change ratings or stats */
+  /** False for bot games and games with time odds: they never change ratings or stats */
   rated: boolean;
   /** Set when the game is part of a friend series (migration 016) */
   seriesId: number | null;
   /** 1-based number of the game within its series */
   seriesGame: number | null;
+  /** What is left of each player's lag allowance (src/game/clock.ts, migration 029) */
+  whiteLagBudgetMs: number;
+  blackLagBudgetMs: number;
+  /** Set while the game is paused for a server shutdown (migration 029) */
+  pausedAt: Date | null;
+  /** The player whose draw offer was declined; they can't offer again until they move */
+  drawDeclinedFor: number | null;
+  /** Whether each player has used their one rematch request */
+  whiteRematchAsked: boolean;
+  blackRematchAsked: boolean;
 }
 
 /**
@@ -80,6 +96,9 @@ export interface GameResponse {
   /** Null for bot games (untimed) */
   time: number | null;
   increment: number;
+  /** Each side's starting clock when they differ (time odds); null otherwise */
+  whiteTime: number | null;
+  blackTime: number | null;
   /** Null for bot games (untimed) */
   type: TimeControl | null;
   status: GameStatus;
@@ -129,6 +148,9 @@ export interface LiveGameSummary {
   startedAt: Date;
   time: number;
   increment: number;
+  /** Each side's starting clock when they differ (time odds); null otherwise */
+  whiteTime: number | null;
+  blackTime: number | null;
   type: TimeControl;
   numMoves: number;
   fen: string | null;

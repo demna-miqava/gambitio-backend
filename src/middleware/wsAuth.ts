@@ -52,6 +52,16 @@ export function selectWsProtocol(protocols: Set<string>): string | false {
  * keepAuthenticated in realtime/socket.ts.
  */
 export async function wsAuthHook(request: FastifyRequest, reply: FastifyReply) {
+  // A plain GET or HEAD (no Upgrade: websocket; @fastify/websocket sets
+  // request.ws) never becomes a socket: it must not take one of the user's
+  // socket slots, which it would hold for as long as its keep-alive
+  // connection stays open
+  if (!request.ws) {
+    return reply
+      .status(426)
+      .header("upgrade", "websocket")
+      .send({ error: "WebSocket upgrade required", code: "UPGRADE_REQUIRED" });
+  }
   const token = wsHandshakeToken(request.headers);
   const clerkId = token ? await request.server.authProvider.verifyToken(token) : null;
   if (!clerkId) {
@@ -65,9 +75,21 @@ export async function wsAuthHook(request: FastifyRequest, reply: FastifyReply) {
       .send({ error: "Profile setup required", code: "PROFILE_SETUP_REQUIRED" });
   }
 
-  if (request.server.hub.userSocketCount(user.id) >= MAX_SOCKETS_PER_USER) {
+  // The slot is taken here, not when the socket attaches, so a burst of
+  // handshakes can't all pass this check before any of them is counted. It
+  // is given back when the connection closes: a refused or failed upgrade,
+  // a socket the route closes before attaching it, or the socket's own end.
+  const release = request.server.hub.reserveSocketSlot(user.id, MAX_SOCKETS_PER_USER);
+  if (!release) {
     return reply.status(429).send({ error: "Too many open connections", code: "TOO_MANY_SOCKETS" });
   }
+  const connection = request.raw.socket;
+  if (!connection || connection.destroyed) {
+    // Gone while we were verifying the token
+    release();
+    return reply.status(400).send({ error: "Connection closed", code: "CONNECTION_CLOSED" });
+  }
+  connection.once("close", release);
 
   request.wsUser = { ...user, clerkId };
 }

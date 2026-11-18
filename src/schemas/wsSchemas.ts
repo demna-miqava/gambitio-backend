@@ -63,6 +63,9 @@ export const notificationClientMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("challenge_sent"),
     data: timeSettingsSchema.extend({
       challengedId: userId,
+      // Time odds: the challenged player's clock, when it differs from the
+      // challenger's (`time`). Such a game is unrated (migration 027)
+      opponentTime: z.number().int().min(TIME_LIMITS.minTime).max(TIME_LIMITS.maxTime).optional(),
       color: z.enum(["white", "black", "random"]),
       // 3 or 5 plays a series (see migration 016)
       bestOf: z.union([z.literal(1), z.literal(3), z.literal(5)]).default(1),
@@ -72,7 +75,16 @@ export const notificationClientMessageSchema = z.discriminatedUnion("type", [
     }),
   }),
   z.object({ type: z.literal("challenge_declined"), data: z.object({ challengerId: userId }) }),
-  z.object({ type: z.literal("challenge_accepted"), data: z.object({ challengerId: userId }) }),
+  z.object({
+    type: z.literal("challenge_accepted"),
+    data: z.object({
+      challengerId: userId,
+      // The version of the challenge the player saw (challenge_received,
+      // GET /api/challenges). If the challenger changed the terms since, the
+      // accept is refused with CHALLENGE_CHANGED. Older clients leave it out.
+      version: z.number().int().min(1).max(2_147_483_647).nullish(),
+    }),
+  }),
   z.object({ type: z.literal("challenge_cancelled"), data: z.object({ challengedId: userId }) }),
 ]);
 export type NotificationClientMessage = z.infer<typeof notificationClientMessageSchema>;

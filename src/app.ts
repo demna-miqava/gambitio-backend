@@ -1,3 +1,4 @@
+import { isIPv4, isIPv6 } from "node:net";
 import fastify, { type FastifyError, type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
@@ -15,6 +16,7 @@ import { ChallengeService } from "./services/challengeService.js";
 import { SeriesService } from "./services/seriesService.js";
 import { StudyService } from "./services/studyService.js";
 import { GameChatService } from "./services/gameChatService.js";
+import { ModerationService } from "./services/moderationService.js";
 import { PushService, webPushSender, type PushSender } from "./services/pushService.js";
 import { createJobs } from "./jobs.js";
 import { UserLookup } from "./plugins/userLookup.js";
@@ -35,6 +37,7 @@ import { repertoireRoutes } from "./routes/repertoire.js";
 import { studyRoutes } from "./routes/study.js";
 import { endgameRoutes } from "./routes/endgames.js";
 import { pushRoutes } from "./routes/push.js";
+import { moderationRoutes } from "./routes/moderation.js";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -46,6 +49,7 @@ declare module "fastify" {
     series: SeriesService;
     study: StudyService;
     gameChat: GameChatService;
+    moderation: ModerationService;
     push: PushService;
     jobs: ReturnType<typeof createJobs>;
     users: UserLookup;
@@ -73,10 +77,46 @@ export function clientIp(req: { ip: string; headers: Record<string, string | str
 }
 
 /**
+ * The address a rate limit counts against. IPv4 addresses (and IPv4-mapped
+ * IPv6 ones, ::ffff:1.2.3.4) count one by one. IPv6 addresses count by their
+ * /64 prefix: that is the smallest block a home or phone connection is given,
+ * and anyone holding one can pick a fresh address from it for every request,
+ * so counting exact addresses would give them a new bucket each time. A
+ * value that isn't an address at all is used as it is.
+ */
+export function rateLimitAddress(ip: string): string {
+  const address = ip.trim().toLowerCase().replace(/%.*$/, "");
+  if (isIPv4(address)) return address;
+  if (!isIPv6(address)) return address;
+  const hextets = expandIPv6(address);
+  if (hextets.slice(0, 5).every((h) => h === 0) && hextets[5] === 0xffff) {
+    const [hi, lo] = [hextets[6]!, hextets[7]!];
+    return `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+  }
+  return `${hextets.slice(0, 4).map((h) => h.toString(16)).join(":")}::/64`;
+}
+
+/** The eight 16-bit groups of a valid IPv6 address, "::" and a dotted IPv4 tail expanded. */
+function expandIPv6(address: string): number[] {
+  let text = address;
+  const dotted = /(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(text);
+  if (dotted) {
+    const [a, b, c, d] = dotted.slice(1).map(Number) as [number, number, number, number];
+    text = `${text.slice(0, dotted.index)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const [head, tail] = text.split("::") as [string, string | undefined];
+  const parse = (part: string | undefined) => (part ? part.split(":").map((h) => parseInt(h, 16)) : []);
+  const left = parse(head);
+  const right = parse(tail);
+  const zeros = tail === undefined ? [] : new Array<number>(8 - left.length - right.length).fill(0);
+  return [...left, ...zeros, ...right];
+}
+
+/**
  * The `sub` claim of the caller's session token (bearer header or the
- * WebSocket handshake), read WITHOUT verifying the token. Only for rate-limit
- * keys, where it is always paired with the IP: a forged token then only
- * splits the forger's own traffic, it can't drain someone else's bucket.
+ * WebSocket handshake), read WITHOUT verifying the token. No longer used for
+ * rate-limit keys (they are verified ids now, see rateLimitKey); kept for
+ * code and tests that read it.
  */
 export function unverifiedSubject(req: {
   headers: Record<string, string | string[] | undefined>;
@@ -98,9 +138,37 @@ export function unverifiedSubject(req: {
 }
 
 /**
- * Requests per minute one IP may make in total, whatever tokens it sends.
- * The per-user limit (300/min) is the one people normally meet; this only
- * bounds a single address flooding with made-up tokens. Counted per instance.
+ * The key a request's rate limit (300/min, or a route's own) counts
+ * against: the signed-in user when authentication succeeded, otherwise the
+ * caller's address (rateLimitAddress). The limiter runs as a preHandler, after
+ * the route's own preHandler (authMiddleware, clerkAuthMiddleware) or
+ * preValidation (wsAuthHook) has verified the token, so the key can never be
+ * a claim the caller made up: made-up tokens can neither split one person's
+ * traffic over many buckets nor fill the limiter's memory with fake users and
+ * push real users' counters out. Requests whose token fails verification are
+ * answered 401 before the limiter and are bounded by the per-address limit.
+ */
+export function rateLimitKey(req: {
+  ip: string;
+  headers: Record<string, string | string[] | undefined>;
+  user?: { id: number } | undefined;
+  wsUser?: { id: number } | undefined;
+  clerkId?: string | undefined;
+}): string {
+  const userId = req.user?.id ?? req.wsUser?.id;
+  if (userId !== undefined) return `user:${userId}`;
+  // Signed in with Clerk, no profile yet (profile setup)
+  if (req.clerkId) return `clerk:${req.clerkId}`;
+  return `ip:${rateLimitAddress(clientIp(req))}`;
+}
+
+/**
+ * Requests per minute one address (an IPv4 address or an IPv6 /64, see
+ * rateLimitAddress) may make in total, whatever tokens it sends. Counted
+ * before anything else, so it also covers requests that fail
+ * authentication. The per-user limit (300/min) is the one people normally
+ * meet; this bounds one address flooding, and still lets a school or club
+ * behind one address use the site together. Counted per instance.
  */
 const PER_IP_PER_MINUTE = 3_000;
 
@@ -113,8 +181,9 @@ function perIpLimiter() {
       windowStart = now;
       counts = new Map();
     }
-    const n = (counts.get(ip) ?? 0) + 1;
-    counts.set(ip, n);
+    const key = rateLimitAddress(ip);
+    const n = (counts.get(key) ?? 0) + 1;
+    counts.set(key, n);
     return n <= PER_IP_PER_MINUTE;
   };
 }
@@ -168,8 +237,13 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   app.decorate(
     "authProvider",
     options.authProvider ??
-      // Only accept session tokens minted for our own frontend
-      clerkAuthProvider(config.CLERK_SECRET_KEY, isAllowedOrigin)
+      clerkAuthProvider({
+        secretKey: config.CLERK_SECRET_KEY,
+        jwtKey: config.CLERK_JWT_KEY,
+        // Only accept session tokens minted for our own frontend
+        isAuthorizedParty: isAllowedOrigin,
+        log: app.log,
+      })
   );
 
   await app.register(postgres, {
@@ -195,16 +269,14 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
     origin: (origin, callback) => callback(null, origin !== undefined && isAllowedOrigin(origin)),
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   });
-  // Per signed-in user (and IP), so a school or club behind one address
-  // doesn't share a single bucket; anonymous requests are limited per IP
+  // Per signed-in user, so a school or club behind one address doesn't
+  // share a single bucket; anonymous requests are limited per address. Runs
+  // after authentication so the key is a verified id: see rateLimitKey.
   await app.register(rateLimit, {
     max: 300,
     timeWindow: "1 minute",
-    keyGenerator: (req) => {
-      const ip = clientIp(req);
-      const sub = unverifiedSubject(req);
-      return sub ? `${ip}|${sub}` : ip;
-    },
+    hook: "preHandler",
+    keyGenerator: rateLimitKey,
   });
   const ipAllowed = perIpLimiter();
   app.addHook("onRequest", async (req, reply) => {
@@ -224,6 +296,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   app.decorate("series", new SeriesService(app, hub));
   app.decorate("study", new StudyService(app, hub));
   app.decorate("gameChat", new GameChatService(app, hub));
+  app.decorate("moderation", new ModerationService(app, hub));
   const vapid = vapidKeys(config);
   app.decorate(
     "push",
@@ -264,6 +337,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   await app.register(studyRoutes, { prefix: "/api" });
   await app.register(endgameRoutes, { prefix: "/api" });
   await app.register(pushRoutes, { prefix: "/api" });
+  await app.register(moderationRoutes, { prefix: "/api" });
 
   return app;
 }

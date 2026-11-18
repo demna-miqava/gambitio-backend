@@ -9,6 +9,10 @@
  * Lichess stores the position *before* the opponent's last move, and Moves
  * starts with that move. The app expects the solver to move first, so each
  * row is converted: the first move is applied to the FEN and dropped.
+ *
+ * Afterwards the per-theme puzzle counts (puzzle_theme_counts, migration
+ * 031) are counted again; the theme picker reads them. The app caches them
+ * for up to an hour.
  */
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
@@ -33,6 +37,25 @@ export function toSolverFirst(fen: string, uciMoves: string[]) {
 }
 
 const BATCH_SIZE = 1000;
+
+/**
+ * Recounts the puzzles per theme (one pass over the table). In one
+ * transaction, so the theme picker never sees the table half filled.
+ */
+export async function refreshThemeCounts(client: pg.Client | pg.PoolClient): Promise<void> {
+  await client.query("BEGIN");
+  try {
+    await client.query("DELETE FROM puzzle_theme_counts");
+    await client.query(
+      `INSERT INTO puzzle_theme_counts (theme, count)
+       SELECT t, COUNT(*) FROM puzzles, unnest(themes) AS t GROUP BY t`
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  }
+}
 
 async function main() {
   const [file, ...rest] = process.argv.slice(2);
@@ -81,8 +104,10 @@ async function main() {
     if (imported + batch.length >= limit) break;
   }
   await flush();
+  console.log(`\nDone: ${imported} puzzles. Counting themes...`);
+  await refreshThemeCounts(client);
   await client.end();
-  console.log(`\nDone: ${imported} puzzles`);
+  console.log("Theme counts updated");
 }
 
 if (process.argv[1]?.endsWith("import-lichess-puzzles.ts")) {

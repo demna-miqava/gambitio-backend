@@ -251,16 +251,26 @@ describe("puzzles", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_RED
     assert.deepEqual((await list(user.clerkId, { mode: "rated", theme: "mateIn2" })).ids, ["seed06"]);
   });
 
-  test("themes lists every theme with its count, cached", async () => {
+  test("themes lists every theme with its count, counted ahead and cached", async () => {
     const get = () => app.inject({ method: "GET", url: "/api/puzzles/themes", headers: auth(user.clerkId) });
     const res = await get();
     assert.equal(res.statusCode, 200);
+    // Migration 031 (and the import) counted them from the puzzles
     const { rows } = await app.pg.query(
       `SELECT t AS theme, COUNT(*)::int AS count FROM puzzles, unnest(themes) t GROUP BY t ORDER BY count DESC, theme`
     );
     assert.deepEqual(res.json().data, rows);
-    assert.ok(await app.redis.exists("puzzles:themes"));
-    assert.deepEqual((await get()).json().data, rows);
+    assert.ok(await app.redis.exists("puzzles:theme-counts"));
+
+    // Served from the counts table, not by counting the puzzles
+    await app.pg.query(`INSERT INTO puzzle_theme_counts (theme, count) VALUES ('zzTest', 1)`);
+    try {
+      assert.deepEqual((await get()).json().data, rows); // still cached
+      await app.redis.del("puzzles:theme-counts");
+      assert.deepEqual((await get()).json().data, [...rows, { theme: "zzTest", count: 1 }]);
+    } finally {
+      await app.pg.query(`DELETE FROM puzzle_theme_counts WHERE theme = 'zzTest'`);
+    }
   });
 
   test("stats summary includes the puzzle rating card", async () => {
@@ -274,7 +284,9 @@ describe("puzzles", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_RED
       solved: 0,
       delta: 0,
     });
-    await solveSeed06(user.clerkId); // clears the stats cache
+    const gameStats = await app.redis.hGet(`stats:${user.id}`, "summary");
+    assert.ok(gameStats);
+    await solveSeed06(user.clerkId); // clears the cached puzzle card
     assert.deepEqual((await summary()).json().puzzle, {
       rating: 1226,
       highestRating: 1226,
@@ -282,5 +294,7 @@ describe("puzzles", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_RED
       solved: 1,
       delta: 26,
     });
+    // ...and only that: the game stats stay cached
+    assert.equal(await app.redis.hGet(`stats:${user.id}`, "summary"), gameStats);
   });
 });

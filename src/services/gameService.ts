@@ -17,8 +17,15 @@ import type { Outcome } from "../game/engine.js";
 import { replayBotGame } from "../game/botGame.js";
 import { getBotById } from "../game/bots.js";
 import { AppError } from "../errors/AppError.js";
-import { cachedField } from "../utils/cache.js";
-import { STATS_CACHE_SECONDS, statsCacheKey } from "./statsService.js";
+import { withinLimit } from "../utils/rateLimit.js";
+
+/**
+ * Bot games one user can save a day. A bot game takes a few minutes, so 200
+ * is many hours of play, far beyond anyone actually playing; it only stops
+ * a script from filling the games table (at most about 1.6 MB of PGN per
+ * user a day, see MAX_BOT_GAME_PGN_LENGTH).
+ */
+export const BOT_GAMES_PER_DAY = 200;
 
 export function toGameResponse(game: Game): GameResponse {
   return { ...toGameListItem(game), pgn: game.pgn, fen: game.fen };
@@ -32,6 +39,8 @@ export function toGameListItem(game: Omit<Game, "pgn" | "fen">): GameListItem {
     numMoves: game.numMoves,
     time: game.time,
     increment: game.increment,
+    whiteTime: game.whiteTime,
+    blackTime: game.blackTime,
     type: game.time === null ? null : getTimeControl(game.time),
     status: game.status,
     result: game.result,
@@ -57,12 +66,14 @@ export function toGameListItem(game: Omit<Game, "pgn" | "fen">): GameListItem {
   };
 }
 
-export function toLiveGameSummary(game: LiveGame): LiveGameSummary {
+export function toLiveGameSummary(game: Omit<LiveGame, "pgn">): LiveGameSummary {
   return {
     id: game.id,
     startedAt: game.createdAt,
     time: game.time,
     increment: game.increment,
+    whiteTime: game.whiteTime,
+    blackTime: game.blackTime,
     type: getTimeControl(game.time),
     numMoves: game.numMoves,
     fen: game.fen,
@@ -111,6 +122,10 @@ export function matchFoundData(game: LiveGame, userId: number) {
     rating: isWhite ? game.whiteRating : game.blackRating,
     time: game.time,
     increment: game.increment,
+    // Each player's own starting clock when they differ (time odds)
+    ownTime: isWhite ? game.whiteTime : game.blackTime,
+    opponentTime: isWhite ? game.blackTime : game.whiteTime,
+    rated: game.rated,
   };
 }
 
@@ -131,14 +146,13 @@ export class GameService {
     const normalizedLimit = Math.min(Math.max(1, limit), 100);
     const offset = (normalizedPage - 1) * normalizedLimit;
     const games = await gameRepository.findPageByUserId(this.fastify.pg, userId, normalizedLimit, offset);
-    // A short first page is the whole history; otherwise the count comes
-    // from the stats cache, which is cleared whenever one of the user's games
-    // ends (a game that just started may be missing from it for a minute)
+    // A short first page is the whole history; otherwise the count is the
+    // user's "listedGames" counter (migration 030) plus their game in
+    // progress, two index lookups however long the history is
     const total =
       normalizedPage === 1 && games.length < normalizedLimit
         ? games.length
-        : await cachedField(this.fastify.redis, this.fastify.log, statsCacheKey(userId), "gamesTotal",
-            STATS_CACHE_SECONDS, () => gameRepository.countByUserId(this.fastify.pg, userId));
+        : await gameRepository.countByUserId(this.fastify.pg, userId);
     return {
       data: games.map(toGameListItem),
       pagination: {
@@ -163,42 +177,133 @@ export class GameService {
   ): Promise<GameResponse> {
     const bot = getBotById(input.botId);
     if (!bot) throw new AppError("Unknown bot", "UNKNOWN_BOT", 400);
+    // Counted before the replay, so the cap also bounds the work spent on
+    // uploads that turn out to be invalid
+    const allowed = await withinLimit(
+      this.fastify.redis,
+      `botgames:saved:${userId}`,
+      BOT_GAMES_PER_DAY,
+      24 * 60 * 60
+    );
+    if (!allowed) {
+      throw new AppError(
+        "You've saved a lot of bot games today. Try again tomorrow.",
+        "BOT_GAME_LIMIT",
+        429
+      );
+    }
     const replayed = replayBotGame(input.pgn, input.color, input.endReason);
 
-    const { rows } = await this.fastify.pg.query<{
-      username: string;
-      avatarUrl: string | null;
-      rating: number;
-    }>(`SELECT username, "avatarUrl", "blitzRating" AS rating FROM users WHERE id = $1`, [userId]);
-    const user = rows[0];
-    if (!user) throw new AppError("User not found", "USER_NOT_FOUND", 404);
+    const game = await this.fastify.pg.transact(async (tx) => {
+      // Reads the user and counts the game in their history (migration 030)
+      // in one statement; the insert below commits with it
+      const { rows } = await tx.query<{ username: string; avatarUrl: string | null; rating: number }>(
+        `UPDATE users SET "listedGames" = "listedGames" + 1 WHERE id = $1
+         RETURNING username, "avatarUrl", "blitzRating" AS rating`,
+        [userId]
+      );
+      const user = rows[0];
+      if (!user) throw new AppError("User not found", "USER_NOT_FOUND", 404);
 
-    const isWhite = input.color === "white";
-    const { result } = replayed.outcome;
-    const playerWon = result === (isWhite ? "white_win" : "black_win");
-    const game = await gameRepository.insertFinishedBotGame(this.fastify.pg, {
-      botId: bot.id,
-      whiteId: isWhite ? userId : null,
-      blackId: isWhite ? null : userId,
-      whiteUsername: isWhite ? user.username : bot.name,
-      blackUsername: isWhite ? bot.name : user.username,
-      whiteRating: isWhite ? user.rating : bot.rating,
-      blackRating: isWhite ? bot.rating : user.rating,
-      whiteAvatarUrl: isWhite ? user.avatarUrl : null,
-      blackAvatarUrl: isWhite ? null : user.avatarUrl,
-      pgn: replayed.pgn,
-      fen: replayed.fen,
-      numMoves: replayed.numMoves,
-      result,
-      endReason: replayed.outcome.reason,
-      // The bot has no user id, so a bot win has no winnerId, like a draw;
-      // result tells them apart
-      winnerId: playerWon ? userId : null,
+      const isWhite = input.color === "white";
+      const { result } = replayed.outcome;
+      const playerWon = result === (isWhite ? "white_win" : "black_win");
+      return gameRepository.insertFinishedBotGame(tx, {
+        botId: bot.id,
+        whiteId: isWhite ? userId : null,
+        blackId: isWhite ? null : userId,
+        whiteUsername: isWhite ? user.username : bot.name,
+        blackUsername: isWhite ? bot.name : user.username,
+        whiteRating: isWhite ? user.rating : bot.rating,
+        blackRating: isWhite ? bot.rating : user.rating,
+        whiteAvatarUrl: isWhite ? user.avatarUrl : null,
+        blackAvatarUrl: isWhite ? null : user.avatarUrl,
+        pgn: replayed.pgn,
+        fen: replayed.fen,
+        numMoves: replayed.numMoves,
+        result,
+        endReason: replayed.outcome.reason,
+        // The bot has no user id, so a bot win has no winnerId, like a draw;
+        // result tells them apart
+        winnerId: playerWon ? userId : null,
+      });
     });
-    // The game history count is cached with the stats
-    await this.fastify.redis.del(statsCacheKey(userId)).catch(() => {});
     return toGameResponse(game);
   }
+}
+
+/** What creating a game needs to know about a player, read under their row lock. */
+export interface LockedPlayer {
+  id: number;
+  username: string;
+  avatarUrl: string | null;
+  bulletRating: number;
+  blitzRating: number;
+  rapidRating: number;
+}
+
+/**
+ * Locks players' rows for the rest of the transaction and reads them, in one
+ * round trip. Rows are locked in id order, the order every path that locks
+ * two players takes (finishGame too), so two transactions locking the same
+ * pair wait for each other instead of deadlocking. Deleted accounts (clerkId
+ * cleared) are left out: the clerkId condition is checked again on a row an
+ * account deletion changed while we waited for its lock.
+ */
+export async function lockPlayers(tx: Queryable, ids: number[]): Promise<Map<number, LockedPlayer>> {
+  const { rows } = await tx.query<LockedPlayer>(
+    `SELECT id, username, "avatarUrl", "bulletRating", "blitzRating", "rapidRating"
+     FROM users WHERE id = ANY($1) AND "clerkId" IS NOT NULL
+     ORDER BY id FOR UPDATE`,
+    [ids]
+  );
+  return new Map(rows.map((row) => [row.id, row]));
+}
+
+/**
+ * The game each of these players has in progress, if any, in one query
+ * (each side uses its partial index on games in progress). Must run after
+ * the players' rows are locked (lockPlayers) to be reliable: a game created
+ * by a transaction that held the locks first is then visible.
+ */
+export async function findActiveGames(tx: Queryable, ids: number[]): Promise<Map<number, number>> {
+  const { rows } = await tx.query<{ id: number; whiteId: number; blackId: number }>(
+    `SELECT id, "whiteId", "blackId" FROM games
+     WHERE status = 'in_progress' AND ("whiteId" = ANY($1) OR "blackId" = ANY($1))`,
+    [ids]
+  );
+  const active = new Map<number, number>();
+  for (const game of rows) {
+    for (const playerId of [game.whiteId, game.blackId]) {
+      if (ids.includes(playerId)) active.set(playerId, game.id);
+    }
+  }
+  return active;
+}
+
+/**
+ * Locks both players (lockPlayers) and checks neither is in a game: what
+ * createGame does unless the caller has done it already. Throws
+ * USER_NOT_FOUND for a deleted account and AlreadyInGameError for a player
+ * with a game in progress.
+ */
+export async function lockPlayersForNewGame(
+  tx: Queryable,
+  whiteId: number,
+  blackId: number
+): Promise<Map<number, LockedPlayer>> {
+  const players = await lockPlayers(tx, [whiteId, blackId]);
+  // A deleted account can still have a queue row or an open challenge for a
+  // moment; it must not end up in a new game
+  if (!players.has(whiteId) || !players.has(blackId)) {
+    throw new AppError("Player not found", "USER_NOT_FOUND", 404);
+  }
+  const active = await findActiveGames(tx, [whiteId, blackId]);
+  for (const userId of [whiteId, blackId]) {
+    const activeGameId = active.get(userId);
+    if (activeGameId !== undefined) throw new AlreadyInGameError(activeGameId);
+  }
+  return players;
 }
 
 /**
@@ -206,59 +311,57 @@ export class GameService {
  * games are created: matchmaking, accepted challenges and rematches all come
  * through here. Ratings and avatars are read from the users table, never from
  * client input.
+ *
+ * Both players are locked first (lockPlayersForNewGame) so two transactions
+ * creating a game for the same player at once (a challenge accepted while
+ * matchmaking pairs them) run one after the other: the second then sees the
+ * first's game and fails instead of putting the player in two games. A
+ * caller that has already done exactly that in this transaction passes the
+ * rows it read as `locked`, and nothing is locked or checked again.
  */
 export async function createGame(
   tx: Queryable,
   params: {
     whiteId: number;
     blackId: number;
+    /** The longer clock when the game has time odds */
     time: number;
     increment: number;
+    /** Time odds: each side's starting clock (seconds). Makes the game unrated. */
+    odds?: { whiteTime: number; blackTime: number } | null;
     /** The series this game belongs to, and its number in it */
     series?: { id: number; game: number };
-  }
+  },
+  options: {
+    /**
+     * Both players' rows, already locked with lockPlayers in this
+     * transaction, with neither found in a game (findActiveGames) after the
+     * lock was taken
+     */
+    locked?: Map<number, LockedPlayer>;
+  } = {}
 ): Promise<LiveGame> {
   const { whiteId, blackId, time, increment, series } = params;
-  // Lock both players (in id order, matching finishGame) so two transactions
-  // creating a game for the same player at once (a challenge accepted while
-  // matchmaking pairs them) run one after the other: the second then sees the
-  // first's game below and fails instead of putting the player in two games.
-  await tx.query(`SELECT 1 FROM users WHERE id = ANY($1) ORDER BY id FOR UPDATE`, [
-    [whiteId, blackId],
-  ]);
-  for (const userId of [whiteId, blackId]) {
-    const activeGameId = await gameRepository.findActiveGameIdForUser(tx, userId);
-    if (activeGameId !== null) throw new AlreadyInGameError(activeGameId);
-  }
-
-  const col = ratingColumns(getTimeControl(time)).rating;
-  const { rows } = await tx.query<{
-    id: number;
-    username: string;
-    avatarUrl: string | null;
-    rating: number;
-  }>(`SELECT id, username, "avatarUrl", "${col}" AS rating FROM users WHERE id = ANY($1)
-        AND "clerkId" IS NOT NULL`, [
-    [whiteId, blackId],
-  ]);
-  const white = rows.find((r) => r.id === whiteId);
-  const black = rows.find((r) => r.id === blackId);
-  // A deleted account (clerkId cleared) can still have a queue row or an open
-  // challenge for a moment; it must not end up in a new game
+  const odds = params.odds && params.odds.whiteTime !== params.odds.blackTime ? params.odds : null;
+  const players = options.locked ?? (await lockPlayersForNewGame(tx, whiteId, blackId));
+  const white = players.get(whiteId);
+  const black = players.get(blackId);
   if (!white || !black) throw new AppError("Player not found", "USER_NOT_FOUND", 404);
 
+  const col = ratingColumns(getTimeControl(time)).rating;
   const now = Date.now();
   return gameRepository.insert(tx, {
     whiteId,
     blackId,
     whiteUsername: white.username,
     blackUsername: black.username,
-    whiteRating: white.rating,
-    blackRating: black.rating,
+    whiteRating: white[col],
+    blackRating: black[col],
     whiteAvatarUrl: white.avatarUrl,
     blackAvatarUrl: black.avatarUrl,
-    time,
+    time: odds ? Math.max(odds.whiteTime, odds.blackTime) : time,
     increment,
+    odds,
     lastMoveAt: new Date(now),
     deadlineAt: new Date(now + FIRST_MOVE_TIMEOUT_MS),
     seriesId: series?.id ?? null,
@@ -271,7 +374,8 @@ export async function createGame(
  * Returns null if the game was already finished, so ending twice (both
  * clients claiming a timeout, resign after checkmate, ...) is a no-op.
  *
- * Rating deltas are computed from the ratings at game start, then added to the
+ * Unrated games (time odds) change no ratings. For rated ones, the deltas
+ * are computed from the ratings at game start, then added to the
  * players' current ratings, so concurrent games don't overwrite each other.
  * The stored and reported change is what was actually applied (it differs
  * from the computed delta when the rating floor kicks in).
@@ -288,37 +392,46 @@ export async function finishGame(
     outcome.result === "white_win" ? game.whiteId : outcome.result === "black_win" ? game.blackId : null;
 
   let ratingChanges: RatingChanges | null = null;
-  if (outcome.result !== "aborted") {
+  // An aborted game isn't listed in either player's history and changes
+  // nothing about them. Any other finished game is counted in "listedGames"
+  // (migration 030); an unrated one (time odds) leaves ratings and the
+  // per-time-control game counters alone.
+  if (outcome.result !== "aborted" && game.rated) {
     const deltas = calculateRatingChanges(game.whiteRating, game.blackRating, outcome.result);
     const { rating, highest, games } = ratingColumns(getTimeControl(game.time));
-    const newRatings = new Map<number, number>();
-    const applied = new Map<number, number>();
-    // Lock users in id order so two games finishing at once can't deadlock
-    for (const [userId, delta] of [
-      [game.whiteId, deltas.whiteRatingChange],
-      [game.blackId, deltas.blackRatingChange],
-    ].sort((a, b) => a[0]! - b[0]!) as [number, number][]) {
-      // The peak also takes the rating before this game, so a row whose peak
-      // fell behind (written by older code, see migration 013) heals itself
-      const { rows } = await tx.query<{ rating: number; previous: number }>(
-        `UPDATE users u SET
-           "${rating}" = GREATEST($3, u."${rating}" + $2),
-           "${highest}" = GREATEST(u."${highest}", u."${rating}", GREATEST($3, u."${rating}" + $2)),
-           "${games}" = u."${games}" + 1
-         FROM (SELECT id, "${rating}" AS previous FROM users WHERE id = $1 FOR UPDATE) old
-         WHERE u.id = old.id
-         RETURNING u."${rating}" AS rating, old.previous`,
-        [userId, delta, RATING_FLOOR]
-      );
-      newRatings.set(userId, rows[0]!.rating);
-      applied.set(userId, rows[0]!.rating - rows[0]!.previous);
-    }
+    // Both players in one statement. The subquery locks them in id order, so
+    // two games finishing at once can't deadlock, and reads the rating
+    // before this game under the lock. The peak also takes that rating, so a
+    // row whose peak fell behind (written by older code, see migration 013)
+    // heals itself.
+    const { rows } = await tx.query<{ id: number; rating: number; previous: number }>(
+      `UPDATE users u SET
+         "${rating}" = GREATEST($5, u."${rating}" + v.delta),
+         "${highest}" = GREATEST(u."${highest}", u."${rating}", GREATEST($5, u."${rating}" + v.delta)),
+         "${games}" = u."${games}" + 1,
+         "listedGames" = u."listedGames" + 1
+       FROM (SELECT id, "${rating}" AS previous FROM users WHERE id = ANY(ARRAY[$1, $3]::int[])
+             ORDER BY id FOR UPDATE) old
+       JOIN (VALUES ($1::int, $2::int), ($3::int, $4::int)) v(id, delta) ON v.id = old.id
+       WHERE u.id = old.id
+       RETURNING u.id, u."${rating}" AS rating, old.previous`,
+      [game.whiteId, deltas.whiteRatingChange, game.blackId, deltas.blackRatingChange, RATING_FLOOR]
+    );
+    const white = rows.find((r) => r.id === game.whiteId)!;
+    const black = rows.find((r) => r.id === game.blackId)!;
     ratingChanges = {
-      whiteRatingChange: applied.get(game.whiteId)!,
-      blackRatingChange: applied.get(game.blackId)!,
-      whiteNewRating: newRatings.get(game.whiteId)!,
-      blackNewRating: newRatings.get(game.blackId)!,
+      whiteRatingChange: white.rating - white.previous,
+      blackRatingChange: black.rating - black.previous,
+      whiteNewRating: white.rating,
+      blackNewRating: black.rating,
     };
+  } else if (outcome.result !== "aborted") {
+    await tx.query(
+      `UPDATE users u SET "listedGames" = u."listedGames" + 1
+       FROM (SELECT id FROM users WHERE id = ANY($1) ORDER BY id FOR UPDATE) old
+       WHERE u.id = old.id`,
+      [[game.whiteId, game.blackId]]
+    );
   }
 
   const finished = await gameRepository.finish(tx, game.id, {

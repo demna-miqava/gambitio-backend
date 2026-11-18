@@ -147,12 +147,44 @@ export function takebackPlies(ply: number, requester: PlayerColor): number | nul
 
 /**
  * Takes back the last `plies` half-moves of `chess` in place, which must be
- * the position after `ply` half-moves. chess.js's pgn() after undo() is in
- * the same format appendToPgn writes.
+ * the position after `pgn` (`ply` half-moves). The new PGN is `pgn` with
+ * those moves cut off (truncatePgn), not chess.pgn(), which replays the
+ * whole game to write it; chess.pgn() is only the fallback for a PGN in
+ * another format (or without `pgn`), and writes the same format.
  */
-export function undoMoves(chess: Chess, ply: number, plies: number): { fen: string; pgn: string; ply: number } {
-  for (let i = 0; i < plies; i++) chess.undo();
-  return { fen: chess.fen(), pgn: chess.pgn(), ply: ply - plies };
+export function undoMoves(
+  chess: Chess,
+  ply: number,
+  plies: number,
+  pgn?: string
+): { fen: string; pgn: string; ply: number } {
+  const undone: string[] = [];
+  for (let i = 0; i < plies; i++) {
+    const move = chess.undo();
+    if (move) undone.unshift(move.san);
+  }
+  const cut = pgn !== undefined && undone.length === plies ? truncatePgn(pgn, ply, undone) : null;
+  return { fen: chess.fen(), pgn: cut ?? chess.pgn(), ply: ply - plies };
+}
+
+/** Space-separated tokens ("1.", "e4", "e5", "2.", ...) for `ply` half-moves in appendToPgn's format */
+const moveTokens = (ply: number) => ply + Math.ceil(ply / 2);
+
+/**
+ * `pgn` (`ply` half-moves, in appendToPgn's format) without its last moves,
+ * which must be `undone` (their SAN, in order); null if it isn't in that
+ * format or the moves don't match, so the caller can fall back to
+ * chess.pgn(). Keeps at least one move: an empty game's PGN is formatted
+ * differently.
+ */
+export function truncatePgn(pgn: string, ply: number, undone: string[]): string | null {
+  const kept = ply - undone.length;
+  if (kept < 1 || !pgn.startsWith(`${PGN_HEADER}\n\n`) || !pgn.endsWith(PGN_TAIL)) return null;
+  const tokens = pgn.slice(PGN_HEADER.length + 2, -PGN_TAIL.length).split(" ");
+  if (tokens.length !== moveTokens(ply)) return null;
+  const removed = tokens.slice(moveTokens(kept)).filter((token) => !/^\d+\.$/.test(token));
+  if (removed.join(" ") !== undone.join(" ")) return null;
+  return `${PGN_HEADER}\n\n${tokens.slice(0, moveTokens(kept)).join(" ")}${PGN_TAIL}`;
 }
 
 /**

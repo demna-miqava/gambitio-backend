@@ -17,7 +17,13 @@ Production: `npm run build && npm start`.
 
 Required env (validated at startup in `src/config.ts`): `POSTGRES_CONNECTION_STRING`,
 `REDIS_URL`, `CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `FRONTEND_URL`, `PORT`.
-Optional: `EXTRA_FRONTEND_ORIGINS`, comma-separated origins allowed besides
+Optional: `CLERK_JWT_KEY`, the Clerk instance's JWT public key (dashboard,
+API keys, "JWT public key": the PEM text; one line with `\n` escapes works
+too). With it, session tokens are verified locally and never cause a call to
+Clerk. Without it the server downloads Clerk's signing keys itself, at most
+once a minute for a token whose key it doesn't know, so made-up tokens can't
+make it call Clerk on every request (`SigningKeys` in
+`src/plugins/authProvider.ts`). `EXTRA_FRONTEND_ORIGINS`, comma-separated origins allowed besides
 `FRONTEND_URL` (e.g. your LAN address, to open the dev server from a phone);
 `PG_POOL_MAX` (Postgres connections, default 15); `PG_STATEMENT_TIMEOUT_MS`
 (longest a query may run, default 5000); `ALLOW_LAN_ORIGINS=true` (local dev
@@ -76,8 +82,10 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
 - `src/game/positionCache.ts` – parsed positions of live games, so a move
   doesn't replay the game from its PGN
 - `src/realtime/hub.ts` – WebSocket delivery (local first, then Redis pub/sub
-  to other instances), presence with one liveness key per instance
-- `src/realtime/socket.ts` – socket message handling, rate limit, session
+  to other instances, skipped while no other instance is running), presence
+  with one liveness key per instance
+- `src/realtime/socket.ts` – socket message handling, rate limits (per
+  socket, and per user across all their sockets on an instance), session
   re-authentication
 - `src/jobs.ts` – backstop sweeps that only run while there's something to
   do; games end at their deadline through per-game timers
@@ -105,9 +113,13 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
   that chat went off. Messages are deleted an hour after their game ends
 - `src/services/challengeService.ts` – challenges. Who may challenge a player
   is their `challengesAllowedFrom` setting (anyone, friends, no one);
-  challenges to non-friends are rate-limited and have a cooldown after a decline
+  challenges are limited per pair and have a cooldown after a decline, and
+  challenges to non-friends are rate-limited. A challenge has a `version`
+  that changes with its terms; accepting can name it, and a stale one is
+  refused with `CHALLENGE_CHANGED` (migration 030)
 - `src/services/pushService.ts`, `src/routes/push.ts` – web push: browsers
   register a subscription, and challenges, friend requests and game starts
-  are also sent as notifications. Endpoints are only accepted on the
-  browsers' own push services
+  are also sent as notifications, throttled per recipient and deduplicated
+  per kind and sender. Endpoints are only accepted on the browsers' own push
+  services
 - `migrations/` – SQL migrations; `scripts/migrate.ts` applies them

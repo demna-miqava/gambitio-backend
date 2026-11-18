@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { notBlockedSql } from "./blockRepository.js";
 import type {
   Friend,
   FriendRequest,
@@ -58,7 +59,8 @@ export class FriendRepository {
   /**
    * A few users to suggest, starting at a random point in the id range (so
    * different people see different suggestions) and wrapping around. Not
-   * the user, not deleted accounts, not existing friends. Each half is a
+   * the user, not deleted accounts, not existing friends, and nobody on
+   * either side of a block. Each half is a
    * primary-key range scan that stops after `limit` rows.
    */
   async getFriendSuggestions(userId: number, limit: number): Promise<FriendSuggestion[]> {
@@ -66,6 +68,7 @@ export class FriendRepository {
         SELECT id, username, "avatarUrl" FROM users
         WHERE ${range} AND id <> $1 AND "clerkId" IS NOT NULL -- deleted accounts
           AND id NOT IN (SELECT friend_id FROM user_friends)
+          AND ${notBlockedSql("$1", "users.id")}
         ORDER BY id LIMIT $2)`;
     const { rows } = await this.fastify.pg.query<FriendSuggestion>(
       `
@@ -165,8 +168,14 @@ export class FriendRepository {
 
   /**
    * Users whose name contains the query (starts with it, for queries under
-   * three characters), excluding the user and their friends, A to Z. Both
-   * forms can use the trigram index on username (migration 014).
+   * three characters), excluding the user, their friends and players they
+   * have blocked, A to Z. Both forms can use the trigram index on username
+   * (migration 014).
+   *
+   * Someone who blocked the user still shows up: the user can find them on
+   * their profile or in old games anyway, so leaving them out of search
+   * would tell the user they were blocked. A friend request to them is
+   * refused like a cooldown (FriendService), which says nothing either.
    */
   async searchUsers(userId: number, searchQuery: string, limit: number): Promise<FriendSuggestion[]> {
     const escaped = escapeLike(searchQuery);
@@ -182,6 +191,7 @@ export class FriendRepository {
         AND "clerkId" IS NOT NULL -- deleted accounts
         AND username ILIKE $2 ESCAPE '\\'
         AND id NOT IN (SELECT friend_id FROM user_friends)
+        AND NOT EXISTS (SELECT 1 FROM user_blocks ub WHERE ub."blockerId" = $1 AND ub."blockedId" = users.id)
       -- lower(username) is the unique index's order: for a common prefix
       -- Postgres walks it and stops after $3 matches, for a rare one it uses
       -- the trigram index and sorts the few matches

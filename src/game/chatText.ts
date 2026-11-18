@@ -35,18 +35,21 @@ export type CleanedChatText = { ok: true; text: string } | { ok: false; reason: 
 export const chatLength = (text: string): number => [...text].length;
 
 /**
+ * Normalises text (NFC) and removes lone surrogates, invisible and control
+ * characters (see INVISIBLE; tabs and line breaks stay) and excess combining
+ * marks. Also used for other text players write (report details).
+ */
+export function stripInvisibleText(raw: string): string {
+  return raw.replace(LONE_SURROGATES, "").normalize("NFC").replace(INVISIBLE, "").replace(EXCESS_MARKS, "$1");
+}
+
+/**
  * Normalises a message (NFC), removes invisible and control characters,
  * turns every run of whitespace (line breaks included) into one space and
  * trims. Refuses what is then empty or longer than CHAT_MAX_LENGTH.
  */
 export function cleanChatText(raw: string): CleanedChatText {
-  const text = raw
-    .replace(LONE_SURROGATES, "")
-    .normalize("NFC")
-    .replace(INVISIBLE, "")
-    .replace(EXCESS_MARKS, "$1")
-    .replace(/\s+/gu, " ")
-    .trim();
+  const text = stripInvisibleText(raw).replace(/\s+/gu, " ").trim();
   if (!VISIBLE.test(text)) return { ok: false, reason: "empty" };
   if (chatLength(text) > CHAT_MAX_LENGTH) return { ok: false, reason: "too_long" };
   return { ok: true, text };
@@ -54,8 +57,12 @@ export function cleanChatText(raw: string): CleanedChatText {
 
 export type ChatAllowedFrom = "everyone" | "only_friends" | "nobody";
 
-/** Why a game has no chat for a player, or null if it does */
-export type ChatOffReason = "off_by_you" | "off_by_opponent" | "closed";
+/**
+ * Why a game has no chat for a player, or null if it does. "blocked": the
+ * player blocked their opponent. Being blocked reads as "off_by_opponent",
+ * so a block is never revealed to the blocked player.
+ */
+export type ChatOffReason = "off_by_you" | "off_by_opponent" | "blocked" | "closed";
 
 /** How long after a game ends its players can still write */
 export const CHAT_OPEN_AFTER_END_MS = 10 * 60_000;
@@ -68,20 +75,26 @@ export interface ChatAccess {
   whiteAllows: ChatAllowedFrom;
   blackAllows: ChatAllowedFrom;
   areFriends: boolean;
+  /** Blocks between the two players (migration 028) */
+  whiteBlockedBlack?: boolean;
+  blackBlockedWhite?: boolean;
 }
 
 const allows = (setting: ChatAllowedFrom, areFriends: boolean) =>
   setting === "everyone" || (setting === "only_friends" && areFriends);
 
 /**
- * Whether a player can write in their game's chat right now. Both players'
- * settings must allow the other; the chat closes a while after the game.
+ * Whether a player can write in their game's chat right now. Neither may
+ * have blocked the other and both players' settings must allow the other;
+ * the chat closes a while after the game.
  * Call only for one of the two players.
  */
 export function chatOffReason(access: ChatAccess, viewerId: number, now: number): ChatOffReason | null {
   const viewerIsWhite = viewerId === access.whiteId;
   const own = viewerIsWhite ? access.whiteAllows : access.blackAllows;
   const theirs = viewerIsWhite ? access.blackAllows : access.whiteAllows;
+  if (viewerIsWhite ? access.whiteBlockedBlack : access.blackBlockedWhite) return "blocked";
+  if (viewerIsWhite ? access.blackBlockedWhite : access.whiteBlockedBlack) return "off_by_opponent";
   if (!allows(own, access.areFriends)) return "off_by_you";
   if (!allows(theirs, access.areFriends)) return "off_by_opponent";
   if (access.status !== "in_progress") {

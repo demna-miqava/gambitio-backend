@@ -2,7 +2,15 @@ import { after, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type { FastifyInstance } from "fastify";
 import { connect, createUser, integrationEnabled, resetDb, startTestApp, type TestSocket } from "./helpers.js";
-import { isPushServiceEndpoint, timeControlLabel, type StoredSubscription } from "../src/services/pushService.js";
+import https from "node:https";
+import webpush from "web-push";
+import {
+  isPushServiceEndpoint,
+  PUSH_LIMITS,
+  timeControlLabel,
+  webPushSender,
+  type StoredSubscription,
+} from "../src/services/pushService.js";
 import { loadConfig, vapidKeys } from "../src/config.js";
 
 describe("push endpoints", () => {
@@ -40,6 +48,29 @@ describe("push endpoints", () => {
     assert.equal(timeControlLabel(30, 0), "0.5+0");
   });
 
+  test("notifications go out over kept-alive connections", async () => {
+    const calls: any[] = [];
+    const original = webpush.sendNotification;
+    // No push service is contacted: the call is captured instead
+    webpush.sendNotification = (async (...args: any[]) => {
+      calls.push(args);
+      return { statusCode: 201, body: "", headers: {} };
+    }) as typeof webpush.sendNotification;
+    try {
+      const send = webPushSender({ subject: "mailto:x@example.com", publicKey: "pub", privateKey: "priv" });
+      const subscription = { endpoint: "https://fcm.googleapis.com/fcm/send/a", p256dh: "p", auth: "a" };
+      await send(subscription, "{}", 60);
+      await send(subscription, "{}", 60);
+    } finally {
+      webpush.sendNotification = original;
+    }
+    const agents = calls.map((args) => args[2].agent);
+    assert.ok(agents[0] instanceof https.Agent);
+    assert.equal((agents[0] as https.Agent & { keepAlive: boolean }).keepAlive, true);
+    // The same agent (and its open connections) for every notification
+    assert.equal(agents[1], agents[0]);
+  });
+
   test("VAPID keys come as a pair", () => {
     const base = { POSTGRES_CONNECTION_STRING: "postgres://x", CLERK_PUBLISHABLE_KEY: "pk", CLERK_SECRET_KEY: "sk" };
     assert.equal(vapidKeys(loadConfig({ ...base, VAPID_PUBLIC_KEY: "", VAPID_PRIVATE_KEY: "" })), null);
@@ -64,13 +95,15 @@ describe("push notifications", { skip: !integrationEnabled && "TEST_POSTGRES_URL
   const sent: { subscription: StoredSubscription; payload: any; ttl: number }[] = [];
   /** Endpoints the fake push service says are gone */
   const gone = new Set<string>();
+  /** Endpoints the fake push service refuses, with this status */
+  const refusing = new Map<string, number>();
 
   const open = async (path: string, clerkId: string) => {
     const socket = await connect(baseUrl, path, clerkId);
     sockets.push(socket);
     return socket;
   };
-  const call = (method: "GET" | "POST", url: string, clerkId: string, payload?: object) =>
+  const call = (method: "GET" | "POST" | "DELETE", url: string, clerkId: string, payload?: object) =>
     app.inject({
       method,
       url,
@@ -91,6 +124,8 @@ describe("push notifications", { skip: !integrationEnabled && "TEST_POSTGRES_URL
     ({ app, baseUrl } = await startTestApp({
       pushSender: async (subscription, payload, ttl) => {
         if (gone.has(subscription.endpoint)) throw Object.assign(new Error("Gone"), { statusCode: 410 });
+        const refusal = refusing.get(subscription.endpoint);
+        if (refusal) throw Object.assign(new Error("Refused"), { statusCode: refusal });
         sent.push({ subscription, payload: JSON.parse(payload), ttl });
       },
     }));
@@ -103,6 +138,7 @@ describe("push notifications", { skip: !integrationEnabled && "TEST_POSTGRES_URL
     await resetDb(app);
     sent.length = 0;
     gone.clear();
+    refusing.clear();
   });
 
   test("subscribing needs a session and a real push service", async () => {
@@ -203,24 +239,141 @@ describe("push notifications", { skip: !integrationEnabled && "TEST_POSTGRES_URL
     assert.deepEqual(rows.map((r) => r.endpoint), [endpointFor("laptop")]);
   });
 
+  test("FCM subscriptions made for other keys are forgotten; other refusals after a few in a row", async () => {
+    const a = await createUser(app, "alice");
+    await subscribe(a.clerkId, "old-keys");
+    await subscribe(a.clerkId, "flaky");
+    await subscribe(a.clerkId, "busy");
+    refusing.set(endpointFor("old-keys"), 403);
+    refusing.set(endpointFor("flaky"), 400);
+    // A server error is the push service's problem, never the subscription's
+    refusing.set(endpointFor("busy"), 503);
+    const endpoints = async () =>
+      (await app.pg.query<{ endpoint: string }>(`SELECT endpoint FROM push_subscriptions ORDER BY id`)).rows.map(
+        (r) => r.endpoint
+      );
+
+    await app.push.notify(a.id, { title: "t", body: "b", url: "/home", tag: "n1" });
+    assert.deepEqual(await endpoints(), [endpointFor("flaky"), endpointFor("busy")]);
+    // A success in between starts the count again
+    refusing.delete(endpointFor("flaky"));
+    await app.push.notify(a.id, { title: "t", body: "b", url: "/home", tag: "n2" });
+    refusing.set(endpointFor("flaky"), 400);
+    await app.push.notify(a.id, { title: "t", body: "b", url: "/home", tag: "n3" });
+    await app.push.notify(a.id, { title: "t", body: "b", url: "/home", tag: "n4" });
+    assert.deepEqual(await endpoints(), [endpointFor("flaky"), endpointFor("busy")]);
+    await app.push.notify(a.id, { title: "t", body: "b", url: "/home", tag: "n5" });
+    assert.deepEqual(await endpoints(), [endpointFor("busy")]);
+    for (let i = 0; i < 5; i++) await app.push.notify(a.id, { title: "t", body: "b", url: "/home", tag: `m${i}` });
+    assert.deepEqual(await endpoints(), [endpointFor("busy")]);
+  });
+
+  test("a 403 from a push service other than FCM only counts as a failure", async () => {
+    // Apple's service answers 403 when it rejects our VAPID token itself (a
+    // subject it doesn't accept, clock skew): not a reason to drop at once
+    const a = await createUser(app, "alice");
+    const safari = "https://web.push.apple.com/QGuQyavXutnMH-Some-Token";
+    assert.equal((await call("POST", "/api/push/subscriptions", a.clerkId, { endpoint: safari, keys })).statusCode, 201);
+    refusing.set(safari, 403);
+    const stored = async () =>
+      (await app.pg.query<{ failures: number }>(`SELECT failures FROM push_subscriptions WHERE endpoint = $1`, [safari]))
+        .rows[0]?.failures;
+
+    await app.push.notify(a.id, { title: "t", body: "b", url: "/home", tag: "s1" });
+    await app.push.notify(a.id, { title: "t", body: "b", url: "/home", tag: "s2" });
+    assert.equal(await stored(), 2);
+    await app.push.notify(a.id, { title: "t", body: "b", url: "/home", tag: "s3" });
+    assert.equal(await stored(), undefined);
+  });
+
+  test("one notification per kind and sender within the window, and only so many a minute", async () => {
+    const a = await createUser(app, "alice");
+    await subscribe(a.clerkId, "phone");
+    const notify = (tag: string) => app.push.notify(a.id, { title: tag, body: "", url: "/home", tag });
+
+    await notify("challenge-7");
+    await notify("challenge-7");
+    assert.deepEqual(sent.map((s) => s.payload.tag), ["challenge-7"]);
+    // Another sender, or another kind, isn't a duplicate
+    await notify("challenge-8");
+    await notify("friend-request-7");
+    assert.equal(sent.length, 3);
+    // Once the window is over the same one goes again
+    await app.redis.del(`push:sent:${a.id}:challenge-7`);
+    await notify("challenge-7");
+    assert.equal(sent.length, 4);
+
+    // Every kind counts against the per-minute limit
+    for (let i = 0; i < PUSH_LIMITS.RECIPIENT_LIMIT.max; i++) await notify(`game-${i}`);
+    assert.equal(sent.length, PUSH_LIMITS.RECIPIENT_LIMIT.max);
+    // Someone else's devices aren't affected
+    const b = await createUser(app, "bobby");
+    await subscribe(b.clerkId, "bobby-phone");
+    await app.push.notify(b.id, { title: "t", body: "", url: "/home", tag: "game-1" });
+    assert.equal(sent.length, PUSH_LIMITS.RECIPIENT_LIMIT.max + 1);
+
+    // One turned away by the limit doesn't use up its tag: once the minute
+    // is over it still goes out (a friend request's window is a whole day)
+    await app.push.notify(a.id, { title: "t", body: "", url: "/home", tag: "friend-request-9" }, 60, {
+      dedupeSeconds: 24 * 60 * 60,
+    });
+    assert.equal(sent.length, PUSH_LIMITS.RECIPIENT_LIMIT.max + 1);
+    assert.equal(await app.redis.exists(`push:sent:${a.id}:friend-request-9`), 0);
+    await app.redis.del(`push:rate:${a.id}`);
+    await app.push.notify(a.id, { title: "t", body: "", url: "/home", tag: "friend-request-9" }, 60, {
+      dedupeSeconds: 24 * 60 * 60,
+    });
+    assert.equal(sent.at(-1)!.payload.tag, "friend-request-9");
+    assert.equal(sent.length, PUSH_LIMITS.RECIPIENT_LIMIT.max + 2);
+  });
+
+  test("re-sending a challenge or a friend request doesn't notify again", async () => {
+    const a = await createUser(app, "alice");
+    const b = await createUser(app, "bobby");
+    await subscribe(b.clerkId, "bobby");
+    await app.pg.query(`INSERT INTO friends ("userOneId", "userTwoId") VALUES ($1, $2)`, [a.id, b.id]);
+    const na = await open("/notifications", a.clerkId);
+    const nb = await open("/notifications", b.clerkId);
+    const challenge = (time: number) =>
+      na.send({ type: "challenge_sent", data: { challengedId: b.id, color: "white", time, increment: 0 } });
+    challenge(300);
+    await nb.next("challenge_received");
+    challenge(180);
+    await nb.next("challenge_received");
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(sent.length, 1);
+
+    // A friend request after cancelling one isn't announced twice either
+    // (the cooldown after a cancel is lifted here to get that far)
+    const c = await createUser(app, "carol");
+    sent.length = 0;
+    const first = await call("POST", "/api/friend-requests", c.clerkId, { receiverId: b.id });
+    await delivered(1);
+    await call("DELETE", `/api/friend-requests/${first.json().data.id}`, c.clerkId);
+    await app.redis.del(`friendreq:cooldown:${c.id}:${b.id}`);
+    assert.equal((await call("POST", "/api/friend-requests", c.clerkId, { receiverId: b.id })).statusCode, 201);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(sent.length, 1);
+  });
+
   test("a browser belongs to whoever signed in on it last, and can be turned off", async () => {
     const a = await createUser(app, "alice");
     const b = await createUser(app, "bobby");
     await subscribe(a.clerkId, "shared-computer");
     await subscribe(b.clerkId, "shared-computer");
 
-    await app.push.notify(a.id, { title: "for alice", body: "", url: "/home", tag: "x" });
+    await app.push.notify(a.id, { title: "for alice", body: "", url: "/home", tag: "x1" });
     assert.equal(sent.length, 0);
-    await app.push.notify(b.id, { title: "for bobby", body: "", url: "/home", tag: "x" });
+    await app.push.notify(b.id, { title: "for bobby", body: "", url: "/home", tag: "x1" });
     assert.equal(sent.length, 1);
 
     // Only your own subscription can be removed
     sent.length = 0;
     await call("POST", "/api/push/unsubscribe", a.clerkId, { endpoint: endpointFor("shared-computer") });
-    await app.push.notify(b.id, { title: "still bobby's", body: "", url: "/home", tag: "x" });
+    await app.push.notify(b.id, { title: "still bobby's", body: "", url: "/home", tag: "x2" });
     assert.equal(sent.length, 1);
     await call("POST", "/api/push/unsubscribe", b.clerkId, { endpoint: endpointFor("shared-computer") });
-    await app.push.notify(b.id, { title: "off", body: "", url: "/home", tag: "x" });
+    await app.push.notify(b.id, { title: "off", body: "", url: "/home", tag: "x3" });
     assert.equal(sent.length, 1);
   });
 

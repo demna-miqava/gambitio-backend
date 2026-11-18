@@ -5,9 +5,14 @@ import { topics, type RealtimeHub } from "../realtime/hub.js";
 import {
   applyStudyOp,
   createStudyState,
+  nodeCount,
+  ROOT_ID,
+  storedStudyDocument,
+  type StudyChange,
   type StudyOp,
   type StudyState,
 } from "../game/studyState.js";
+import { withinLimit } from "../utils/rateLimit.js";
 
 /** Rooms one player may own. */
 export const MAX_ROOMS_PER_OWNER = 30;
@@ -16,6 +21,30 @@ export const MAX_ROOM_MEMBERS = 20;
 
 /** Redis set of the sockets open on a room; see RealtimeHub.addMembership. */
 export const studyPresenceKey = (roomId: number) => `presence:study:${roomId}`;
+
+/**
+ * Changes that rewrite the stored document (new moves, comments, arrows,
+ * deletes, promotions) one player may make to one room, over all their
+ * sockets and every server instance. Enough to enter a known opening at
+ * speed. Moving around the tree (goto, or a move the tree already has)
+ * isn't counted here: it is one small UPDATE (see apply), and each socket's
+ * own limit (a burst of 20, then 10 a second, see socket.ts) already caps
+ * it, so holding an arrow key down keeps working.
+ */
+export const STUDY_WRITE_LIMIT = { max: 40, windowSeconds: 10 };
+
+/**
+ * The cursor to use with a stored document. The column can name a node
+ * that is no longer there: code from before migration 031 (still running
+ * during a deploy) writes only the document, cursor included, and may have
+ * deleted that node. Then the document's own cursor is used if it is in the
+ * tree, else the root.
+ */
+function cursorIn(state: StudyState, column: string): string {
+  if (Object.hasOwn(state.nodes, column)) return column;
+  const stored = (state as Partial<StudyState>).cursor;
+  return typeof stored === "string" && Object.hasOwn(state.nodes, stored) ? stored : ROOT_ID;
+}
 
 export interface StudyMember {
   id: number;
@@ -39,12 +68,15 @@ export interface StudyRoomListItem extends Omit<StudyRoomMeta, "version"> {
 }
 
 const roomNotFound = () => new AppError("Study room not found", "STUDY_NOT_FOUND", 404);
+const positionGone = () => new AppError("That position is no longer in the study", "INVALID_STUDY_ACTION", 400);
+// Same code as the socket's own limit, which the client already handles
+const tooFast = () => new AppError("Too many changes at once. Wait a moment.", "RATE_LIMITED", 429);
 const notOwner = () => new AppError("Only the room's owner can do that", "NOT_STUDY_OWNER", 403);
 
 /**
- * Shared study rooms. Every change to a room's analysis runs in a
- * transaction holding the room's row lock and bumps its version; messages
- * go out only after it commits. Only members can see or change a room.
+ * Shared study rooms. Every change to a room's analysis (the cursor
+ * included) holds the room's row lock and bumps its version; messages go
+ * out only after it commits. Only members can see or change a room.
  */
 export class StudyService {
   constructor(
@@ -75,12 +107,13 @@ export class StudyService {
   }
 
   async list(userId: number): Promise<StudyRoomListItem[]> {
+    // "nodeCount" is kept with the document, so the documents aren't read here
     const { rows } = await this.fastify.pg.query<
-      Omit<StudyRoomListItem, "moveCount" | "memberCount"> & { memberCount: string; nodeCount: string }
+      Omit<StudyRoomListItem, "moveCount" | "memberCount"> & { memberCount: string; nodeCount: number }
     >(
       `SELECT r.id, r.name, r."ownerId", r."createdAt", r."updatedAt", o.username AS "ownerUsername",
          (SELECT COUNT(*) FROM study_room_members c WHERE c."roomId" = r.id) AS "memberCount",
-         (SELECT COUNT(*) FROM jsonb_object_keys(r.state->'nodes')) AS "nodeCount"
+         r."nodeCount"
        FROM study_room_members m
        JOIN study_rooms r ON r.id = m."roomId"
        JOIN users o ON o.id = r."ownerId"
@@ -92,7 +125,7 @@ export class StudyService {
     return rows.map(({ memberCount, nodeCount, ...room }) => ({
       ...room,
       memberCount: Number(memberCount),
-      moveCount: Math.max(0, Number(nodeCount) - 1),
+      moveCount: Math.max(0, nodeCount - 1),
     }));
   }
 
@@ -116,9 +149,9 @@ export class StudyService {
         );
       }
       const { rows } = await tx.query<StudyRoomMeta>(
-        `INSERT INTO study_rooms ("ownerId", name, state) VALUES ($1, $2, $3::jsonb)
+        `INSERT INTO study_rooms ("ownerId", name, state, cursor, "nodeCount") VALUES ($1, $2, $3::jsonb, $4, $5)
          RETURNING id, name, "ownerId", "createdAt", "updatedAt", version`,
-        [ownerId, input.name.trim(), JSON.stringify(state)]
+        [ownerId, input.name.trim(), storedStudyDocument(state), state.cursor, nodeCount(state)]
       );
       const room = rows[0]!;
       await tx.query(`INSERT INTO study_room_members ("roomId", "userId") VALUES ($1, $2)`, [room.id, ownerId]);
@@ -129,14 +162,15 @@ export class StudyService {
   /** Room, analysis and members, for a member. */
   async get(roomId: number, userId: number) {
     await this.assertMember(roomId, userId);
-    const { rows } = await this.fastify.pg.query<StudyRoomMeta & { state: StudyState }>(
-      `SELECT id, name, "ownerId", "createdAt", "updatedAt", version, state FROM study_rooms WHERE id = $1`,
+    const { rows } = await this.fastify.pg.query<StudyRoomMeta & { state: StudyState; cursor: string }>(
+      `SELECT id, name, "ownerId", "createdAt", "updatedAt", version, state, cursor FROM study_rooms WHERE id = $1`,
       [roomId]
     );
     const row = rows[0];
     if (!row) throw roomNotFound();
-    const { state, ...room } = row;
-    return { room, state, members: await this.members(roomId) };
+    const { state, cursor, ...room } = row;
+    // Sent as one document, as before the cursor had its own column
+    return { room, state: { ...state, cursor: cursorIn(state, cursor) }, members: await this.members(roomId) };
   }
 
   async rename(roomId: number, userId: number, name: string): Promise<StudyRoomMeta> {
@@ -254,25 +288,28 @@ export class StudyService {
 
   /**
    * Applies a change to the room's analysis. Membership is checked in the
-   * same transaction, so someone removed a moment ago can't slip one in.
+   * same statement or transaction, so someone removed a moment ago can't
+   * slip one in.
+   *
+   * Moving around the tree (goto, or a move the tree already has) only
+   * changes the cursor column: one UPDATE that checks in SQL that the node
+   * exists, without reading or rewriting the stored document. Everything
+   * else loads the document under the row lock, applies the op and writes
+   * it back. Both bump the version, so clients see one sequence of changes.
    */
   async apply(roomId: number, userId: number, op: StudyOp): Promise<void> {
-    const outcome = await this.fastify.pg.transact(async (tx) => {
-      const { rows } = await tx.query<{ state: StudyState; version: number }>(
-        `SELECT state, version FROM study_rooms WHERE id = $1 FOR UPDATE`,
-        [roomId]
-      );
-      const room = rows[0];
-      if (!room || !(await this.isMember(tx, roomId, userId))) throw roomNotFound();
-      const { state, change } = applyStudyOp(room.state, op);
-      if (change.kind === "none") return null;
-      const version = room.version + 1;
-      await tx.query(
-        `UPDATE study_rooms SET state = $2::jsonb, version = $3, "updatedAt" = now() WHERE id = $1`,
-        [roomId, JSON.stringify(state), version]
-      );
-      return { state, change, version };
-    });
+    // Only ops that end up rewriting the document count against
+    // STUDY_WRITE_LIMIT; moving the cursor isn't counted in Redis at all
+    let outcome: { change: StudyChange; version: number } | null;
+    if (op.type === "goto") {
+      outcome = await this.gotoNode(roomId, userId, op.nodeId);
+    } else {
+      outcome = op.type === "move" ? await this.replayMove(roomId, userId, op.nodeId, op.uci) : null;
+      if (!outcome) {
+        await this.limit(`study:writes:${roomId}:${userId}`, STUDY_WRITE_LIMIT);
+        outcome = await this.rewrite(roomId, userId, op);
+      }
+    }
     if (!outcome) return;
 
     // Only what changed goes out: the whole document is sent on connect and
@@ -298,6 +335,104 @@ export class StudyService {
       case "children":
         return this.publish(roomId, { type: "children", parentId: change.parentId, children: change.children, version, by });
     }
+  }
+
+  /**
+   * Counts an op against a per-player, per-room limit shared by every
+   * instance. If Redis can't be reached the op goes ahead: the socket's own
+   * limit still applies, and the room is unusable without Redis anyway.
+   */
+  private async limit(key: string, { max, windowSeconds }: { max: number; windowSeconds: number }) {
+    const allowed = await withinLimit(this.fastify.redis, key, max, windowSeconds).catch((err) => {
+      this.fastify.log.warn({ err }, "Study rate limit unavailable");
+      return true;
+    });
+    if (!allowed) throw tooFast();
+  }
+
+  /**
+   * goto: moves the cursor if the node is in the tree. The row's other
+   * columns are copied as they are; the document is only read by Postgres
+   * for the key check, never sent here or written. A concurrent change to
+   * the tree holds the row lock, and the WHERE is checked again against
+   * what it wrote.
+   */
+  private async gotoNode(roomId: number, userId: number, nodeId: string) {
+    const { rows } = await this.fastify.pg.query<{ version: number }>(
+      `UPDATE study_rooms r SET cursor = $2, version = r.version + 1, "updatedAt" = now()
+       WHERE r.id = $1 AND r.cursor <> $2 AND r.state->'nodes' ? $2
+         AND EXISTS (SELECT 1 FROM study_room_members m WHERE m."roomId" = r.id AND m."userId" = $3)
+       RETURNING r.version`,
+      [roomId, nodeId, userId]
+    );
+    if (rows[0]) return { change: { kind: "cursor", cursor: nodeId } as const, version: rows[0].version };
+
+    // Nothing changed: find out why (rare, so the UPDATE doesn't pay for it)
+    const { rows: found } = await this.fastify.pg.query<{ atNode: boolean; hasNode: boolean; member: boolean }>(
+      `SELECT r.cursor = $2 AS "atNode", r.state->'nodes' ? $2 AS "hasNode",
+         EXISTS (SELECT 1 FROM study_room_members m WHERE m."roomId" = r.id AND m."userId" = $3) AS member
+       FROM study_rooms r WHERE r.id = $1`,
+      [roomId, nodeId, userId]
+    );
+    const room = found[0];
+    if (!room || !room.member) throw roomNotFound();
+    if (!room.hasNode) throw positionGone();
+    return null; // already there
+  }
+
+  /**
+   * A move the tree already has from that node (replaying a line): the
+   * cursor goes to that child. Null when the tree doesn't have the move (or
+   * the node, or the room); the caller then applies the op in full, which
+   * adds the move or says what is wrong. The child is looked up in the
+   * locked row, so a change committed meanwhile is taken into account.
+   */
+  private async replayMove(roomId: number, userId: number, parentId: string, uci: string) {
+    const { rows } = await this.fastify.pg.query<{ version: number; cursor: string }>(
+      `WITH target AS (
+         SELECT r.id, jsonb_path_query_first(r.state, '$.nodes.* ? (@.parentId == $p && @.uci == $u).id',
+                  jsonb_build_object('p', $2::text, 'u', $3::text)) #>> '{}' AS child
+         FROM study_rooms r
+         WHERE r.id = $1
+           AND EXISTS (SELECT 1 FROM study_room_members m WHERE m."roomId" = r.id AND m."userId" = $4)
+         FOR UPDATE OF r
+       )
+       UPDATE study_rooms r SET cursor = target.child, version = r.version + 1, "updatedAt" = now()
+       FROM target WHERE r.id = target.id AND target.child IS NOT NULL
+       RETURNING r.version, r.cursor`,
+      [roomId, parentId, uci, userId]
+    );
+    const row = rows[0];
+    return row ? { change: { kind: "cursor", cursor: row.cursor } as const, version: row.version } : null;
+  }
+
+  /** Any other op: the document is loaded under the row lock, changed and written back. */
+  private async rewrite(roomId: number, userId: number, op: StudyOp) {
+    return this.fastify.pg.transact(async (tx) => {
+      const { rows } = await tx.query<{ state: StudyState; cursor: string; version: number }>(
+        `SELECT state, cursor, version FROM study_rooms WHERE id = $1 FOR UPDATE`,
+        [roomId]
+      );
+      const room = rows[0];
+      if (!room || !(await this.isMember(tx, roomId, userId))) throw roomNotFound();
+      const { state, change } = applyStudyOp({ ...room.state, cursor: cursorIn(room.state, room.cursor) }, op);
+      if (change.kind === "none") return null;
+      const version = room.version + 1;
+      if (change.kind === "cursor") {
+        // A move that someone else added a moment ago: the document is as it was
+        await tx.query(
+          `UPDATE study_rooms SET cursor = $2, version = $3, "updatedAt" = now() WHERE id = $1`,
+          [roomId, state.cursor, version]
+        );
+      } else {
+        await tx.query(
+          `UPDATE study_rooms SET state = $2::jsonb, cursor = $3, "nodeCount" = $4, version = $5, "updatedAt" = now()
+           WHERE id = $1`,
+          [roomId, storedStudyDocument(state), state.cursor, nodeCount(state), version]
+        );
+      }
+      return { change, version };
+    });
   }
 
   /** Users with the room open right now. */

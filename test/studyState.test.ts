@@ -5,8 +5,11 @@ import {
   createStudyState,
   MAX_COMMENT_LENGTH,
   MAX_STUDY_BYTES,
+  nodeCount,
   pathTo,
   ROOT_ID,
+  storedStudyDocument,
+  type StudyOp,
   type StudyState,
 } from "../src/game/studyState.js";
 
@@ -98,5 +101,46 @@ describe("study state", () => {
     );
     assert.equal(applyStudyOp(moved.state, { type: "comment", nodeId: ROOT_ID, text: "short" }).change.kind, "node");
     assert.equal(applyStudyOp(moved.state, { type: "delete", nodeId: e4 }).change.kind, "deleted");
+  });
+
+  test("ops copy only what they change and never touch the input", () => {
+    let state = createStudyState({ moves: ["e4", "e5", "Nf3", "Nc6"] });
+    ({ state } = applyStudyOp(state, { type: "move", nodeId: ROOT_ID, uci: "d2d4" }));
+    const d4 = state.cursor;
+    const [e4] = state.nodes[ROOT_ID]!.children;
+    const ops: StudyOp[] = [
+      { type: "goto", nodeId: e4! },
+      { type: "move", nodeId: d4, uci: "d7d5" },
+      { type: "move", nodeId: ROOT_ID, uci: "e2e4" },
+      { type: "comment", nodeId: d4, text: "Queen's pawn" },
+      { type: "shapes", nodeId: d4, shapes: [{ orig: "d2", dest: "d4", brush: "green" }] },
+      { type: "promote", nodeId: d4 },
+      { type: "delete", nodeId: e4! },
+    ];
+    for (const op of ops) {
+      const before = structuredClone(state);
+      const nodesBefore = { ...state.nodes };
+      const { state: next } = applyStudyOp(state, op);
+      assert.deepEqual(state, before, `${op.type} changed its input`);
+      assert.notEqual(next.nodes, state.nodes);
+      // Nodes the op didn't change are shared, not copied
+      for (const [id, node] of Object.entries(nodesBefore)) {
+        if (next.nodes[id] && JSON.stringify(next.nodes[id]) === JSON.stringify(node)) {
+          assert.equal(next.nodes[id], node, `${op.type} copied ${id}`);
+        }
+      }
+    }
+  });
+
+  test("the stored document leaves the cursor to its own column", () => {
+    const { state } = applyStudyOp(createStudyState({ moves: ["e4"] }), {
+      type: "move",
+      nodeId: ROOT_ID,
+      uci: "d2d4",
+    });
+    const stored = JSON.parse(storedStudyDocument(state));
+    assert.equal(stored.cursor, undefined);
+    assert.deepEqual({ ...stored, cursor: state.cursor }, state);
+    assert.equal(nodeCount(state), 3);
   });
 });

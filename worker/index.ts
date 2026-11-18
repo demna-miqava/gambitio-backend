@@ -1,4 +1,5 @@
 import { Container, getContainer } from "@cloudflare/containers";
+import { backendHeaders } from "./clientRtt.js";
 
 /*
  * Gambitio on Cloudflare: this Worker serves the built frontend
@@ -20,6 +21,8 @@ interface Env {
   REDIS_URL: string;
   CLERK_PUBLISHABLE_KEY: string;
   CLERK_SECRET_KEY: string;
+  /** Optional: Clerk's PEM public key, so tokens are checked without calling Clerk (see DEPLOY.md) */
+  CLERK_JWT_KEY?: string;
   // Optional secrets: web push is off without the two keys (see DEPLOY.md)
   VAPID_PUBLIC_KEY?: string;
   VAPID_PRIVATE_KEY?: string;
@@ -49,6 +52,7 @@ export class Backend extends Container<Env> {
       REDIS_URL: env.REDIS_URL,
       CLERK_PUBLISHABLE_KEY: env.CLERK_PUBLISHABLE_KEY,
       CLERK_SECRET_KEY: env.CLERK_SECRET_KEY,
+      ...(env.CLERK_JWT_KEY && { CLERK_JWT_KEY: env.CLERK_JWT_KEY }),
       ...(env.VAPID_PUBLIC_KEY &&
         env.VAPID_PRIVATE_KEY && {
           VAPID_PUBLIC_KEY: env.VAPID_PUBLIC_KEY,
@@ -108,7 +112,11 @@ export function instanceName(index: number, generation: number): string {
  * the current code, send every request to backends with new names: they are
  * created on the spot, with today's code and secrets. The previous
  * generation's containers are stopped (retirePrevious); people connected to
- * them reconnect to the new ones within a few seconds.
+ * them reconnect to the new ones within a few seconds. The new containers
+ * start before the old ones stop, so both run for a moment: the backend is
+ * built for several instances at once (Postgres row locks, Redis), and the
+ * old one pauses its games' clocks when it gets SIGTERM, which the new ones
+ * leave paused until the players reconnect (LiveGameService.pauseForShutdown).
  */
 export function generationOf(value: string | undefined): number {
   const n = Math.floor(Number(value ?? "1"));
@@ -118,18 +126,42 @@ export function generationOf(value: string | undefined): number {
 let previousRetired = false;
 
 /**
+ * How long an old backend gets, after SIGTERM, to pause its games and close
+ * its sockets before it is killed. It exits by itself in a second or two;
+ * this stays well inside the 30s a Worker may keep running after its
+ * response (ctx.waitUntil).
+ */
+const RETIRE_GRACE_MS = 10_000;
+
+/**
  * Stops the previous generation's containers, once per Worker instance. They
  * would otherwise run on, with the old settings, until the last person
- * connected to them left. Stopping one that isn't running does nothing.
+ * connected to them left. SIGTERM first, so the backend shuts down cleanly
+ * (destroy() is a SIGKILL: games in progress would lose the downtime from
+ * their clocks), then destroy() for one that didn't exit. Stopping one that
+ * isn't running does nothing.
  */
 async function retirePrevious(env: Env, instances: number, generation: number): Promise<void> {
   if (previousRetired || generation <= 1) return;
   previousRetired = true;
-  for (let index = 0; index < instances; index++) {
-    await getContainer(env.BACKEND, instanceName(index, generation - 1))
-      .destroy()
-      .catch((error: unknown) => console.log("Stopping an old backend failed", String(error)));
-  }
+  const old = Array.from({ length: instances }, (_, index) =>
+    getContainer(env.BACKEND, instanceName(index, generation - 1))
+  );
+  const failed = (error: unknown) => console.log("Stopping an old backend failed", String(error));
+  await Promise.all(old.map((backend) => backend.stop("SIGTERM").catch(failed)));
+  await new Promise((resolve) => setTimeout(resolve, RETIRE_GRACE_MS));
+  await Promise.all(old.map((backend) => backend.destroy().catch(failed)));
+}
+
+/**
+ * The request as the backend gets it. Headers on an incoming request can't
+ * be changed, so a changed one is a new Request built from it: same method,
+ * URL, body and the rest, which keeps a WebSocket upgrade working (the
+ * upgrade travels in its headers). See backendHeaders.
+ */
+function toBackend(request: Request): Request {
+  const headers = backendHeaders(request.url, request.headers, request.cf?.clientTcpRtt);
+  return headers ? new Request(request, { headers }) : request;
 }
 
 /** Must match max_instances in wrangler.jsonc: a higher BACKEND_INSTANCES would route to containers that can't start. */
@@ -140,6 +172,6 @@ export default {
     const instances = Math.min(MAX_INSTANCES, Math.max(1, Math.floor(Number(env.BACKEND_INSTANCES ?? "1")) || 1));
     const generation = generationOf(env.BACKEND_GENERATION);
     ctx.waitUntil(retirePrevious(env, instances, generation));
-    return getContainer(env.BACKEND, instanceFor(request, instances, generation)).fetch(request);
+    return getContainer(env.BACKEND, instanceFor(request, instances, generation)).fetch(toBackend(request));
   },
 } satisfies ExportedHandler<Env>;

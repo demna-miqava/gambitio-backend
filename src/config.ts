@@ -1,3 +1,4 @@
+import { createPublicKey } from "node:crypto";
 import { z } from "zod";
 
 // An empty value (KEY= in a .env file) counts as not set
@@ -19,6 +20,23 @@ const envSchema = z.object({
   PG_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
   CLERK_PUBLISHABLE_KEY: z.string().min(1),
   CLERK_SECRET_KEY: z.string().min(1),
+  // The instance's "JWT public key" (PEM) from the Clerk dashboard (API keys
+  // page). With it, session tokens are verified locally and never cause a
+  // request to Clerk; without it the signing keys are fetched from Clerk's
+  // API (rate-guarded, see clerkAuthProvider). See clerkJwtKey for the format.
+  CLERK_JWT_KEY: optionalText.transform((value, ctx) => {
+    if (value === undefined) return undefined;
+    const pem = clerkJwtKey(value);
+    if (!pem) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "must be the PEM public key from the Clerk dashboard (-----BEGIN PUBLIC KEY----- ... -----END PUBLIC KEY-----, RSA 2048)",
+      });
+      return z.NEVER;
+    }
+    return pem;
+  }).optional(),
   FRONTEND_URL: z.string().url().default("http://localhost:5173"),
   // Comma-separated origins also allowed besides FRONTEND_URL, e.g. the LAN
   // address used to open the dev server from a phone
@@ -58,6 +76,36 @@ const envSchema = z.object({
 });
 
 export type Config = z.infer<typeof envSchema>;
+
+const PEM_HEADER = "-----BEGIN PUBLIC KEY-----";
+const PEM_TRAILER = "-----END PUBLIC KEY-----";
+
+/**
+ * The Clerk JWT public key as a clean PEM, or null if it isn't one Clerk can
+ * use. Secret stores often keep a multi-line value as one line with literal
+ * "\n" escapes (or with spaces where the line breaks were), so the body is
+ * rebuilt from its base64 characters. Clerk turns the PEM into a key by
+ * cutting a fixed prefix off it (loadClerkJwkFromPem in @clerk/backend),
+ * which only works for a 2048-bit RSA key with exponent 65537: anything else
+ * is rejected here rather than failing every sign-in later.
+ */
+export function clerkJwtKey(raw: string): string | null {
+  const text = raw.replace(/\\r/g, "").replace(/\\n/g, "\n").trim();
+  if (!text.startsWith(PEM_HEADER) || !text.endsWith(PEM_TRAILER)) return null;
+  const body = text.slice(PEM_HEADER.length, -PEM_TRAILER.length).replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(body)) return null;
+  const pem = `${PEM_HEADER}\n${body.match(/.{1,64}/g)!.join("\n")}\n${PEM_TRAILER}`;
+  try {
+    const key = createPublicKey(pem);
+    const details = key.asymmetricKeyDetails;
+    if (key.asymmetricKeyType !== "rsa" || details?.modulusLength !== 2048 || details.publicExponent !== 65537n) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return pem;
+}
 
 /** The VAPID keys push messages are signed with, or null when push isn't configured. */
 export function vapidKeys(config: Config): { subject: string; publicKey: string; privateKey: string } | null {

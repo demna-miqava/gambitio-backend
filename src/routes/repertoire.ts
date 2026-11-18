@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { authMiddleware } from "../middleware/auth.js";
-import { RepertoireService } from "../services/repertoireService.js";
+import { REPERTOIRE_CHECK_GAMES, RepertoireService } from "../services/repertoireService.js";
 import { MAX_LINE_PLIES } from "../game/repertoire.js";
 
 const color = z.enum(["white", "black"]);
@@ -23,7 +23,10 @@ const updateLineSchema = z
   .refine((v) => v.name !== undefined || v.color !== undefined, "Nothing to update");
 
 const practiceSchema = z.object({ correct: z.boolean() }).strict();
-const checkQuery = z.object({ limit: z.coerce.number().int().min(1).max(50).default(20) });
+// The comparison runs on the event loop (see checkRecentGames), so a request covers a few games only
+const checkQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(REPERTOIRE_CHECK_GAMES.max).default(REPERTOIRE_CHECK_GAMES.default),
+});
 
 export async function repertoireRoutes(fastify: FastifyInstance) {
   const repertoire = new RepertoireService(fastify);

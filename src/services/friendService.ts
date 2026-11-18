@@ -1,6 +1,9 @@
 import type { FastifyInstance } from "fastify";
 import { FriendRepository } from "../repositories/friendRepository.js";
 import { topics } from "../realtime/hub.js";
+import { AppError } from "../errors/AppError.js";
+import { blocksBetween } from "../repositories/blockRepository.js";
+import { withinLimit } from "../utils/rateLimit.js";
 import type {
   FriendRequest,
   PaginatedFriendRequestsResponse,
@@ -25,6 +28,37 @@ const FRIEND_CONFIG = {
   DEFAULT_PAGE_SIZE: 10,
   MAX_PAGE_SIZE: 100,
 } as const;
+
+/**
+ * Limits on friend requests, so sending one (a list update and a push
+ * notification for the receiver) can't be used to pester:
+ *
+ * - After cancelling a request, the sender can't send that player another
+ *   for an hour: send-then-cancel can't be looped.
+ * - After a decline, the sender can't ask that player again for a day (the
+ *   player who declined can still send one themselves).
+ * - One account can send FRIEND_REQUESTS_PER_DAY requests a day.
+ * - The receiver's push notification for a sender's request goes at most
+ *   once a day (PushService dedupes by tag).
+ *
+ * A request to someone who has blocked the sender gets the same refusal as
+ * a cooldown, so it doesn't reveal the block.
+ */
+const FRIEND_REQUEST_LIMITS = {
+  cancelCooldownSeconds: 60 * 60,
+  declineCooldownSeconds: 24 * 60 * 60,
+  perDay: 50,
+  pushDedupeSeconds: 24 * 60 * 60,
+};
+const cooldownKey = (senderId: number, receiverId: number) => `friendreq:cooldown:${senderId}:${receiverId}`;
+
+/** The refusal for a cooldown, and for a block (which it doesn't reveal) */
+const cooldownError = () =>
+  new AppError(
+    "You can't send this player a friend request right now. Try again later.",
+    "FRIEND_REQUEST_COOLDOWN",
+    429
+  );
 
 /** What changed, from the point of view of the user being told. */
 export type FriendsEvent =
@@ -96,9 +130,31 @@ export class FriendService {
     if (context.areFriends) {
       throw new FriendshipExistsError("Already friends with this user");
     }
+    const blocks = await blocksBetween(this.fastify.pg, senderId, receiverId);
+    if (blocks.byFirst) {
+      throw new AppError("You've blocked this player. Unblock them first.", "BLOCKED_BY_YOU", 403);
+    }
+    // The same answer as a cooldown, so the block isn't revealed: there is
+    // no setting that turns friend requests off, so any other wording would
+    // only ever mean a block
+    if (blocks.bySecond) throw cooldownError();
     const exists = () =>
       new FriendRequestExistsError("Friend request already exists between these users");
     if (context.requestExists) throw exists();
+    if (await this.fastify.redis.exists(cooldownKey(senderId, receiverId))) throw cooldownError();
+    const allowed = await withinLimit(
+      this.fastify.redis,
+      `friendreq:sent:${senderId}`,
+      FRIEND_REQUEST_LIMITS.perDay,
+      24 * 60 * 60
+    );
+    if (!allowed) {
+      throw new AppError(
+        "You've sent a lot of friend requests today. Try again tomorrow.",
+        "FRIEND_REQUEST_RATE_LIMITED",
+        429
+      );
+    }
 
     const created = await this.friendRepository.createFriendRequest(
       senderId,
@@ -126,7 +182,8 @@ export class FriendService {
         url: `/profile/${created.receiverId}/friends`,
         tag: `friend-request-${senderId}`,
       },
-      24 * 60 * 60
+      24 * 60 * 60,
+      { dedupeSeconds: FRIEND_REQUEST_LIMITS.pushDedupeSeconds }
     );
     return created;
   }
@@ -190,6 +247,8 @@ export class FriendService {
   async declineFriendRequest(requestId: number, userId: number): Promise<void> {
     const declined = await this.friendRepository.deleteFriendRequestAs(requestId, userId, "receiverId");
     if (declined) {
+      const { senderId, receiverId } = declined;
+      await this.startCooldown(senderId, receiverId, FRIEND_REQUEST_LIMITS.declineCooldownSeconds);
       await this.notify(declined.senderId, friendsUpdatedMessage("request_declined", { id: userId }));
       return;
     }
@@ -203,10 +262,28 @@ export class FriendService {
   async cancelFriendRequest(requestId: number, userId: number): Promise<void> {
     const cancelled = await this.friendRepository.deleteFriendRequestAs(requestId, userId, "senderId");
     if (cancelled) {
+      const { senderId, receiverId } = cancelled;
+      await this.startCooldown(senderId, receiverId, FRIEND_REQUEST_LIMITS.cancelCooldownSeconds);
       await this.notify(cancelled.receiverId, friendsUpdatedMessage("request_cancelled", { id: userId }));
       return;
     }
     throw await this.requestError(requestId, "Not authorized to cancel this friend request");
+  }
+
+  /**
+   * The sender can't send the receiver another request for a while (see
+   * FRIEND_REQUEST_LIMITS). A longer cooldown already running is kept: a
+   * cancel doesn't shorten a decline's. Never throws.
+   */
+  private async startCooldown(senderId: number, receiverId: number, seconds: number): Promise<void> {
+    const key = cooldownKey(senderId, receiverId);
+    try {
+      const ttl = await this.fastify.redis.ttl(key);
+      if (ttl >= seconds) return;
+      await this.fastify.redis.set(key, "1", { expiration: { type: "EX", value: seconds } });
+    } catch (err) {
+      this.fastify.log.warn({ err }, "Recording a friend request cooldown failed");
+    }
   }
 
   /**

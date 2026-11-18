@@ -137,6 +137,40 @@ describe("leaderboard", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST
     assert.equal((await get(w.clerkId, "variant=blitz")).body.pagination.total, 0);
   });
 
+  test("your own position is fresh right after a game or a rated puzzle; pages keep a key old code can read", async () => {
+    const w = await createUser(app, "white");
+    const b = await createUser(app, "black");
+    await rate(w.id, "bullet", 1500);
+    await rate(b.id, "bullet", 1495);
+    await rate(b.id, "puzzle", 1200);
+    assert.equal((await get(b.clerkId, "variant=bullet")).body.me.rank, 2);
+    const puzzleBefore = (await get(b.clerkId, "variant=puzzle")).body.me.rating;
+    assert.equal(puzzleBefore, 1200);
+    // Pages are stored as {v, freshUntil}: under a name code from before
+    // that change doesn't read as a page
+    assert.equal(await app.redis.exists("leaderboard:global:bullet:10:1"), 0);
+    assert.equal(await app.redis.exists("leaderboard:v2:global:bullet:10:1"), 1);
+    assert.equal(await app.redis.exists(`leaderboard:me:bullet:${b.id}`), 1);
+
+    const game = await app.pg.transact((tx) => createGame(tx, { whiteId: w.id, blackId: b.id, time: 60, increment: 0 }));
+    await app.pg.query(`UPDATE games SET "numMoves" = 2 WHERE id = $1`, [game.id]);
+    await app.liveGames.resign(game.id, w.id);
+    // The page may be up to GLOBAL_CACHE_SECONDS old; the caller's own entry isn't
+    const after = (await get(b.clerkId, "variant=bullet")).body.me;
+    assert.equal(after.rank, 1);
+    assert.ok(after.rating > 1495, `rating ${after.rating}`);
+    assert.equal((await get(w.clerkId, "variant=bullet")).body.me.rank, 2);
+
+    const res = await fetch(`http://${baseUrl}/api/puzzles/seed06/check`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${b.clerkId}`, "content-type": "application/json" },
+      body: JSON.stringify({ moves: ["b3g8", "h6f7"] }),
+    });
+    const { puzzleRating } = ((await res.json()) as any).attempt;
+    assert.notEqual(puzzleRating, puzzleBefore);
+    assert.equal((await get(b.clerkId, "variant=puzzle")).body.me.rating, puzzleRating);
+  });
+
   test("the peak is never reported below the current rating", async () => {
     const me = await createUser(app, "climber");
     // A row written before finishGame kept the peak up to date
@@ -241,7 +275,7 @@ describe("leaderboard", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST
     );
   });
 
-  test("global pages are cached briefly, the caller's entry is not", async () => {
+  test("global pages, the caller's own entry and the totals are cached briefly", async () => {
     const a = await createUser(app, "cached");
     const b = await createUser(app, "fresh");
     await rate(a.id, "bullet", 1500);
@@ -254,15 +288,30 @@ describe("leaderboard", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST
       body.data.map((e: any) => e.username),
       ["cached", "fresh"]
     );
+    // b's own entry wasn't cached yet
     assert.equal(body.me.rank, 1);
     assert.equal(body.me.rating, 1600);
 
+    // Now it is (for everyone's own entry, separately), and so is the number of listed players
+    await rate(b.id, "bullet", 1300);
+    const late = await createUser(app, "late");
+    await rate(late.id, "bullet", 1450);
+    const again = (await get(b.clerkId, "variant=bullet")).body;
+    assert.deepEqual([again.me.rank, again.me.rating], [1, 1600]);
+    assert.equal(again.pagination.total, 2);
+    assert.equal((await get(late.clerkId, "variant=bullet")).body.me.rating, 1450);
+    await app.redis.flushDb();
+    const fresh = (await get(b.clerkId, "variant=bullet")).body;
+    assert.deepEqual([fresh.me.rank, fresh.me.rating, fresh.pagination.total], [3, 1300, 3]);
+
     // Friends scope is computed on every request
+    await rate(b.id, "bullet", 1250);
     const friends = await get(b.clerkId, "variant=bullet&scope=friends");
     assert.deepEqual(
       friends.body.data.map((e: any) => [e.rank, e.rating]),
-      [[1, 1600]]
+      [[1, 1250]]
     );
+    assert.equal(friends.body.me.rating, 1250);
   });
 
   test("rejects bad parameters and anonymous requests", async () => {

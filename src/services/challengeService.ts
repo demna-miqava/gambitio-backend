@@ -1,14 +1,16 @@
 import type { FastifyInstance } from "fastify";
 import { AppError } from "../errors/AppError.js";
 import { gameRepository } from "../repositories/gameRepository.js";
-import { AlreadyInGameError, createGame, matchFoundData } from "./gameService.js";
+import { AlreadyInGameError, createGame, lockPlayers, matchFoundData } from "./gameService.js";
+import type { LiveGame } from "../models/Game.js";
 import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
 import { getTimeControl, ratingColumns, type PlayerColor } from "../models/common.js";
-import { seriesColors } from "../game/series.js";
+import { seriesColors, seriesOdds } from "../game/series.js";
 import { seriesRepository, type SeriesRow } from "./seriesService.js";
 import type { AllowedFrom } from "../models/Settings.js";
 import { withinLimit } from "../utils/rateLimit.js";
-import { timeControlLabel } from "./pushService.js";
+import { clockLabel, timeControlLabel } from "./pushService.js";
+import { blocksBetween } from "../repositories/blockRepository.js";
 
 export interface Challenge {
   id: number;
@@ -19,13 +21,26 @@ export interface Challenge {
   challengedUsername: string | null;
   challengerAvatarUrl: string | null;
   challengedAvatarUrl: string | null;
+  /** The longer clock when the challenge has time odds */
   time: number;
   increment: number;
+  /**
+   * Each player's starting clock in seconds when they differ (time odds,
+   * migration 027); null for an even game. Such a game is unrated.
+   */
+  challengerTime: number | null;
+  challengedTime: number | null;
   challengerColor: PlayerColor;
   /** 1 for a single game; 3 or 5 for a series */
   bestOf: number;
   /** Set when accepting plays the next game of an existing series */
   seriesId: number | null;
+  /**
+   * Changes whenever the terms above do (re-sending with other settings),
+   * never repeats (migration 030). Accepting can name the version the player
+   * saw; a different one is refused with CHALLENGE_CHANGED.
+   */
+  version: number;
 }
 
 /** A challenge with the number of the series game it would start (continuations only) */
@@ -47,18 +62,67 @@ export const challengeTimings = { offlineGraceMs: 15_000 };
 type WithdrawReason = "expired" | "offline";
 
 /**
- * Limits on challenging someone who isn't a friend, so "anyone can challenge
- * me" can't be used to pester: after a decline the same player can't be
- * challenged again for a while, and one player can only challenge so many
- * strangers in a row.
+ * Limits on challenging, so a challenge (a pop-up, and a push notification
+ * for a tab in the background) can't be used to pester:
+ *
+ * - After a decline the same player can't be challenged again for a while:
+ *   a few minutes for someone who isn't a friend, a minute for a friend or
+ *   the next game of a series (enough to stop an instant re-ask).
+ * - Each (challenger, challenged) pair has its own limit, friends and series
+ *   included. Re-sending replaces the open challenge, and normal use (change
+ *   the time control, cancel and ask again, play a quick series) stays well
+ *   under it.
+ * - One player can only challenge so many strangers in a row.
+ *
+ * All three are counted before the challenged player's availability is
+ * checked, so asking "is this player online?" costs the same as a challenge.
  */
 const STRANGER_DECLINE_COOLDOWN_SECONDS = 5 * 60;
+const FRIEND_DECLINE_COOLDOWN_SECONDS = 60;
+const PAIR_CHALLENGES = { max: 8, windowSeconds: 10 * 60 };
 const STRANGER_CHALLENGES = { max: 10, windowSeconds: 10 * 60 };
+/** Holds the time of the decline (ms), for STRANGER_DECLINE_COOLDOWN_SECONDS */
 const declinedKey = (challengerId: number, challengedId: number) =>
   `challenge:declined:${challengerId}:${challengedId}`;
 
 const unavailable = () =>
   new AppError("Player is currently unavailable", "OPPONENT_UNAVAILABLE", 409);
+
+/** The challenge was re-sent with other terms after the player saw it */
+const changedError = () =>
+  new AppError("The challenge changed. Check the new terms.", "CHALLENGE_CHANGED", 409);
+
+/** A received challenge with the challenger's rating for its time control. */
+export type ReceivedChallenge = ChallengeWithSeriesGame & { challengerRating: number };
+
+/**
+ * The `challenge_received` message: a challenge as the challenged player
+ * sees it. Sent when it arrives, when it is re-sent (new terms, new
+ * version), and again when an accept named a version that is no longer the
+ * current one.
+ */
+function challengeReceivedMessage(challenge: ReceivedChallenge) {
+  return {
+    type: "challenge_received",
+    data: {
+      id: challenge.id,
+      challengerId: challenge.challengerId,
+      username: challenge.challengerUsername,
+      avatarUrl: challenge.challengerAvatarUrl ?? "",
+      rating: challenge.challengerRating,
+      time: challenge.time,
+      increment: challenge.increment,
+      // From the challenged player's point of view
+      ownTime: challenge.challengedTime,
+      opponentTime: challenge.challengerTime,
+      color: challenge.challengerColor === "white" ? "black" : "white",
+      bestOf: challenge.bestOf,
+      ...(challenge.seriesId !== null && { seriesId: challenge.seriesId, seriesGame: challenge.seriesGame }),
+      version: challenge.version,
+      createdAt: new Date(challenge.createdAt).toISOString(),
+    },
+  };
+}
 
 /**
  * Friend challenges. Accepting deletes the challenge row with RETURNING
@@ -108,18 +172,19 @@ export class ChallengeService {
     this.graceTimers.set(userId, timer);
   }
 
-  /** With the challenger's current rating for each challenge's time control */
-  async getChallengesReceivedByUser(
-    userId: number
-  ): Promise<(ChallengeWithSeriesGame & { challengerRating: number })[]> {
+  /**
+   * With the challenger's current rating for each challenge's time control.
+   * `fromId` narrows it to the one challenge from that player.
+   */
+  async getChallengesReceivedByUser(userId: number, fromId?: number): Promise<ReceivedChallenge[]> {
     const { rows } = await this.fastify.pg.query<
       ChallengeWithSeriesGame & { bulletRating: number; blitzRating: number; rapidRating: number }
     >(
       `SELECT c.*, ${SERIES_GAME_SELECT}, u."bulletRating", u."blitzRating", u."rapidRating"
        FROM challenges c JOIN users u ON u.id = c."challengerId"
-       WHERE c."challengedId" = $1 AND c."createdAt" > $2
+       WHERE c."challengedId" = $1 AND c."createdAt" > $2 AND ($3::int IS NULL OR c."challengerId" = $3)
        ORDER BY c."createdAt" DESC`,
-      [userId, new Date(Date.now() - CHALLENGE_TTL_MS)]
+      [userId, new Date(Date.now() - CHALLENGE_TTL_MS), fromId ?? null]
     );
     return rows.map(({ bulletRating, blitzRating, rapidRating, ...challenge }) => {
       const ratings = { bulletRating, blitzRating, rapidRating };
@@ -127,13 +192,17 @@ export class ChallengeService {
     });
   }
 
-  private async ratingOf(userId: number, time: number): Promise<number | undefined> {
-    const column = ratingColumns(getTimeControl(time)).rating;
-    const { rows } = await this.fastify.pg.query<{ rating: number }>(
-      `SELECT "${column}" AS rating FROM users WHERE id = $1`,
-      [userId]
-    );
-    return rows[0]?.rating;
+  /**
+   * Sends the challenged player (all their tabs) the challenge as it stands
+   * now, after they tried to accept terms it no longer has. Never throws.
+   */
+  private async resendCurrent(challengerId: number, challengedId: number): Promise<void> {
+    try {
+      const [current] = await this.getChallengesReceivedByUser(challengedId, challengerId);
+      if (current) await this.hub.publish(topics.notifications(challengedId), challengeReceivedMessage(current));
+    } catch (err) {
+      this.fastify.log.error({ err }, "Re-sending a changed challenge failed");
+    }
   }
 
   private async isAvailable(userId: number): Promise<boolean> {
@@ -146,8 +215,11 @@ export class ChallengeService {
     data: {
       challengedId: number;
       color: PlayerColor | "random";
+      /** The challenger's own clock */
       time: number;
       increment: number;
+      /** The challenged player's clock, when it differs (time odds) */
+      opponentTime?: number | undefined;
       bestOf?: number | undefined;
       /** Continue this series: its settings replace the ones sent */
       seriesId?: number | undefined;
@@ -155,6 +227,15 @@ export class ChallengeService {
   ): Promise<void> {
     if (data.challengedId === challenger.id) {
       throw new AppError("You can't challenge yourself", "SELF_CHALLENGE", 400);
+    }
+    // A block either way rules out any challenge, a series' next game included
+    const blocks = await blocksBetween(this.fastify.pg, challenger.id, data.challengedId);
+    if (blocks.byFirst) {
+      throw new AppError("You've blocked this player. Unblock them to play.", "BLOCKED_BY_YOU", 403);
+    }
+    // Reads like the setting, so the block isn't revealed
+    if (blocks.bySecond) {
+      throw new AppError("This player isn't accepting challenges", "CHALLENGES_OFF", 403);
     }
     // The next game of a series: the opponent, time control, length and
     // colours are the series' own
@@ -165,9 +246,11 @@ export class ChallengeService {
         throw new AppError("That player isn't in this series", "NOT_IN_SERIES", 400);
       }
       const colors = seriesColors(series, series.gamesPlayed + 1);
+      const challengerIsOne = series.playerOneId === challenger.id;
       data = {
         ...data,
-        time: series.time,
+        time: (challengerIsOne ? series.playerOneTime : series.playerTwoTime) ?? series.time,
+        opponentTime: (challengerIsOne ? series.playerTwoTime : series.playerOneTime) ?? undefined,
         increment: series.increment,
         bestOf: series.bestOf,
         color: colors.whiteId === challenger.id ? "white" : "black",
@@ -177,65 +260,81 @@ export class ChallengeService {
     const areFriends = series ? true : await this.assertMayChallenge(challenger.id, data.challengedId);
     const ownGameId = await gameRepository.findActiveGameIdForUser(this.fastify.pg, challenger.id);
     if (ownGameId !== null) throw new AlreadyInGameError(ownGameId);
+    // Counted before the availability check, so probing whether someone is
+    // online costs a challenge
+    await this.assertLimits(challenger.id, data.challengedId, { stranger: !areFriends });
     if (!(await this.isAvailable(data.challengedId))) throw unavailable();
-    // Counted only for challenges that would reach the other player
-    if (!areFriends) await this.assertStrangerLimits(challenger.id, data.challengedId);
 
     const challengerColor: PlayerColor =
       data.color === "random" ? (Math.random() < 0.5 ? "white" : "black") : data.color;
+    const hasOdds = data.opponentTime !== undefined && data.opponentTime !== data.time;
+    const time = hasOdds ? Math.max(data.time, data.opponentTime!) : data.time;
+    const ratingColumn = ratingColumns(getTimeControl(time)).rating;
 
-    const { rows } = await this.fastify.pg.query<Challenge>(
+    // Sending again to the same player replaces the open challenge (new
+    // settings, fresh expiry), so a client that lost track of it isn't
+    // stuck. Its version changes only if the terms did: re-sending the same
+    // challenge doesn't make a player's accept fail
+    const { rows } = await this.fastify.pg.query<Challenge & { challengerRating: number }>(
       `INSERT INTO challenges (
          "challengerId", "challengedId", "challengerUsername", "challengedUsername",
-         "challengerAvatarUrl", "challengedAvatarUrl", time, increment, "challengerColor", "bestOf", "seriesId")
-       SELECT $1, u.id, $2, u.username, $3, u."avatarUrl", $4, $5, $6, $8, $9
+         "challengerAvatarUrl", "challengedAvatarUrl", time, increment, "challengerColor", "bestOf", "seriesId",
+         "challengerTime", "challengedTime")
+       SELECT $1, u.id, $2, u.username, $3, u."avatarUrl", $4, $5, $6, $8, $9, $10, $11
        FROM users u WHERE u.id = $7
        ON CONFLICT ("challengerId", "challengedId") DO UPDATE SET
+         version = CASE
+           WHEN (challenges.time, challenges.increment, challenges."challengerColor", challenges."bestOf",
+                 challenges."seriesId", challenges."challengerTime", challenges."challengedTime")
+             IS NOT DISTINCT FROM
+                (EXCLUDED.time, EXCLUDED.increment, EXCLUDED."challengerColor", EXCLUDED."bestOf",
+                 EXCLUDED."seriesId", EXCLUDED."challengerTime", EXCLUDED."challengedTime")
+           THEN challenges.version
+           ELSE nextval('challenges_version_seq')
+         END,
          time = EXCLUDED.time, increment = EXCLUDED.increment,
          "challengerColor" = EXCLUDED."challengerColor", "bestOf" = EXCLUDED."bestOf",
-         "seriesId" = EXCLUDED."seriesId", "createdAt" = now()
-       RETURNING *`,
+         "seriesId" = EXCLUDED."seriesId", "challengerTime" = EXCLUDED."challengerTime",
+         "challengedTime" = EXCLUDED."challengedTime",
+         "challengerUsername" = EXCLUDED."challengerUsername",
+         "challengerAvatarUrl" = EXCLUDED."challengerAvatarUrl", "createdAt" = now()
+       RETURNING *, (SELECT "${ratingColumn}" FROM users WHERE id = $1) AS "challengerRating"`,
       [
         challenger.id,
         challenger.username,
         challenger.avatarUrl,
-        data.time,
+        time,
         data.increment,
         challengerColor,
         data.challengedId,
         data.bestOf ?? 1,
         series?.id ?? null,
+        hasOdds ? data.time : null,
+        hasOdds ? data.opponentTime : null,
       ]
     );
-    // Sending again to the same player replaces the open challenge (new
-    // settings, fresh expiry), so a client that lost track of it isn't stuck
     const challenge = rows[0];
     if (!challenge) throw new AppError("Challenged user not found", "USER_NOT_FOUND", 404);
+    // Keeps the challenge sweep running until this one can have expired
+    this.fastify.jobs.noteChallenge();
 
-    await this.hub.publish(topics.notifications(data.challengedId), {
-      type: "challenge_received",
-      data: {
-        id: challenge.id,
-        challengerId: challenger.id,
-        username: challenger.username,
-        avatarUrl: challenger.avatarUrl ?? "",
-        rating: await this.ratingOf(challenger.id, challenge.time),
-        time: challenge.time,
-        increment: challenge.increment,
-        // From the challenged player's point of view
-        color: challengerColor === "white" ? "black" : "white",
-        bestOf: challenge.bestOf,
-        ...(series && { seriesId: series.id, seriesGame: series.gamesPlayed + 1 }),
-        createdAt: new Date(challenge.createdAt).toISOString(),
-      },
-    });
-    // For a tab in the background. Only useful while the challenge is open
+    await this.hub.publish(
+      topics.notifications(data.challengedId),
+      challengeReceivedMessage({ ...challenge, seriesGame: series ? series.gamesPlayed + 1 : null })
+    );
+    // For a tab in the background. Only useful while the challenge is open.
+    // The push service sends one per challenger and minute at most, so
+    // re-sending with new terms doesn't buzz the phone each time
     void this.fastify.push.notify(
       data.challengedId,
       {
         title: `${challenger.username} challenged you`,
         body:
-          `${timeControlLabel(challenge.time, challenge.increment)}` +
+          (challenge.challengedTime !== null && challenge.challengerTime !== null
+            ? `Time odds: you get ${clockLabel(challenge.challengedTime)}, they get ` +
+              `${clockLabel(challenge.challengerTime)}` +
+              (challenge.increment ? `, +${challenge.increment}s a move` : "")
+            : `${timeControlLabel(challenge.time, challenge.increment)}`) +
           (challenge.bestOf > 1 ? `, best of ${challenge.bestOf}` : "") +
           `. You play ${challengerColor === "white" ? "Black" : "White"}.`,
         url: "/home",
@@ -272,28 +371,51 @@ export class ChallengeService {
     return target.areFriends;
   }
 
-  /** See STRANGER_CHALLENGES. Throws when the challenger has to wait. */
-  private async assertStrangerLimits(challengerId: number, challengedId: number): Promise<void> {
-    if (await this.fastify.redis.exists(declinedKey(challengerId, challengedId))) {
-      throw new AppError(
-        "This player declined your challenge. You can ask again in a few minutes.",
-        "CHALLENGE_DECLINED_RECENTLY",
-        429
-      );
+  /**
+   * See PAIR_CHALLENGES and the cooldowns above it. Throws when the
+   * challenger has to wait; otherwise counts this challenge.
+   */
+  private async assertLimits(
+    challengerId: number,
+    challengedId: number,
+    { stranger }: { stranger: boolean }
+  ): Promise<void> {
+    const declined = await this.fastify.redis.get(declinedKey(challengerId, challengedId));
+    if (declined !== null) {
+      const declinedAt = Number(declined) > 1e12 ? Number(declined) : null;
+      const cooldownSeconds = stranger ? STRANGER_DECLINE_COOLDOWN_SECONDS : FRIEND_DECLINE_COOLDOWN_SECONDS;
+      // A key without a time ("1") was written by code from before the
+      // friend cooldown (or an instance still running it): it applies as it
+      // did then, to strangers for as long as the key lives, and not to
+      // friends or a series
+      const recent = declinedAt === null ? stranger : Date.now() - declinedAt < cooldownSeconds * 1000;
+      if (recent) {
+        throw new AppError(
+          stranger
+            ? "This player declined your challenge. You can ask again in a few minutes."
+            : "This player declined your challenge. You can ask again in a minute.",
+          "CHALLENGE_DECLINED_RECENTLY",
+          429
+        );
+      }
     }
+    const rateLimited = () =>
+      new AppError("You've sent a lot of challenges. Try again in a few minutes.", "CHALLENGE_RATE_LIMITED", 429);
+    const pairAllowed = await withinLimit(
+      this.fastify.redis,
+      `challenge:pair:${challengerId}:${challengedId}`,
+      PAIR_CHALLENGES.max,
+      PAIR_CHALLENGES.windowSeconds
+    );
+    if (!pairAllowed) throw rateLimited();
+    if (!stranger) return;
     const allowed = await withinLimit(
       this.fastify.redis,
       `challenge:strangers:${challengerId}`,
       STRANGER_CHALLENGES.max,
       STRANGER_CHALLENGES.windowSeconds
     );
-    if (!allowed) {
-      throw new AppError(
-        "You've sent a lot of challenges. Try again in a few minutes.",
-        "CHALLENGE_RATE_LIMITED",
-        429
-      );
-    }
+    if (!allowed) throw rateLimited();
   }
 
   /** The series a player wants to continue, if they may: theirs, active, between games. */
@@ -325,21 +447,25 @@ export class ChallengeService {
       [challengerId, challengedId]
     );
     if (rowCount) {
-      // Only checked for players who aren't friends (see assertStrangerLimits)
+      // The cooldown depends on whether the two are friends, which is
+      // looked at when the next challenge comes (see assertLimits); the key
+      // lasts as long as the longer one
       await this.fastify.redis
-        .set(declinedKey(challengerId, challengedId), "1", {
+        .set(declinedKey(challengerId, challengedId), String(Date.now()), {
           expiration: { type: "EX", value: STRANGER_DECLINE_COOLDOWN_SECONDS },
         })
         .catch((err) => this.fastify.log.warn({ err }, "Recording a declined challenge failed"));
-      await this.hub.publish(topics.notifications(challengerId), {
-        type: "challenge_declined",
-        data: { challengedId },
-      });
-      // The decliner's other tabs drop the challenge too
-      await this.hub.publish(topics.notifications(challengedId), {
-        type: "challenge_cancelled",
-        data: { challengerId, reason: "declined" },
-      });
+      await Promise.all([
+        this.hub.publish(topics.notifications(challengerId), {
+          type: "challenge_declined",
+          data: { challengedId },
+        }),
+        // The decliner's other tabs drop the challenge too
+        this.hub.publish(topics.notifications(challengedId), {
+          type: "challenge_cancelled",
+          data: { challengerId, reason: "declined" },
+        }),
+      ]);
     }
   }
 
@@ -379,19 +505,29 @@ export class ChallengeService {
     rows: { challengerId: number; challengedId: number }[],
     reason: WithdrawReason
   ): Promise<void> {
-    for (const { challengerId, challengedId } of rows) {
-      await this.hub.publish(topics.notifications(challengedId), {
-        type: "challenge_cancelled",
-        data: { challengerId },
-      });
-      await this.hub.publish(topics.notifications(challengerId), {
-        type: "challenge_declined",
-        data: { challengedId, reason },
-      });
-    }
+    // All at once: publish() delivers locally in call order, and the Redis
+    // PUBLISHes go out back to back instead of one round trip each
+    await Promise.all(
+      rows.flatMap(({ challengerId, challengedId }) => [
+        this.hub.publish(topics.notifications(challengedId), {
+          type: "challenge_cancelled",
+          data: { challengerId },
+        }),
+        this.hub.publish(topics.notifications(challengerId), {
+          type: "challenge_declined",
+          data: { challengedId, reason },
+        }),
+      ])
+    );
   }
 
-  async accept(challengedId: number, challengerId: number): Promise<void> {
+  /**
+   * Accepts a challenge and starts its game. `version` is the version of the
+   * challenge the player saw (clients that predate versions leave it out):
+   * if the challenger has changed the terms since, nothing starts, the
+   * player gets CHALLENGE_CHANGED and the challenge as it now stands.
+   */
+  async accept(challengedId: number, challengerId: number, version?: number): Promise<void> {
     if (!(await this.hub.isPresent("notifications", challengerId))) {
       await this.fastify.pg.query(
         `DELETE FROM challenges WHERE "challengerId" = $1 AND "challengedId" = $2`,
@@ -400,105 +536,152 @@ export class ChallengeService {
       throw unavailable();
     }
 
-    const game = await this.fastify.pg.transact(async (tx) => {
-      // Locks in the order matchmaking takes them (queue rows, then players
-      // in id order), before any challenge row: two challenges from one
-      // player accepted at once, or an accept racing a pairing, then wait on
-      // each other instead of deadlocking
-      await tx.query(`DELETE FROM matchmaking WHERE "userId" = ANY($1)`, [[challengerId, challengedId]]);
-      // A continuation locks its series before the players (queue rows,
-      // series, players: the order a rematch and a game's end take them in).
-      // Which series is read first without a lock; the claim below checks
-      // the challenge wasn't replaced meanwhile
-      const { rows: pending } = await tx.query<{ seriesId: number | null }>(
-        `SELECT "seriesId" FROM challenges WHERE "challengerId" = $1 AND "challengedId" = $2`,
-        [challengerId, challengedId]
-      );
-      const seriesId = pending[0]?.seriesId ?? null;
-      const continuing = seriesId !== null ? await seriesRepository.lock(tx, seriesId) : null;
-      await tx.query(`SELECT 1 FROM users WHERE id = ANY($1) ORDER BY id FOR UPDATE`, [
-        [challengerId, challengedId],
-      ]);
-      const { rows } = await tx.query<Challenge>(
-        `DELETE FROM challenges WHERE "challengerId" = $1 AND "challengedId" = $2 RETURNING *`,
-        [challengerId, challengedId]
-      );
-      const challenge = rows[0];
-      if (!challenge || Date.now() - new Date(challenge.createdAt).getTime() > CHALLENGE_TTL_MS) {
-        throw new AppError("Challenge not found", "CHALLENGE_NOT_FOUND", 404);
-      }
-      if (challenge.seriesId !== seriesId) {
-        throw new AppError("The challenge changed; try again", "CHALLENGE_CHANGED", 409);
-      }
-
-      // The challenger may have started another game since sending this
-      if ((await gameRepository.findActiveGameIdForUser(tx, challengerId)) !== null) {
-        throw unavailable();
-      }
-
-      if (continuing) {
-        // The next game of an existing series; its colours and clock apply
-        if (continuing.status !== "active") throw new AppError("The series is over", "SERIES_OVER", 409);
-        if (await seriesRepository.hasGameInProgress(tx, continuing.id)) {
-          throw new AppError("A game of this series is being played", "SERIES_GAME_IN_PROGRESS", 409);
-        }
-        const number = continuing.gamesPlayed + 1;
-        const created = await createGame(tx, {
-          ...seriesColors(continuing, number),
-          time: continuing.time,
-          increment: continuing.increment,
-          series: { id: continuing.id, game: number },
-        });
-        await tx.query(
-          `DELETE FROM challenges WHERE "challengerId" = ANY($1) OR "challengedId" = ANY($1)`,
-          [[challengerId, challengedId]]
+    const pair = [challengerId, challengedId];
+    let game: LiveGame;
+    try {
+      game = await this.fastify.pg.transact(async (tx) => {
+        // Locks in the order matchmaking takes them (queue rows, then players
+        // in id order), before any challenge row: two challenges from one
+        // player accepted at once, or an accept racing a pairing, then wait on
+        // each other instead of deadlocking.
+        //
+        // A continuation locks its series before the players (queue rows,
+        // series, players: the order a rematch and a game's end take them
+        // in). Which series is read in the same round trip as the queue rows
+        // are taken, without a lock; the claim below checks the challenge
+        // wasn't replaced meanwhile
+        const { rows: pending } = await tx.query<{ seriesId: number | null }>(
+          `WITH dequeued AS (DELETE FROM matchmaking WHERE "userId" = ANY($3))
+           SELECT "seriesId" FROM challenges WHERE "challengerId" = $1 AND "challengedId" = $2`,
+          [challengerId, challengedId, pair]
         );
-        return created;
-      }
+        const seriesId = pending[0]?.seriesId ?? null;
+        const continuing = seriesId !== null ? await seriesRepository.lock(tx, seriesId) : null;
+        const players = await lockPlayers(tx, pair);
+        // One statement, after the player locks: claims this challenge and
+        // drops every other open challenge of the two (they are about to be
+        // in a game; a refusal below rolls that back), and reads whether
+        // either player, or the series, has a game in progress
+        const { rows } = await tx.query<
+          Challenge & { challengerGameId: number | null; challengedGameId: number | null; seriesBusy: boolean }
+        >(
+          `WITH dropped AS (
+             DELETE FROM challenges WHERE "challengerId" = ANY($3) OR "challengedId" = ANY($3)
+             RETURNING *
+           )
+           SELECT d.*,
+             (SELECT id FROM games WHERE status = 'in_progress' AND ("whiteId" = $1 OR "blackId" = $1)
+              LIMIT 1) AS "challengerGameId",
+             (SELECT id FROM games WHERE status = 'in_progress' AND ("whiteId" = $2 OR "blackId" = $2)
+              LIMIT 1) AS "challengedGameId",
+             EXISTS (SELECT 1 FROM games WHERE "seriesId" = d."seriesId" AND status = 'in_progress')
+               AS "seriesBusy"
+           FROM dropped d WHERE d."challengerId" = $1 AND d."challengedId" = $2`,
+          [challengerId, challengedId, pair]
+        );
+        const claimed = rows[0];
+        if (!claimed || Date.now() - new Date(claimed.createdAt).getTime() > CHALLENGE_TTL_MS) {
+          throw new AppError("Challenge not found", "CHALLENGE_NOT_FOUND", 404);
+        }
+        const { challengerGameId, challengedGameId, seriesBusy, ...challenge } = claimed;
+        if (challenge.seriesId !== seriesId || (version !== undefined && challenge.version !== version)) {
+          throw changedError();
+        }
 
-      const challengerIsWhite = challenge.challengerColor === "white";
-      // A best-of challenge starts a series; this is its first game. The
-      // series row's foreign keys share-lock both players, so take
-      // createGame's lock (id order) first: two transactions holding share
-      // locks on the same player would deadlock upgrading them
-      if (challenge.bestOf > 1) {
-        await tx.query(`SELECT 1 FROM users WHERE id = ANY($1) ORDER BY id FOR UPDATE`, [
-          [challengerId, challengedId],
-        ]);
-      }
-      const series =
-        challenge.bestOf > 1
-          ? await seriesRepository.create(tx, {
-              challengerId,
-              challengedId,
-              challengerColor: challenge.challengerColor,
-              bestOf: challenge.bestOf,
-              time: challenge.time,
-              increment: challenge.increment,
-            })
-          : null;
-      const created = await createGame(tx, {
-        whiteId: challengerIsWhite ? challengerId : challengedId,
-        blackId: challengerIsWhite ? challengedId : challengerId,
-        time: challenge.time,
-        increment: challenge.increment,
-        ...(series && { series: { id: series.id, game: 1 } }),
+        // The challenger may have started another game since sending this
+        if (challengerGameId !== null) throw unavailable();
+        // A deleted account can still have an open challenge for a moment
+        if (!players.has(challengerId) || !players.has(challengedId)) {
+          throw new AppError("Player not found", "USER_NOT_FOUND", 404);
+        }
+
+        if (continuing) {
+          // The next game of an existing series; its colours and clock apply
+          if (continuing.status !== "active") throw new AppError("The series is over", "SERIES_OVER", 409);
+          if (seriesBusy) {
+            throw new AppError("A game of this series is being played", "SERIES_GAME_IN_PROGRESS", 409);
+          }
+        }
+        if (challengedGameId !== null) throw new AlreadyInGameError(challengedGameId);
+
+        // The players are locked and neither is in a game: createGame
+        // doesn't need to check again
+        const locked = { locked: players };
+        if (continuing) {
+          const number = continuing.gamesPlayed + 1;
+          const colors = seriesColors(continuing, number);
+          return createGame(
+            tx,
+            {
+              ...colors,
+              time: continuing.time,
+              increment: continuing.increment,
+              odds: seriesOdds(continuing, colors),
+              series: { id: continuing.id, game: number },
+            },
+            locked
+          );
+        }
+
+        const challengerIsWhite = challenge.challengerColor === "white";
+        const odds =
+          challenge.challengerTime !== null && challenge.challengedTime !== null
+            ? { challengerTime: challenge.challengerTime, challengedTime: challenge.challengedTime }
+            : null;
+        // A best-of challenge starts a series; this is its first game. The
+        // series row's foreign keys share-lock both players, which is why
+        // they were locked (for update) above, before anything else could
+        // take a share lock on them
+        const series =
+          challenge.bestOf > 1
+            ? await seriesRepository.create(tx, {
+                challengerId,
+                challengedId,
+                challengerColor: challenge.challengerColor,
+                bestOf: challenge.bestOf,
+                time: challenge.time,
+                increment: challenge.increment,
+                odds,
+              })
+            : null;
+        return createGame(
+          tx,
+          {
+            whiteId: challengerIsWhite ? challengerId : challengedId,
+            blackId: challengerIsWhite ? challengedId : challengerId,
+            time: challenge.time,
+            increment: challenge.increment,
+            odds: odds && {
+              whiteTime: challengerIsWhite ? odds.challengerTime : odds.challengedTime,
+              blackTime: challengerIsWhite ? odds.challengedTime : odds.challengerTime,
+            },
+            ...(series && { series: { id: series.id, game: 1 } }),
+          },
+          locked
+        );
       });
-      await tx.query(
-        `DELETE FROM challenges WHERE "challengerId" = ANY($1) OR "challengedId" = ANY($1)`,
-        [[challengerId, challengedId]]
-      );
-      return created;
-    });
+    } catch (error) {
+      // The player accepted terms that are no longer the challenge's: show
+      // them the current ones (the challenge is still open, nothing changed)
+      if (error instanceof AppError && error.code === "CHALLENGE_CHANGED") {
+        await this.resendCurrent(challengerId, challengedId);
+      }
+      throw error;
+    }
 
     this.fastify.liveGames.watchDeadline(game.id, game.deadlineAt);
-    for (const playerId of [game.whiteId, game.blackId]) {
-      await this.hub.publish(topics.notifications(playerId), {
-        type: "match_created",
-        data: matchFoundData(game, playerId),
-      });
-      await this.hub.publish(topics.notifications(playerId), activeGameMessage(game.id));
-    }
+    // All at once: publish() delivers locally in call order (each player
+    // gets match_created before active_game), and the Redis PUBLISHes go out
+    // back to back instead of one round trip each
+    await Promise.all(
+      [game.whiteId, game.blackId].flatMap((playerId) => [
+        this.hub.publish(topics.notifications(playerId), {
+          type: "match_created",
+          data: matchFoundData(game, playerId),
+        }),
+        this.hub.publish(topics.notifications(playerId), activeGameMessage(game.id)),
+      ])
+    );
     // The challenger may have switched tabs while waiting for the answer
     const data = matchFoundData(game, challengerId);
     void this.fastify.push.notify(

@@ -42,6 +42,21 @@ export function seriesColors(
 }
 
 /**
+ * The clocks of a series game with the given colours, when the series has
+ * time odds: each player keeps their own clock whichever colour they have.
+ */
+export function seriesOdds(
+  series: { playerOneId: number; playerOneTime: number | null; playerTwoTime: number | null },
+  colors: { whiteId: number }
+): { whiteTime: number; blackTime: number } | null {
+  const { playerOneTime: one, playerTwoTime: two } = series;
+  if (one === null || two === null) return null;
+  return colors.whiteId === series.playerOneId
+    ? { whiteTime: one, blackTime: two }
+    : { whiteTime: two, blackTime: one };
+}
+
+/**
  * The score after one game. An aborted game changes nothing (it is replayed
  * with the same colours, since the game number is gamesPlayed + 1).
  */

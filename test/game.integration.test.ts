@@ -10,7 +10,8 @@ import {
   startTestApp,
   type TestSocket,
 } from "./helpers.js";
-import { createGame } from "../src/services/gameService.js";
+import { createGame, finishGame } from "../src/services/gameService.js";
+import { gameRepository } from "../src/repositories/gameRepository.js";
 import { challengeTimings } from "../src/services/challengeService.js";
 
 describe("live games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_REDIS_URL not set" }, () => {
@@ -78,6 +79,68 @@ describe("live games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_
     assert.equal((await w.next("error")).data.code, "GAME_OVER");
     assert.equal(await ratingOf(black.id), 1208);
     assert.equal(await ratingOf(white.id), 1192);
+  });
+
+  test("a game's end updates both players in one go, and only what it should", async () => {
+    const row = async (userId: number) =>
+      (
+        await app.pg.query(
+          `SELECT "blitzRating", "highestBlitzRating", "blitzGames", "listedGames" FROM users WHERE id = $1`,
+          [userId]
+        )
+      ).rows[0];
+    const end = (game: Awaited<ReturnType<typeof newGame>>, outcome: Parameters<typeof finishGame>[2]) =>
+      app.pg.transact(async (tx) => {
+        const locked = await gameRepository.lockById(tx, game.id);
+        return finishGame(tx, locked as typeof game, outcome, null);
+      });
+
+    // Rated: ratings, peaks and both counters, with the floor applied to the
+    // reported change
+    await app.pg.query(`UPDATE users SET "blitzRating" = 100, "highestBlitzRating" = 100 WHERE id = $1`, [
+      white.id,
+    ]);
+    const rated = await newGame();
+    const finished = await end(rated, { result: "black_win", reason: "resignation" });
+    assert.ok(finished?.ratingChanges);
+    assert.equal(finished.ratingChanges.whiteNewRating, 100);
+    assert.equal(finished.ratingChanges.whiteRatingChange, 0);
+    assert.equal(finished.ratingChanges.blackNewRating, 1200 + finished.ratingChanges.blackRatingChange);
+    assert.deepEqual(await row(white.id), {
+      blitzRating: 100,
+      highestBlitzRating: 100,
+      blitzGames: 1,
+      listedGames: 1,
+    });
+    const blackAfter = await row(black.id);
+    assert.equal(blackAfter.blitzGames, 1);
+    assert.equal(blackAfter.listedGames, 1);
+    assert.equal(blackAfter.highestBlitzRating, blackAfter.blitzRating);
+
+    // Aborted: nothing
+    const aborted = await newGame();
+    await end(aborted, { result: "aborted", reason: "aborted" });
+    assert.equal((await row(white.id)).listedGames, 1);
+
+    // Unrated (time odds): listed in the history, nothing else
+    const odds = await app.pg.transact((tx) =>
+      createGame(tx, {
+        whiteId: white.id,
+        blackId: black.id,
+        time: 300,
+        increment: 0,
+        odds: { whiteTime: 300, blackTime: 60 },
+      })
+    );
+    const unrated = await end(odds, { result: "draw", reason: "draw_agreement" });
+    assert.equal(unrated?.ratingChanges, null);
+    assert.deepEqual(await row(white.id), {
+      blitzRating: 100,
+      highestBlitzRating: 100,
+      blitzGames: 1,
+      listedGames: 2,
+    });
+    assert.equal((await row(black.id)).listedGames, 2);
   });
 
   test("stats require sign-in and refresh when a game ends", async () => {
@@ -685,6 +748,73 @@ describe("matchmaking and challenges", { skip: !integrationEnabled && "TEST_POST
     assert.equal(rows[0].n, 1);
   });
 
+  /** A queue row with no socket behind it, as an instance that crashed leaves them */
+  const leftover = async (userId: number, ageSeconds: number, rating = 1200) =>
+    app.pg.query(
+      `INSERT INTO matchmaking ("userId", rating, time, increment, "createdAt")
+       VALUES ($1, $2, 60, 0, now() - make_interval(secs => $3))`,
+      [userId, rating, ageSeconds]
+    );
+  const queued = async () =>
+    (await app.pg.query<{ userId: number }>(`SELECT "userId" FROM matchmaking ORDER BY id`)).rows.map(
+      (r) => r.userId
+    );
+
+  test("a player who isn't searching any more is never paired, and leaves the queue", async () => {
+    const ghost = await createUser(app, "ghost");
+    await leftover(ghost.id, 30);
+    const a = await createUser(app, "alice");
+    const sa = await open("/matchmaking?time=60&increment=0", a.clerkId);
+    await sa.next("searching");
+    await sa.none("match_found");
+    // Joining found the ghost, saw nobody behind it, and dropped it
+    assert.deepEqual(await queued(), [a.id]);
+    assert.equal((await app.pg.query(`SELECT 1 FROM games`)).rowCount, 0);
+
+    // The next real player is paired
+    const b = await createUser(app, "bobby");
+    const sb = await open("/matchmaking?time=60&increment=0", b.clerkId);
+    await Promise.all([sa.next("match_found"), sb.next("match_found")]);
+  });
+
+  test("the sweep pairs entries that have someone to play, and drops gone opponents", async () => {
+    const a = await createUser(app, "alice", 1200);
+    const b = await createUser(app, "bobby", 1900);
+    const c = await createUser(app, "carol", 2600);
+    const ghost = await createUser(app, "ghost", 2600);
+    const sa = await open("/matchmaking?time=60&increment=0", a.clerkId);
+    await sa.next("searching");
+    const sb = await open("/matchmaking?time=60&increment=0", b.clerkId);
+    await sb.next("searching");
+    const sc = await open("/matchmaking?time=60&increment=0", c.clerkId);
+    await sc.next("searching");
+    assert.deepEqual(await queued(), [a.id, b.id, c.id]);
+
+    // Bobby's window reaches Alice now (as after a long wait), and a ghost
+    // entry appears next to Carol
+    await app.pg.query(`UPDATE matchmaking SET rating = 1240 WHERE "userId" = $1`, [b.id]);
+    await leftover(ghost.id, 0, 2610);
+    await app.matchmaking.sweep();
+    await Promise.all([sa.next("match_found"), sb.next("match_found")]);
+    // Carol's only candidate was the ghost: it is gone, she keeps waiting
+    assert.deepEqual(await queued(), [c.id]);
+    await sc.none("match_found");
+  });
+
+  test("leftover queue entries are removed at startup, live searchers keep theirs", async () => {
+    const ghost = await createUser(app, "ghost");
+    const fresh = await createUser(app, "fresh");
+    const a = await createUser(app, "alice", 2500);
+    const sa = await open("/matchmaking?time=60&increment=0", a.clerkId);
+    await sa.next("searching");
+    await app.pg.query(`UPDATE matchmaking SET "createdAt" = now() - interval '1 minute'`);
+    await leftover(ghost.id, 60, 800);
+    // Too new to tell: its socket may still be connecting
+    await leftover(fresh.id, 0, 1600);
+    await app.matchmaking.removeLeftovers();
+    assert.deepEqual(await queued(), [a.id, fresh.id]);
+  });
+
   test("rejects invalid time controls", async () => {
     const a = await createUser(app, "alice");
     const s = await open("/matchmaking?time=-5&increment=null", a.clerkId);
@@ -751,13 +881,160 @@ describe("matchmaking and challenges", { skip: !integrationEnabled && "TEST_POST
     assert.equal((await na.next("error")).data.code, "CHALLENGE_DECLINED_RECENTLY");
     await nb.none("challenge_received");
 
-    // A friend can ask again straight away
+    // A friend only waits a minute
     nc.send(challengeTo(b));
     await nb.next("challenge_received");
     nb.send({ type: "challenge_declined", data: { challengerId: c.id } });
     await nc.next("challenge_declined");
     nc.send(challengeTo(b));
+    const wait = await nc.next("error");
+    assert.equal(wait.data.code, "CHALLENGE_DECLINED_RECENTLY");
+    assert.match(wait.data.message, /in a minute/);
+    await nb.none("challenge_received");
+
+    // A minute later the friend may ask again; the stranger still waits
+    const aMinuteAgo = String(Date.now() - 61_000);
+    await app.redis.set(`challenge:declined:${c.id}:${b.id}`, aMinuteAgo);
+    await app.redis.set(`challenge:declined:${a.id}:${b.id}`, aMinuteAgo);
+    nc.send(challengeTo(b));
     await nb.next("challenge_received");
+    na.send(challengeTo(b));
+    assert.equal((await na.next("error")).data.code, "CHALLENGE_DECLINED_RECENTLY");
+  });
+
+  test("a decline recorded by older code (no time) holds strangers back as it did, and not friends", async () => {
+    const a = await createUser(app, "alice");
+    const b = await createUser(app, "bobby");
+    const c = await createUser(app, "carol");
+    await befriend(c, b);
+    const na = await open("/notifications", a.clerkId);
+    const nb = await open("/notifications", b.clerkId);
+    const nc = await open("/notifications", c.clerkId);
+    // What the code before the friend cooldown wrote, for its own TTL
+    for (const challenger of [a, c]) {
+      await app.redis.set(`challenge:declined:${challenger.id}:${b.id}`, "1", { expiration: { type: "EX", value: 300 } });
+    }
+
+    nc.send(challengeTo(b));
+    assert.equal((await nb.next("challenge_received")).data.challengerId, c.id);
+    na.send(challengeTo(b));
+    assert.equal((await na.next("error")).data.code, "CHALLENGE_DECLINED_RECENTLY");
+    // Once the key is gone, so is the wait
+    await app.redis.del(`challenge:declined:${a.id}:${b.id}`);
+    na.send(challengeTo(b));
+    await nb.next("challenge_received", (m) => m.data.challengerId === a.id);
+  });
+
+  test("probing whether a stranger is online costs a challenge", async () => {
+    const a = await createUser(app, "alice");
+    const na = await open("/notifications", a.clerkId);
+    // Ten probes of players who aren't online use up the stranger limit
+    for (let i = 0; i < 10; i++) {
+      na.send(challengeTo(await createUser(app, `offline${i}`)));
+      await na.next("opponent_unavailable");
+    }
+    const online = await createUser(app, "online");
+    const no = await open("/notifications", online.clerkId);
+    na.send(challengeTo(online));
+    assert.equal((await na.next("error")).data.code, "CHALLENGE_RATE_LIMITED");
+    await no.none("challenge_received");
+  });
+
+  test("challenges to one player are limited, friends and series included", async () => {
+    const a = await createUser(app, "alice");
+    const b = await createUser(app, "bobby");
+    await befriend(a, b);
+    const na = await open("/notifications", a.clerkId);
+    const nb = await open("/notifications", b.clerkId);
+    // Re-sending replaces the open challenge, but each one pops up again
+    for (let i = 0; i < 8; i++) {
+      na.send(challengeTo(b));
+      await nb.next("challenge_received");
+    }
+    na.send(challengeTo(b));
+    assert.equal((await na.next("error")).data.code, "CHALLENGE_RATE_LIMITED");
+    await nb.none("challenge_received");
+    // Someone else is still free to challenge them
+    const c = await createUser(app, "carol");
+    const nc = await open("/notifications", c.clerkId);
+    nc.send(challengeTo(b));
+    await nb.next("challenge_received");
+    await nc.none("error");
+  });
+
+  test("a challenge carries a version that changes with its terms", async () => {
+    const a = await createUser(app, "alice");
+    const b = await createUser(app, "bobby");
+    await befriend(a, b);
+    const na = await open("/notifications", a.clerkId);
+    const nb = await open("/notifications", b.clerkId);
+    const received = async () => (await nb.next("challenge_received")).data;
+    const listed = async () =>
+      (await app.inject({ url: "/api/challenges", headers: { authorization: `Bearer ${b.clerkId}` } })).json()
+        .challenges[0];
+
+    na.send(challengeTo(b));
+    const first = await received();
+    assert.equal(typeof first.version, "number");
+    assert.equal((await listed()).version, first.version);
+    const sent = (
+      await app.inject({ url: "/api/challenges/sent", headers: { authorization: `Bearer ${a.clerkId}` } })
+    ).json().challenge;
+    assert.equal(sent.version, first.version);
+
+    // The same terms again: same version (only the expiry is refreshed)
+    na.send(challengeTo(b));
+    assert.equal((await received()).version, first.version);
+
+    // Other terms: a new version, and accepting the old one is refused
+    na.send({ ...challengeTo(b), data: { ...challengeTo(b).data, time: 60 } });
+    const second = await received();
+    assert.notEqual(second.version, first.version);
+    assert.equal(second.time, 60);
+    nb.send({ type: "challenge_accepted", data: { challengerId: a.id, version: first.version } });
+    const refused = await nb.next("error");
+    assert.equal(refused.data.code, "CHALLENGE_CHANGED");
+    assert.equal(refused.data.message, "The challenge changed. Check the new terms.");
+    // The challenged player is shown the challenge as it now stands, still open
+    const resent = await received();
+    assert.equal(resent.version, second.version);
+    assert.equal(resent.time, 60);
+    await na.none("match_created");
+    assert.equal((await listed()).version, second.version);
+
+    // Accepting the current version starts the game on its terms
+    nb.send({ type: "challenge_accepted", data: { challengerId: a.id, version: second.version } });
+    const created = await na.next("match_created");
+    assert.equal(created.data.time, 60);
+  });
+
+  test("a challenge cancelled and sent again never reuses a version", async () => {
+    const a = await createUser(app, "alice");
+    const b = await createUser(app, "bobby");
+    await befriend(a, b);
+    const na = await open("/notifications", a.clerkId);
+    const nb = await open("/notifications", b.clerkId);
+    na.send(challengeTo(b));
+    const first = (await nb.next("challenge_received")).data;
+    na.send({ type: "challenge_cancelled", data: { challengedId: b.id } });
+    await nb.next("challenge_cancelled");
+    na.send(challengeTo(b));
+    const second = (await nb.next("challenge_received")).data;
+    assert.notEqual(second.version, first.version);
+    nb.send({ type: "challenge_accepted", data: { challengerId: a.id, version: first.version } });
+    assert.equal((await nb.next("error")).data.code, "CHALLENGE_CHANGED");
+  });
+
+  test("accepting without a version still works (older clients)", async () => {
+    const a = await createUser(app, "alice");
+    const b = await createUser(app, "bobby");
+    const na = await open("/notifications", a.clerkId);
+    const nb = await open("/notifications", b.clerkId);
+    na.send(challengeTo(b));
+    await nb.next("challenge_received");
+    nb.send({ type: "challenge_accepted", data: { challengerId: a.id } });
+    await na.next("match_created");
+    await nb.next("match_created");
   });
 
   test("one player can't challenge strangers without end", async () => {

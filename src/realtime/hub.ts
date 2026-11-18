@@ -54,7 +54,17 @@ interface Attached {
 type Envelope =
   | { origin: string; topic: string; message: object }
   | { origin: string; closeUser: number }
-  | { origin: string; closeTopic: string; code: number; reason: string };
+  | { origin: string; closeTopic: string; code: number; reason: string }
+  /** "This instance is alive": sent on start and on every heartbeat */
+  | { origin: string; beat: true };
+
+/**
+ * A message envelope as publish() writes it: the same text JSON.stringify
+ * makes of { origin, topic, message }, with the message's own JSON pasted
+ * in, so a message is stringified once. Receivers read origin and topic with
+ * this and hand the rest on without parsing and re-stringifying it.
+ */
+const MESSAGE_ENVELOPE = /^\{"origin":"(?:[^"\\]|\\.)*","topic":("(?:[^"\\]|\\.)*"),"message":/;
 
 /**
  * Routes WebSocket messages between server instances.
@@ -86,6 +96,19 @@ export class RealtimeHub {
   private socketSeq = 0;
   /** Set while shutting down: sockets close because of us, not the user */
   private stopping = false;
+  /**
+   * Connections per user: from the handshake (reserveSocketSlot) until the
+   * connection closes, attached to topics or not
+   */
+  private connectionsPerUser = new Map<number, number>();
+  /**
+   * When another instance was last heard from (its heartbeat or any of its
+   * envelopes). Starts at "now" so a new instance publishes to Redis until it
+   * has had time to hear everyone's heartbeat: see othersAlive.
+   */
+  private othersSeenAt = Date.now();
+  /** Starts every envelope this instance sends, to drop our own echoes unread */
+  private readonly ownPrefix = `{"origin":${JSON.stringify(this.instanceId)},`;
 
   constructor(
     private redis: RedisClient,
@@ -93,11 +116,16 @@ export class RealtimeHub {
   ) {}
 
   async start(): Promise<void> {
+    this.othersSeenAt = Date.now();
     await this.renewLiveness();
     this.sub = this.redis.duplicate();
     this.sub.on("error", (err) => this.log.error({ err }, "Redis subscriber error"));
     await this.sub.connect();
     await this.sub.subscribe(CHANNEL, (raw) => this.onEnvelope(raw));
+    // Subscribed first, then announced: the instances already running start
+    // publishing to Redis again the moment this arrives, before this one
+    // serves its first request
+    await this.announce();
     this.heartbeat = setInterval(() => void this.beat(), HEARTBEAT_MS);
     this.keyRefresh = setInterval(() => void this.refreshKeys(), KEY_REFRESH_MS);
   }
@@ -233,30 +261,117 @@ export class RealtimeHub {
   }
 
   /**
-   * Delivers to this instance's sockets at once (no Redis round trip before
-   * players see a move), then hands the message to the other instances.
+   * Whether another instance may be running and listening on the channel:
+   * one was heard from (a heartbeat every HEARTBEAT_MS, or any envelope)
+   * within INSTANCE_TTL_MS, or this instance started less than that long
+   * ago. No Redis read: it is kept up to date by the subscription. While it
+   * is false nothing needs to cross instances, so publish() skips Redis and
+   * sweeps that only matter for other instances can skip their work.
+   *
+   * A new instance announces itself as soon as it has subscribed, before it
+   * serves anything, so the running ones resume publishing straight away;
+   * the only messages it can miss are ones published in the moment the
+   * announcement is in flight, before any of its sockets exist. It also
+   * assumes others are alive for its own first INSTANCE_TTL_MS, until it has
+   * heard their heartbeats. An instance that stops is still published to
+   * for up to INSTANCE_TTL_MS, which is harmless.
    */
-  async publish(topic: string, message: object): Promise<void> {
-    this.deliverLocal(topic, JSON.stringify(message));
-    const envelope: Envelope = { origin: this.instanceId, topic, message };
-    await this.redis.publish(CHANNEL, JSON.stringify(envelope));
+  get othersAlive(): boolean {
+    return Date.now() - this.othersSeenAt < INSTANCE_TTL_MS;
+  }
+
+  /**
+   * Delivers to this instance's sockets at once (no Redis round trip before
+   * players see a move), then hands the message to the other instances,
+   * unless none is running (othersAlive). The Redis command is issued before
+   * this returns, and commands on one connection run in order, so callers
+   * don't need to await one publish before the next to keep them in order;
+   * the promise is for callers that want to know it failed. A failure is
+   * also logged, so a publish nobody awaits can't become an unhandled rejection.
+   */
+  publish(topic: string, message: object): Promise<void> {
+    const payload = JSON.stringify(message);
+    this.deliverLocal(topic, payload);
+    if (!this.othersAlive) return Promise.resolve();
+    // Exactly what JSON.stringify({ origin, topic, message }) would write
+    return this.send(
+      `${this.ownPrefix}"topic":${JSON.stringify(topic)},"message":${payload}}`
+    );
   }
 
   /** Closes every socket a user holds, on all instances (their account is gone). */
-  async closeUserSockets(userId: number): Promise<void> {
+  closeUserSockets(userId: number): Promise<void> {
     this.closeLocal(userId);
+    if (!this.othersAlive) return Promise.resolve();
     const envelope: Envelope = { origin: this.instanceId, closeUser: userId };
-    await this.redis.publish(CHANNEL, JSON.stringify(envelope));
+    return this.send(JSON.stringify(envelope));
   }
 
   /**
    * Closes every socket listening on a topic, on all instances (e.g. a study
    * room someone was removed from, or one that was deleted).
    */
-  async closeTopicSockets(topic: string, code = 4003, reason = "Access removed"): Promise<void> {
+  closeTopicSockets(topic: string, code = 4003, reason = "Access removed"): Promise<void> {
     this.closeTopicLocal(topic, code, reason);
+    if (!this.othersAlive) return Promise.resolve();
     const envelope: Envelope = { origin: this.instanceId, closeTopic: topic, code, reason };
-    await this.redis.publish(CHANNEL, JSON.stringify(envelope));
+    return this.send(JSON.stringify(envelope));
+  }
+
+  private send(raw: string): Promise<void> {
+    // Whether Redis counts our own subscriber among the receivers. While it
+    // is down (reconnecting, or not started) it doesn't, and one receiver
+    // is another instance. Checked when sending and again on the reply, so
+    // a subscriber that drops in between can't make us think we're alone.
+    const listeningAtSend = this.sub?.isReady === true;
+    let published: Promise<number>;
+    try {
+      published = this.redis.publish(CHANNEL, raw);
+    } catch (err) {
+      // A client that is closing may throw rather than reject
+      published = Promise.reject(err);
+    }
+    const sent = published.then((receivers) => {
+      // Our own subscriber is one of them (if it is up): more means another
+      // instance is listening
+      const self = listeningAtSend && this.sub?.isReady === true ? 1 : 0;
+      if (receivers > self) this.othersSeenAt = Date.now();
+    });
+    sent.catch((err) => this.log.warn({ err }, "Publishing to other instances failed"));
+    return sent;
+  }
+
+  /** Tells the other instances this one is alive (on start and every heartbeat). */
+  private async announce(): Promise<void> {
+    const envelope: Envelope = { origin: this.instanceId, beat: true };
+    await this.send(JSON.stringify(envelope)).catch(() => {});
+  }
+
+  /**
+   * Takes one of a user's MAX socket slots on this instance for a WebSocket
+   * handshake, or returns null if they are all taken. Counted from the
+   * handshake rather than from attach(), so many handshakes at once can't
+   * all pass the check before any of them is counted. Call the returned
+   * function when the connection closes (whether or not it ever upgraded or
+   * attached); calling it again does nothing.
+   */
+  reserveSocketSlot(userId: number, max: number): (() => void) | null {
+    const held = this.connectionsPerUser.get(userId) ?? 0;
+    if (held >= max) return null;
+    this.connectionsPerUser.set(userId, held + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.connectionsPerUser.get(userId) ?? 1) - 1;
+      if (remaining > 0) this.connectionsPerUser.set(userId, remaining);
+      else this.connectionsPerUser.delete(userId);
+    };
+  }
+
+  /** Connections a user holds on this instance, including handshakes under way. */
+  userConnectionCount(userId: number): number {
+    return this.connectionsPerUser.get(userId) ?? 0;
   }
 
   async isPresent(kind: PresenceKind, userId: number): Promise<boolean> {
@@ -291,6 +406,20 @@ export class RealtimeHub {
   }
 
   private onEnvelope(raw: string): void {
+    // Our own publishes come back to our subscriber too; already delivered
+    if (raw.startsWith(this.ownPrefix)) return;
+    this.othersSeenAt = Date.now();
+    const message = MESSAGE_ENVELOPE.exec(raw);
+    if (message && raw.endsWith("}")) {
+      let topic: unknown;
+      try {
+        topic = JSON.parse(message[1]!);
+      } catch {
+        return;
+      }
+      if (typeof topic === "string") this.deliverLocal(topic, raw.slice(message[0].length, -1));
+      return;
+    }
     let parsed: Partial<Envelope> & { topic?: string; message?: object; closeUser?: number; closeTopic?: string; code?: number; reason?: string };
     try {
       parsed = JSON.parse(raw);
@@ -336,7 +465,10 @@ export class RealtimeHub {
     });
   }
 
-  /** Pings every socket (terminating ones that never answered) and renews this instance's liveness. */
+  /**
+   * Pings every socket (terminating ones that never answered), renews this
+   * instance's liveness key and tells the other instances it is alive.
+   */
   private async beat(): Promise<void> {
     for (const [socket, entry] of this.attached) {
       if (!entry.alive) {
@@ -346,7 +478,10 @@ export class RealtimeHub {
       entry.alive = false;
       socket.ping();
     }
-    await this.renewLiveness().catch((err) => this.log.error({ err }, "Renewing instance liveness failed"));
+    await Promise.all([
+      this.renewLiveness().catch((err) => this.log.error({ err }, "Renewing instance liveness failed")),
+      this.announce(),
+    ]);
   }
 
   /** Keeps the sets this instance has members in from expiring. One command per set per hour. */

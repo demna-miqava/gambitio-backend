@@ -5,6 +5,7 @@ import { keepAuthenticated, onValidatedMessage, sendError, sendJson } from "../.
 import { gameClientMessageSchema } from "../../schemas/wsSchemas.js";
 import { AppError } from "../../errors/AppError.js";
 import { spectatorsKey } from "../../services/liveGameService.js";
+import { CLIENT_RTT_HEADER, parseClientRtt, RttProbe } from "./rttProbe.js";
 
 export async function gameWebSocketRoute(fastify: FastifyInstance) {
   const { hub, liveGames, gameChat } = fastify;
@@ -27,17 +28,31 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
         return;
       }
 
+      // Cloudflare's TCP round trip to this browser, from the Worker
+      const tcpRttMs = parseClientRtt(request.headers[CLIENT_RTT_HEADER]);
+      // Set while this socket is a player's in a game in progress (see sendState)
+      let probe: RttProbe | null = null;
+      let detachPlayer: (() => void) | null = null;
+      socket.once("close", () => {
+        probe?.stop();
+        detachPlayer?.();
+      });
+
       // Register before anything async so no message is missed. Anyone may
       // watch; only the two players can act (checked by LiveGameService).
       onValidatedMessage(socket, gameClientMessageSchema, request.log, async (message, { receivedAt }) => {
         const userId = user.id;
         switch (message.type) {
           case "move":
-            // Timed from arrival: queueing and database work don't cost the player
+            // Timed from arrival: queueing and database work don't cost the
+            // player. The round trip is the server's own measure (see
+            // MAX_LAG_COMPENSATION_MS)
             return liveGames.move(gameId, userId, message.move, {
               receivedAt,
               thinkMs: message.thinkMs,
               ply: message.ply,
+              measuredRttMs: probe ? probe.measuredMs : tcpRttMs,
+              rttSources: { pingMs: probe?.pingMs, tcpMs: tcpRttMs },
             });
           case "resign":
             return liveGames.resign(gameId, userId);
@@ -82,9 +97,10 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
       /**
        * Full state for this socket: on connect, and when the client asks
        * ("sync"). On connect, a spectator of a live game is counted before
-       * the state goes out, so the count they see includes them.
+       * the state goes out, so the count they see includes them; the count
+       * is returned so it isn't read again for the broadcast.
        */
-      async function sendState(onConnect = false): Promise<void> {
+      async function sendState(onConnect = false): Promise<number | undefined> {
         const state = await liveGames.getState(gameId, user.id);
         const { data } = state;
         const isPlayer = user.id === data.whitePlayer.id || user.id === data.blackPlayer.id;
@@ -98,6 +114,14 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
               return false;
             });
         }
+        // A player's socket in a game in progress: measure its round trip,
+        // and count the game as played here (it is paused if this server
+        // shuts down). Not if the socket closed while the state was loading
+        if (isPlayer && live && !probe && socket.readyState === socket.OPEN) {
+          probe = new RttProbe(socket, tcpRttMs);
+          probe.start();
+          detachPlayer = liveGames.attachPlayer(gameId, probe);
+        }
         const spectators = live ? await liveGames.spectatorCount(gameId).catch(() => undefined) : undefined;
         // Chat is between the players: spectators get none of it. A failure
         // here leaves the game without chat rather than without a board
@@ -108,11 +132,12 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
             })
           : null;
         sendJson(socket, { ...state, data: { ...data, spectators, ...(chat && { chat }) } });
+        return spectators;
       }
 
       try {
-        await sendState(true);
-        if (spectating) await liveGames.publishSpectatorCount(gameId);
+        const spectators = await sendState(true);
+        if (spectating) await liveGames.publishSpectatorCount(gameId, spectators);
       } catch (error) {
         sendError(socket, error instanceof AppError ? error.message : "Failed to load game");
         socket.close();

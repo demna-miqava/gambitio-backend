@@ -1,15 +1,22 @@
 import type { FastifyInstance } from "fastify";
-import { Chess } from "chess.js";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import type { PlayerColor } from "../models/common.js";
 import { AppError } from "../errors/AppError.js";
 import {
-  buildBook,
+  BookBuilder,
   checkGame,
+  MAX_LINE_PLIES,
   MAX_LINES_PER_USER,
   nextDue,
   normalizeLine,
+  pgnSans,
   type GameCheck,
 } from "../game/repertoire.js";
+
+/** Recent games GET /repertoire/check compares, by default and at most. */
+export const REPERTOIRE_CHECK_GAMES = { default: 20, max: 20 };
+/** Lines added to the books between turns of the event loop (each is a few chess.js moves). */
+const BOOK_LINES_PER_TURN = 10;
 
 interface LineRow {
   id: number;
@@ -140,13 +147,21 @@ export class RepertoireService {
   /**
    * The player's most recent finished games (online and against bots),
    * each compared with the repertoire for the colour they had.
+   *
+   * This is chess.js work on the event loop, which every live game on the
+   * instance shares, so it is kept small and done in slices: each game's
+   * moves are read from its PGN text and played once (checkGame, and only
+   * while they are in the book), and the loop lets other work run every few
+   * lines of the book and between games.
    */
   async checkRecentGames(userId: number, limit: number): Promise<RepertoireGameCheck[]> {
     const lines = await this.list(userId);
-    const books = {
-      white: buildBook(lines.filter((l) => l.color === "white")),
-      black: buildBook(lines.filter((l) => l.color === "black")),
-    };
+    const builders = { white: new BookBuilder(), black: new BookBuilder() };
+    for (const [i, line] of lines.entries()) {
+      if (i > 0 && i % BOOK_LINES_PER_TURN === 0) await nextTurn();
+      builders[line.color].add(line);
+    }
+    const books = { white: builders.white.book, black: builders.black.book };
     // One scan per colour, each walking its (player, createdAt) index
     const side = (column: string, extra = "") => `(
       SELECT id, "createdAt", pgn, result, "whiteId", "blackId", "whiteUsername", "blackUsername", "botId"
@@ -170,19 +185,15 @@ export class RepertoireService {
       [userId, limit]
     );
 
-    return rows.map((game) => {
+    const checks: RepertoireGameCheck[] = [];
+    for (const game of rows) {
+      await nextTurn();
       const color: PlayerColor = game.whiteId === userId ? "white" : "black";
-      const chess = new Chess();
-      let sans: string[] = [];
-      try {
-        if (game.pgn) chess.loadPgn(game.pgn);
-        sans = chess.history();
-      } catch {
-        sans = [];
-      }
+      // A line has at most MAX_LINE_PLIES moves, so checkGame stops by then
+      const sans = game.pgn ? pgnSans(game.pgn, MAX_LINE_PLIES + 1) : [];
       const won = game.result === (color === "white" ? "white_win" : "black_win");
       const isWhite = color === "white";
-      return {
+      checks.push({
         gameId: game.id,
         createdAt: game.createdAt,
         color,
@@ -194,7 +205,8 @@ export class RepertoireService {
         outcome: game.result === "draw" ? "draw" : won ? "win" : "loss",
         botId: game.botId,
         ...checkGame(books[color], sans, color),
-      };
-    });
+      });
+    }
+    return checks;
   }
 }

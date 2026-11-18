@@ -17,12 +17,18 @@ export async function challengeRoutes(fastify: FastifyInstance) {
         avatarUrl: challenge.challengerAvatarUrl,
         time: challenge.time,
         increment: challenge.increment,
+        // Each player's starting clock when they differ (time odds), from
+        // the receiving player's side; null for an even game
+        ownTime: challenge.challengedTime,
+        opponentTime: challenge.challengerTime,
         rating: challenge.challengerRating,
         // The color the receiving player will play
         color: challenge.challengerColor === "white" ? "black" : "white",
         bestOf: challenge.bestOf,
         seriesId: challenge.seriesId,
         seriesGame: challenge.seriesGame,
+        // Changes whenever the terms do; sent back when accepting
+        version: challenge.version,
       })),
     };
   });
@@ -43,10 +49,13 @@ export async function challengeRoutes(fastify: FastifyInstance) {
         username: challenge.challengedUsername,
         time: challenge.time,
         increment: challenge.increment,
+        ownTime: challenge.challengerTime,
+        opponentTime: challenge.challengedTime,
         color: challenge.challengerColor,
         bestOf: challenge.bestOf,
         seriesId: challenge.seriesId,
         seriesGame: challenge.seriesGame,
+        version: challenge.version,
       },
     };
   });

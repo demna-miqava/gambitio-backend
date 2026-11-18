@@ -12,7 +12,7 @@ import {
   startTestApp,
   type TestSocket,
 } from "./helpers.js";
-import { createGame } from "../src/services/gameService.js";
+import { createGame, finishGame } from "../src/services/gameService.js";
 import { RealtimeHub } from "../src/realtime/hub.js";
 import { reauthTimings } from "../src/realtime/socket.js";
 import { unverifiedSubject } from "../src/app.js";
@@ -285,21 +285,26 @@ describe("scalability changes", { skip: !integrationEnabled && "TEST_POSTGRES_UR
   });
 
   test("game history pages in order without pgn, with a correct total", async () => {
+    // Ended the way live games end, which keeps the history counter
+    // ("listedGames", migration 030) the total comes from
+    const play = (whiteId: number, blackId: number, outcome: Parameters<typeof finishGame>[2]) =>
+      app.pg.transact(async (tx) => {
+        const game = await createGame(tx, { whiteId, blackId, time: 180, increment: 0 });
+        await finishGame(tx, game, outcome, null);
+        return game;
+      });
     const ids: number[] = [];
     for (let i = 0; i < 7; i++) {
       const [w, b] = i % 2 === 0 ? [white.id, black.id] : [black.id, white.id];
-      const game = await app.pg.transact((tx) => createGame(tx, { whiteId: w, blackId: b, time: 180, increment: 0 }));
-      await app.pg.query(
-        `UPDATE games SET status = 'finished', result = 'draw', "createdAt" = now() - make_interval(mins => $2) WHERE id = $1`,
-        [game.id, i]
-      );
+      const game = await play(w, b, { result: "draw", reason: "draw_agreement" });
+      await app.pg.query(`UPDATE games SET "createdAt" = now() - make_interval(mins => $2) WHERE id = $1`, [
+        game.id,
+        i,
+      ]);
       ids.push(game.id);
     }
     // An aborted game is left out
-    const aborted = await app.pg.transact((tx) =>
-      createGame(tx, { whiteId: white.id, blackId: black.id, time: 180, increment: 0 })
-    );
-    await app.pg.query(`UPDATE games SET status = 'finished', result = 'aborted' WHERE id = $1`, [aborted.id]);
+    await play(white.id, black.id, { result: "aborted", reason: "aborted" });
 
     const page = async (n: number) =>
       (
@@ -317,6 +322,65 @@ describe("scalability changes", { skip: !integrationEnabled && "TEST_POSTGRES_UR
     assert.equal(pages[0].pagination.totalPages, 3);
     assert.equal(pages[0].data[0].pgn, undefined);
     assert.equal(pages[0].data[0].fen, undefined);
+
+    // A game in progress is listed, and counted, before it has ended
+    const live = await app.pg.transact((tx) =>
+      createGame(tx, { whiteId: white.id, blackId: black.id, time: 180, increment: 0 })
+    );
+    const withLive = await page(1);
+    assert.equal(withLive.data[0].id, live.id);
+    assert.equal(withLive.pagination.total, 8);
+    // The counter matches what migration 030 counts for an existing history
+    const { rows } = await app.pg.query<{ counter: number; counted: number }>(
+      `SELECT "listedGames" AS counter,
+         (SELECT count(*)::int FROM games WHERE ("whiteId" = $1 OR "blackId" = $1)
+            AND status IS DISTINCT FROM 'in_progress' AND result IS DISTINCT FROM 'aborted') AS counted
+       FROM users WHERE id = $1`,
+      [white.id]
+    );
+    assert.equal(rows[0]!.counter, 7);
+    assert.equal(rows[0]!.counted, 7);
+  });
+
+  test("the history page and head-to-head queries use their indexes", async () => {
+    // A history long enough that a sequential scan would cost more
+    await app.pg.query(
+      `INSERT INTO games ("whiteId", "blackId", "whiteUsername", "blackUsername", "whiteRating", "blackRating",
+         time, increment, status, result, "endReason", "numMoves", "createdAt")
+       SELECT CASE WHEN g % 2 = 0 THEN $1::int ELSE $2::int END,
+         CASE WHEN g % 2 = 0 THEN $2::int ELSE $1::int END, 'w', 'b', 1200, 1200, 180, 0, 'finished', 'draw', 'draw_agreement', 40, now() - make_interval(mins => g)
+       FROM generate_series(1, 2000) g`,
+      [white.id, black.id]
+    );
+    await app.pg.query("ANALYZE games");
+    const plan = async (sql: string, params: unknown[]) =>
+      (await app.pg.query(`EXPLAIN ${sql}`, params)).rows.map((r: any) => r["QUERY PLAN"]).join("\n");
+
+    const history = await plan(
+      `SELECT * FROM (
+         (SELECT id, "createdAt" FROM games WHERE "whiteId" = $1 AND result IS DISTINCT FROM 'aborted'
+          ORDER BY "createdAt" DESC, id DESC LIMIT $2)
+         UNION ALL
+         (SELECT id, "createdAt" FROM games WHERE "blackId" = $1 AND "whiteId" IS DISTINCT FROM $1
+            AND result IS DISTINCT FROM 'aborted'
+          ORDER BY "createdAt" DESC, id DESC LIMIT $2)
+       ) page ORDER BY "createdAt" DESC, id DESC LIMIT 10 OFFSET 90`,
+      [white.id, 100]
+    );
+    assert.match(history, /games_white_created_idx/);
+    assert.match(history, /games_black_created_idx/);
+    assert.doesNotMatch(history, /Seq Scan/);
+
+    const pair = await plan(
+      `SELECT id FROM games
+       WHERE LEAST("whiteId", "blackId") = LEAST($1::int, $2::int)
+         AND GREATEST("whiteId", "blackId") = GREATEST($1::int, $2::int)
+         AND status = 'finished' AND result IS DISTINCT FROM 'aborted' AND "botId" IS NULL
+       ORDER BY "createdAt" DESC, id DESC LIMIT 10`,
+      [white.id, black.id]
+    );
+    assert.match(pair, /games_pair_finished_idx/);
+    assert.doesNotMatch(pair, /Sort/);
   });
 
   test("stats still load when Redis is down", async () => {

@@ -9,8 +9,30 @@ import {
 import { cachedValue } from "../utils/cache.js";
 
 const GLOBAL_CACHE_SECONDS = 30;
+/**
+ * "v2": cachedValue stores {v, freshUntil}, while code from before it did
+ * reads `leaderboard:global:*` as the page itself. A new name keeps both
+ * working while instances of each run side by side.
+ */
 export const leaderboardCacheKey = (variant: LeaderboardVariant, page: number, limit: number) =>
-  `leaderboard:global:${variant}:${limit}:${page}`;
+  `leaderboard:v2:global:${variant}:${limit}:${page}`;
+/**
+ * The caller's own global position: a count over everyone above them, so not
+ * on every request. Dropped when their rating changes (a game ends, a rated
+ * puzzle attempt), see invalidateStats and invalidatePuzzleStats.
+ */
+const MY_POSITION_CACHE_SECONDS = 30;
+export const myPositionCacheKey = (variant: LeaderboardVariant, userId: number) =>
+  `leaderboard:me:${variant}:${userId}`;
+
+/**
+ * Listed players per variant (bullet, blitz, rapid, puzzle, and "all" for
+ * profile stats), the same number for everyone. Shared by the leaderboard's
+ * page count and the profile percentile (StatsService), whose filters for a
+ * variant are the same.
+ */
+export const LISTED_TOTAL_CACHE_SECONDS = 60;
+export const listedTotalCacheKey = (variant: string) => `listed:total:${variant}`;
 
 type Page = Pick<LeaderboardResponse, "data" | "pagination">;
 
@@ -21,8 +43,10 @@ type Page = Pick<LeaderboardResponse, "data" | "pagination">;
  * Ranking: rating DESC; equal ratings share a rank (competition ranking:
  * 1, 2, 2, 4) and are listed by user id ASC (older account first). Only
  * players with a rated game in the variant are listed (see
- * LeaderboardRepository). Global pages are cached for GLOBAL_CACHE_SECONDS;
- * the caller's own entry ("me") is always computed fresh.
+ * LeaderboardRepository). Global pages are cached for GLOBAL_CACHE_SECONDS,
+ * the number of listed players for LISTED_TOTAL_CACHE_SECONDS, and the
+ * caller's own global entry ("me") for MY_POSITION_CACHE_SECONDS. The
+ * friends scope is small and always computed fresh.
  */
 export class LeaderboardService {
   private repository: LeaderboardRepository;
@@ -40,9 +64,18 @@ export class LeaderboardService {
   }): Promise<LeaderboardResponse> {
     const { userId, variant, scope, page, limit } = params;
     const computePage = () => this.computePage(userId, variant, scope, page, limit);
+    const findPosition = () => this.repository.findPosition(variant, { scope, userId });
     const [pageData, position] = await Promise.all([
       scope === "global" ? this.cachedGlobal(variant, page, limit, computePage) : computePage(),
-      this.repository.findPosition(variant, { scope, userId }),
+      scope === "global"
+        ? cachedValue(
+            this.fastify.redis,
+            this.fastify.log,
+            myPositionCacheKey(variant, userId),
+            MY_POSITION_CACHE_SECONDS,
+            findPosition
+          )
+        : findPosition(),
     ]);
 
     return {
@@ -67,7 +100,7 @@ export class LeaderboardService {
     const offset = (page - 1) * limit;
     const [rows, total] = await Promise.all([
       this.repository.findPage(variant, { scope, userId }, limit, offset),
-      this.repository.count(variant, { scope, userId }),
+      scope === "global" ? this.globalTotal(variant) : this.repository.count(variant, { scope, userId }),
     ]);
     // The first row may tie with rows on the previous page
     const firstRank = rows.length
@@ -77,6 +110,18 @@ export class LeaderboardService {
       data: assignRanks(rows, offset, firstRank),
       pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
     };
+  }
+
+  /** Listed players in the variant, cached once for every page and profile. */
+  private globalTotal(variant: LeaderboardVariant): Promise<number> {
+    return cachedValue(
+      this.fastify.redis,
+      this.fastify.log,
+      listedTotalCacheKey(variant),
+      LISTED_TOTAL_CACHE_SECONDS,
+      () => this.repository.count(variant, { scope: "global", userId: 0 }),
+      { staleSeconds: LISTED_TOTAL_CACHE_SECONDS }
+    );
   }
 
   private cachedGlobal(

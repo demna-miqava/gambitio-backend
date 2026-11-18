@@ -7,6 +7,7 @@ import {
   appendToPgn,
   loadGame,
   takebackPlies,
+  truncatePgn,
   undoMoves,
 } from "../src/game/engine.js";
 import { PositionCache } from "../src/game/positionCache.js";
@@ -89,6 +90,45 @@ test("undoing moves gives the PGN the moves would have written", () => {
     assert.ok(next.ok);
     assert.equal(next.pgn, position.pgn());
   }
+});
+
+test("takebacks cut the stored PGN to exactly what chess.js would write", () => {
+  for (let seed = 1; seed <= 6; seed++) {
+    const random = rng(seed);
+    const chess = new Chess();
+    let pgn = "";
+    let ply = 0;
+    while (!chess.isGameOver() && ply < 120) {
+      const moves = chess.moves({ verbose: true });
+      const pick = moves[Math.floor(random() * moves.length)]!;
+      const played = applyMoveTo(chess, pgn, ply, { from: pick.from, to: pick.to, promotion: pick.promotion as "q" | undefined });
+      assert.ok(played.ok);
+      ({ pgn, ply } = played);
+      if (ply >= 4 && random() < 0.15) {
+        const plies = ply % 2 === 0 ? 2 : 1;
+        const sans = chess.history().slice(-plies);
+        const undone = undoMoves(chess, ply, plies, pgn);
+        assert.equal(undone.pgn, chess.pgn(), `seed ${seed} at ply ${ply}`);
+        assert.equal(truncatePgn(pgn, ply, sans), undone.pgn, "by cutting the PGN, not the fallback");
+        ({ pgn, ply } = undone);
+      }
+    }
+  }
+});
+
+test("truncatePgn refuses PGN it can't vouch for", () => {
+  const chess = new Chess();
+  let pgn = "";
+  for (const [i, [from, to]] of ([["e2", "e4"], ["e7", "e5"], ["g1", "f3"]] as const).entries()) {
+    const played = applyMoveTo(chess, pgn, i, { from, to });
+    assert.ok(played.ok);
+    pgn = played.pgn;
+  }
+  assert.equal(truncatePgn(pgn, 3, ["Nc3"]), null, "not the move that was undone");
+  assert.equal(truncatePgn(pgn, 4, ["Nf3"]), null, "wrong ply count");
+  assert.equal(truncatePgn("1. e4 e5 2. Nf3 *", 3, ["Nf3"]), null, "not appendToPgn's format");
+  assert.equal(truncatePgn(pgn, 3, ["e4", "e5", "Nf3"]), null, "would leave no moves");
+  assert.ok(truncatePgn(pgn, 3, ["e5", "Nf3"])?.endsWith("\n\n1. e4 *"));
 });
 
 test("appendToPgn refuses PGN it didn't write", () => {

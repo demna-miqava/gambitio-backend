@@ -74,7 +74,7 @@
 		// changing the Backend class in worker/index.ts: a running backend
 		// keeps the settings it started with, and this moves everyone to
 		// freshly created ones. See generationOf in worker/index.ts.
-		"BACKEND_GENERATION": "2",
+		"BACKEND_GENERATION": "3",
 	},
 	"observability": {
 		"enabled": true,

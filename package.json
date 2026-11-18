@@ -11,6 +11,7 @@
     "migrate": "tsx --env-file=.env scripts/migrate.ts",
     "generate-vapid-keys": "web-push generate-vapid-keys",
     "import-puzzles": "tsx --env-file=.env scripts/import-lichess-puzzles.ts",
+    "reports": "tsx --env-file=.env scripts/reports.ts",
     "test": "node --import tsx --test --test-concurrency=1 \"test/**/*.test.ts\"",
     "typecheck:worker": "tsc -p worker/tsconfig.json",
     "deploy": "grep -q '^VITE_CLERK_PUBLISHABLE_KEY=pk_live_' ../gambitio-frontend/.env.production || { echo 'Put your Clerk production key (pk_live_...) in gambitio-frontend/.env.production first'; exit 1; }; npm --prefix ../gambitio-frontend run build && wrangler deploy"

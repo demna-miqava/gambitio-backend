@@ -4,8 +4,10 @@ import { AppError } from "../errors/AppError.js";
 /**
  * The shared analysis of a study room: a move tree with comments and
  * arrows per position, and the position the group is looking at (cursor).
- * Stored as one JSON document (migration 018) and changed only through
- * applyStudyOp, under the room's row lock.
+ * The tree is stored as one JSON document (migration 018) and changed only
+ * through applyStudyOp, under the room's row lock. The cursor has its own
+ * column (migration 031), so moving around the tree doesn't rewrite the
+ * document; see StudyService.apply.
  */
 
 export const STUDY_BRUSHES = ["green", "red", "blue", "yellow"] as const;
@@ -123,6 +125,11 @@ export function createStudyState(options: { fen?: string | undefined; moves?: st
   return state;
 }
 
+/**
+ * Adds a move under `parentId`. `state.nodes` must be the state's own map
+ * (not shared with another state); the parent is replaced by a copy, so a
+ * node object is never changed once it is in a tree.
+ */
 function addChild(state: StudyState, parentId: string, san: string, uci: string, fen: string): string {
   const parent = state.nodes[parentId]!;
   // Prefixed so an id can never be "root"
@@ -138,7 +145,7 @@ function addChild(state: StudyState, parentId: string, san: string, uci: string,
     comment: "",
     shapes: [],
   };
-  parent.children.push(id);
+  state.nodes[parentId] = { ...parent, children: [...parent.children, id] };
   return id;
 }
 
@@ -159,12 +166,15 @@ const SQUARE = /^[a-h][1-8]$/;
 const UCI = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
 
 /**
- * Applies an op to a copy of the state. Throws INVALID_STUDY_ACTION for an
- * illegal move, an unknown node or a limit reached; the stored state is
- * then left as it was.
+ * Applies an op and returns the new state; `current` is left as it was.
+ * Copy-on-write: the new state gets its own node map, and only the nodes
+ * the op changes are copied, so the two states share every other node
+ * (treat both as read-only). Throws INVALID_STUDY_ACTION for an illegal
+ * move, an unknown node or a limit reached; the stored state is then left
+ * as it was.
  */
 export function applyStudyOp(current: StudyState, op: StudyOp): { state: StudyState; change: StudyChange } {
-  const state: StudyState = structuredClone(current);
+  const state: StudyState = { ...current, nodes: { ...current.nodes } };
   switch (op.type) {
     case "goto": {
       nodeOf(state, op.nodeId);
@@ -175,7 +185,7 @@ export function applyStudyOp(current: StudyState, op: StudyOp): { state: StudySt
     case "move": {
       const parent = nodeOf(state, op.nodeId);
       if (!UCI.test(op.uci)) throw invalid("Illegal move");
-      const existing = parent.children.find((id) => state.nodes[id]!.uci === op.uci);
+      const existing = existingChild(state, parent, op.uci);
       if (existing) {
         state.cursor = existing;
         return { state, change: { kind: "cursor", cursor: existing } };
@@ -204,9 +214,9 @@ export function applyStudyOp(current: StudyState, op: StudyOp): { state: StudySt
       const text = op.text.trim();
       if (text.length > MAX_COMMENT_LENGTH) throw invalid("Comment is too long");
       if (node.comment === text) return { state, change: { kind: "none" } };
-      node.comment = text;
-      if (text.length > (current.nodes[node.id]?.comment.length ?? 0)) assertSize(state);
-      return { state, change: { kind: "node", node } };
+      const changed = (state.nodes[node.id] = { ...node, comment: text });
+      if (text.length > node.comment.length) assertSize(state);
+      return { state, change: { kind: "node", node: changed } };
     }
     case "shapes": {
       const node = nodeOf(state, op.nodeId);
@@ -222,16 +232,16 @@ export function applyStudyOp(current: StudyState, op: StudyOp): { state: StudySt
         const shape: StudyShape = { orig: s.orig, brush: s.brush, ...(s.dest && s.dest !== s.orig ? { dest: s.dest } : {}) };
         byKey.set(`${shape.orig}${shape.dest ?? ""}`, shape);
       }
-      node.shapes = [...byKey.values()];
-      if (node.shapes.length > (current.nodes[node.id]?.shapes.length ?? 0)) assertSize(state);
-      return { state, change: { kind: "node", node } };
+      const changed = (state.nodes[node.id] = { ...node, shapes: [...byKey.values()] });
+      if (changed.shapes.length > node.shapes.length) assertSize(state);
+      return { state, change: { kind: "node", node: changed } };
     }
     case "delete": {
       const node = nodeOf(state, op.nodeId);
       if (node.parentId === null) throw invalid("The starting position can't be deleted");
       const removed = subtree(state, node.id);
       const parent = state.nodes[node.parentId]!;
-      parent.children = parent.children.filter((id) => id !== node.id);
+      state.nodes[parent.id] = { ...parent, children: parent.children.filter((id) => id !== node.id) };
       for (const id of removed) delete state.nodes[id];
       if (removed.includes(state.cursor)) state.cursor = parent.id;
       return { state, change: { kind: "deleted", nodeId: node.id, parentId: parent.id, cursor: state.cursor } };
@@ -244,14 +254,34 @@ export function applyStudyOp(current: StudyState, op: StudyOp): { state: StudySt
       while (child.parentId !== null) {
         const parent = state.nodes[child.parentId]!;
         if (parent.children[0] !== child.id) {
-          parent.children = [child.id, ...parent.children.filter((id) => id !== child.id)];
-          return { state, change: { kind: "children", parentId: parent.id, children: parent.children } };
+          const children = [child.id, ...parent.children.filter((id) => id !== child.id)];
+          state.nodes[parent.id] = { ...parent, children };
+          return { state, change: { kind: "children", parentId: parent.id, children } };
         }
         child = parent;
       }
       return { state, change: { kind: "none" } };
     }
   }
+}
+
+/** The child of `parent` reached by the move `uci`, if the tree has it. */
+function existingChild(state: StudyState, parent: StudyNode, uci: string): string | undefined {
+  return parent.children.find((id) => state.nodes[id]!.uci === uci);
+}
+
+/**
+ * The document as stored: everything but the cursor, which has its own
+ * column (migration 031).
+ */
+export function storedStudyDocument(state: StudyState): string {
+  const { cursor: _cursor, ...document } = state;
+  return JSON.stringify(document);
+}
+
+/** Positions in the tree, the root included (the "nodeCount" column). */
+export function nodeCount(state: StudyState): number {
+  return Object.keys(state.nodes).length;
 }
 
 /** The document must stay small enough to store and send whole (see MAX_STUDY_BYTES). */
