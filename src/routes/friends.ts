@@ -21,6 +21,17 @@ export async function friendsRoutes(fastify: FastifyInstance) {
   });
 
   /**
+   * GET /api/friends/status
+   * The signed-in user's friends who are online or playing (see
+   * FriendService.getFriendStatuses). Clients poll it while a list is shown.
+   */
+  fastify.get(
+    "/friends/status",
+    { preHandler: authMiddleware, config: { rateLimit: { max: 60, timeWindow: "1 minute" } } },
+    async (request) => ({ data: await friendService.getFriendStatuses(request.user!.id) })
+  );
+
+  /**
    * DELETE /api/friends/:friendId
    * Either user in the friendship can delete it
    */

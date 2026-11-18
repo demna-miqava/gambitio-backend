@@ -404,4 +404,42 @@ export class FriendRepository {
 
     return (rowCount ?? 0) > 0;
   }
+
+  /**
+   * Every friend of the user, with the live game each has in progress (if
+   * any): what the friends status list needs besides presence. The game is
+   * found through the partial indexes on live games (migration 014), one
+   * lookup per friend.
+   */
+  async getFriendsWithLiveGame(userId: number): Promise<FriendWithLiveGame[]> {
+    const { rows } = await this.fastify.pg.query<FriendWithLiveGame>(
+      `SELECT u.id, u.username, u."avatarUrl", f."createdAt" AS "friendsSince",
+              u."blitzRating", u."bulletRating", u."rapidRating",
+              g.id AS "gameId", g.time AS "gameTime"
+       FROM friends f
+       INNER JOIN users u ON (${this.buildFriendJoinCondition()})
+       LEFT JOIN LATERAL (
+         SELECT id, time FROM games
+         WHERE status = 'in_progress' AND ("whiteId" = u.id OR "blackId" = u.id)
+         LIMIT 1
+       ) g ON true
+       WHERE f."userOneId" = $1 OR f."userTwoId" = $1
+       ORDER BY u.username`,
+      [userId]
+    );
+    return rows;
+  }
+}
+
+export interface FriendWithLiveGame {
+  id: number;
+  username: string;
+  avatarUrl: string | null;
+  friendsSince: Date;
+  blitzRating: number | null;
+  bulletRating: number | null;
+  rapidRating: number | null;
+  gameId: number | null;
+  /** The game's starting clock (seconds), for its time control */
+  gameTime: number | null;
 }

@@ -386,6 +386,34 @@ export class RealtimeHub {
     return (await this.liveMembers(presenceKey(kind, userId))).length > 0;
   }
 
+  /**
+   * Which of these users are present (isPresent) for this kind, on any
+   * instance: for a friends list, not for the whole site. Users with a
+   * socket here need no Redis read; the rest cost one read each, sent
+   * together (node-redis pipelines them into one round trip), plus one
+   * liveness read for the other instances found. Members of this instance
+   * whose socket is no longer counted here are on their way out (detach
+   * removes them from Redis just after), so they don't count.
+   */
+  async presentUserIds(kind: PresenceKind, userIds: readonly number[]): Promise<Set<number>> {
+    const present = new Set<number>();
+    const remote: number[] = [];
+    for (const userId of new Set(userIds)) {
+      if ((this.presenceSockets.get(`${kind}:${userId}`) ?? 0) > 0) present.add(userId);
+      else remote.push(userId);
+    }
+    if (remote.length === 0) return present;
+    const memberLists = await Promise.all(remote.map((userId) => this.redis.zRange(presenceKey(kind, userId), 0, -1)));
+    const others = [...new Set(memberLists.flat().map(instanceOf))].filter((id) => id !== this.instanceId);
+    if (others.length === 0) return present;
+    const flags = await this.redis.mGet(others.map(instanceKey));
+    const alive = new Set(others.filter((_, i) => flags[i] !== null));
+    remote.forEach((userId, i) => {
+      if (memberLists[i]!.some((member) => alive.has(instanceOf(member)))) present.add(userId);
+    });
+    return present;
+  }
+
   /** Sockets this instance holds for a user, across all socket types. */
   userSocketCount(userId: number): number {
     return this.socketsPerUser.get(userId) ?? 0;

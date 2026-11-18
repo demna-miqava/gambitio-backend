@@ -9,7 +9,9 @@ import type {
   PaginatedFriendRequestsResponse,
   Friend,
   FriendSuggestion,
+  FriendStatus,
 } from "../models/Friend.js";
+import { getTimeControl } from "../models/common.js";
 import {
   SelfFriendRequestError,
   UserNotFoundError,
@@ -104,6 +106,33 @@ export class FriendService {
     return searchQuery
       ? this.friendRepository.searchUsers(userId, searchQuery, limit)
       : this.friendRepository.getFriendSuggestions(userId, limit);
+  }
+
+  /**
+   * The user's friends who are online or playing (FriendStatus), available
+   * ones (online, not in a game: the ones who can be challenged) first, then
+   * those playing, each group by username. Only ever the user's own
+   * friends: nobody else learns whether a player is online.
+   */
+  async getFriendStatuses(userId: number): Promise<FriendStatus[]> {
+    const friends = await this.friendRepository.getFriendsWithLiveGame(userId);
+    const online = await this.fastify.hub.presentUserIds(
+      "notifications",
+      friends.filter((f) => f.gameId === null).map((f) => f.id)
+    );
+    const statuses: FriendStatus[] = [];
+    for (const friend of friends) {
+      const playing = friend.gameId !== null;
+      if (!playing && !online.has(friend.id)) continue;
+      const { gameTime: _, ...item } = friend;
+      statuses.push({
+        ...item,
+        status: playing ? "playing" : "online",
+        gameType: friend.gameTime === null ? null : getTimeControl(friend.gameTime),
+      });
+    }
+    // Stable: keeps the username order within each group
+    return statuses.sort((a, b) => Number(a.status === "playing") - Number(b.status === "playing"));
   }
 
   /**

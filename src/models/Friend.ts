@@ -1,3 +1,5 @@
+import type { TimeControl } from "./common.js";
+
 export interface Friend {
   id: number;
   createdAt: Date;
@@ -69,6 +71,29 @@ export interface FriendListItem {
   bulletRating: number | null;
   rapidRating: number | null;
   status?: FriendshipStatus;
+}
+
+/**
+ * A friend who is online or playing, for the signed-in user. Friends who are
+ * neither aren't listed.
+ *
+ * - "online": has the site open (a notifications socket), so they can be
+ *   challenged
+ * - "playing": has a live game in progress (whether or not their tab is open)
+ */
+export interface FriendStatus {
+  /** The same fields as a friends list item, so clients show it the same way */
+  id: number;
+  username: string;
+  avatarUrl: string | null;
+  friendsSince: Date;
+  blitzRating: number | null;
+  bulletRating: number | null;
+  rapidRating: number | null;
+  status: "online" | "playing";
+  /** The game in progress, when playing */
+  gameId: number | null;
+  gameType: TimeControl | null;
 }
 
 /**
