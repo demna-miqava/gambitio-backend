@@ -24,6 +24,8 @@ export interface SaveTableGameInput extends TableGameClaim {
   blackTime: number;
   increment: number;
   opponent: { kind: "guest"; name: string } | { kind: "friend"; userId: number };
+  /** The browser's id for the game: saving it again returns the stored one (migration 041) */
+  clientId?: string | undefined;
 }
 
 /** A friend's table game waiting for them to confirm, as their inbox shows it */
@@ -64,6 +66,15 @@ export class TableGameService {
     const friendId = input.opponent.kind === "friend" ? input.opponent.userId : null;
     if (friendId === userId) throw new AppError("Pick someone else as the other player", "NOT_FRIENDS", 400);
 
+    // The same game sent again (a retry after a lost answer, another tab):
+    // the one stored the first time, counted against nothing. Looked up
+    // again under the recorder's row lock below, for two saves at once
+    const { clientId } = input;
+    if (clientId !== undefined) {
+      const saved = await gameRepository.findTableGameByClientId(this.fastify.pg, userId, clientId);
+      if (saved) return toGameResponse(saved);
+    }
+
     // Counted before the replay, so the cap also bounds the work spent on
     // uploads that turn out to be invalid (as for bot games)
     const allowed = await withinLimit(this.fastify.redis, `tablegames:saved:${userId}`, TABLE_GAMES_PER_DAY, 24 * 60 * 60);
@@ -76,6 +87,13 @@ export class TableGameService {
     const ratingColumn = `"${getTimeControl(time)}Rating"`;
 
     const { game, request } = await this.fastify.pg.transact(async (tx) => {
+      if (clientId !== undefined) {
+        // Saves by one recorder take this lock one at a time, so a save
+        // with the same id that committed meanwhile is seen here
+        await tx.query(`SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, [userId]);
+        const saved = await gameRepository.findTableGameByClientId(tx, userId, clientId);
+        if (saved) return { game: saved, request: null };
+      }
       // Locks the recorder's row (so their pending requests are counted one
       // save at a time) and counts the game in their history (migration 030)
       const { rows: me } = await tx.query<{ username: string; avatarUrl: string | null; rating: number }>(
@@ -86,11 +104,14 @@ export class TableGameService {
       const recorder = me[0];
       if (!recorder) throw new AppError("User not found", "USER_NOT_FOUND", 404);
 
+      // A guest, or a friend until they confirm: a plain name (no rating,
+      // avatar or id), so a game they never confirm says nothing else
+      // about them
       let other = { username: guestName ?? "", rating: 0 };
       if (friendId !== null) {
         // Only a friend, with no block either way, and not a deleted account
-        const { rows: friends } = await tx.query<{ username: string; rating: number; pending: number }>(
-          `SELECT u.username, u.${ratingColumn} AS rating,
+        const { rows: friends } = await tx.query<{ username: string; pending: number }>(
+          `SELECT u.username,
              (SELECT COUNT(*) FROM table_game_requests r
               WHERE r."recorderId" = $1 AND r."friendId" = u.id AND r.status = 'pending')::int AS pending
            FROM users u
@@ -112,7 +133,7 @@ export class TableGameService {
             409
           );
         }
-        other = friend;
+        other = { username: friend.username, rating: 0 };
       }
 
       const isWhite = input.color === "white";
@@ -139,6 +160,7 @@ export class TableGameService {
         endReason: reason,
         winnerId: recorderWon ? userId : null,
       });
+      if (clientId !== undefined) await gameRepository.recordTableGameClientId(tx, userId, clientId, game.id);
 
       let request: TableGameRequest | null = null;
       if (friendId !== null) {
@@ -197,12 +219,15 @@ export class TableGameService {
 
   /**
    * The friend confirms: their id goes on their side of the game, which then
-   * shows in their history. Refused if a block came between the two since.
+   * shows in their history, with their avatar and their rating for the
+   * game's time control as they are now (until then it was a plain name).
+   * Refused if a block came between the two since.
    */
   async confirm(userId: number, gameId: number): Promise<void> {
     const recorderId = await this.fastify.pg.transact(async (tx) => {
-      const { rows } = await tx.query<{ recorderId: number; color: PlayerColor }>(
-        `SELECT r."recorderId", r.color FROM table_game_requests r
+      const { rows } = await tx.query<{ recorderId: number; color: PlayerColor; time: number }>(
+        `SELECT r."recorderId", r.color, g.time FROM table_game_requests r
+         JOIN games g ON g.id = r."gameId"
          WHERE r."gameId" = $1 AND r."friendId" = $2 AND r.status = 'pending'
            AND NOT EXISTS (SELECT 1 FROM user_blocks b
              WHERE (b."blockerId" = r."recorderId" AND b."blockedId" = $2)
@@ -212,17 +237,19 @@ export class TableGameService {
       );
       const request = rows[0];
       if (!request) throw requestNotFound();
-      // Their name and avatar as they are now; counted in their history
-      const { rows: me } = await tx.query<{ username: string; avatarUrl: string | null }>(
-        `UPDATE users SET "listedGames" = "listedGames" + 1 WHERE id = $1 RETURNING username, "avatarUrl"`,
+      // Their name, avatar and rating as they are now; counted in their history
+      const ratingColumn = `"${getTimeControl(request.time)}Rating"`;
+      const { rows: me } = await tx.query<{ username: string; avatarUrl: string | null; rating: number }>(
+        `UPDATE users SET "listedGames" = "listedGames" + 1 WHERE id = $1
+         RETURNING username, "avatarUrl", ${ratingColumn} AS rating`,
         [userId]
       );
       const side = request.color === "white" ? "white" : "black";
       await tx.query(
-        `UPDATE games SET "${side}Id" = $2, "${side}Username" = $3, "${side}AvatarUrl" = $4,
+        `UPDATE games SET "${side}Id" = $2, "${side}Username" = $3, "${side}AvatarUrl" = $4, "${side}Rating" = $5,
            "winnerId" = CASE WHEN result = '${side}_win' THEN $2 ELSE "winnerId" END
          WHERE id = $1 AND "tableGame" AND "${side}Id" IS NULL`,
-        [gameId, userId, me[0]!.username, me[0]!.avatarUrl]
+        [gameId, userId, me[0]!.username, me[0]!.avatarUrl, me[0]!.rating]
       );
       await tx.query(`DELETE FROM table_game_requests WHERE "gameId" = $1`, [gameId]);
       return request.recorderId;
@@ -230,7 +257,11 @@ export class TableGameService {
     await this.announce(userId, recorderId, gameId, true);
   }
 
-  /** The friend declines: the game stays the recorder's, with their name on the other side. */
+  /**
+   * The friend declines: the game stays the recorder's, with only their name
+   * on the other side, as a guest's would be (nothing else about them was
+   * put on it). A block declines the same way (ModerationService.block).
+   */
   async decline(userId: number, gameId: number): Promise<void> {
     const { rows } = await this.fastify.pg.query<{ recorderId: number }>(
       `UPDATE table_game_requests SET status = 'declined'

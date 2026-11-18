@@ -25,6 +25,9 @@ ALTER TABLE series ADD CONSTRAINT series_best_of CHECK ("bestOf" IN (2, 3, 5));
 ALTER TABLE games
   ADD COLUMN "openingId" text,
   ADD COLUMN "startPly" smallint NOT NULL DEFAULT 0,
+  -- NOT VALID: new and changed rows are checked at once, but the rows already
+  -- there aren't scanned while this holds the table's exclusive lock.
+  -- Migration 042 validates it under a lock that doesn't block play.
   ADD CONSTRAINT games_start_ply CHECK (
     "startPly" >= 0 AND "numMoves" >= "startPly" AND ("openingId" IS NULL) = ("startPly" = 0)
-  );
+  ) NOT VALID;

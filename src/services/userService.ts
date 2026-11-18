@@ -6,6 +6,7 @@ import { AppError } from "../errors/AppError.js";
 import { isUniqueViolation, type TxClient } from "../db.js";
 import { gameRepository } from "../repositories/gameRepository.js";
 import { bothPlayersMoved } from "./gameService.js";
+import { inActiveTimedMatch } from "./seriesService.js";
 
 /**
  * `batchSize`: games rewritten per statement when an account is deleted,
@@ -107,8 +108,14 @@ export class UserService {
       const gameId = await gameRepository.findActiveGameIdForUser(this.fastify.pg, user.id);
       if (gameId !== null) {
         const game = await gameRepository.findById(this.fastify.pg, gameId);
-        // A tournament game can't be aborted: it is resigned whatever the move
-        await (game && !bothPlayersMoved(game) && game.tournamentId === null
+        // Tournament and timed match games can't be aborted: they are
+        // resigned whatever the move
+        const abortable =
+          game !== null &&
+          !bothPlayersMoved(game) &&
+          game.tournamentId === null &&
+          !(await inActiveTimedMatch(this.fastify.pg, game));
+        await (abortable
           ? this.fastify.liveGames.abort(gameId, user.id)
           : this.fastify.liveGames.resign(gameId, user.id)
         ).catch((error) => {
@@ -198,7 +205,15 @@ export class UserService {
        FROM table_game_requests r WHERE r."gameId" = g.id AND r."friendId" = $1`,
       id
     );
-    await tx.query(`DELETE FROM table_game_requests WHERE "friendId" = $1 OR "recorderId" = $1`, id);
+    await tx.query(`DELETE FROM table_game_requests WHERE "friendId" = $1`, id);
+    // The ones they recorded stay, declined (no longer in the friend's
+    // inbox), so the friend's name on those games still goes if the friend
+    // deletes their account later. Both use migration 041's indexes
+    await tx.query(
+      `UPDATE table_game_requests SET status = 'declined' WHERE "recorderId" = $1 AND status = 'pending'`,
+      id
+    );
+    await tx.query(`DELETE FROM table_game_saves WHERE "recorderId" = $1`, id);
     await tx.query(`DELETE FROM push_subscriptions WHERE "userId" = $1`, id);
     // Rooms they own go (with everyone's membership); they leave the others
     const { rows: rooms } = await tx.query<{ id: number }>(

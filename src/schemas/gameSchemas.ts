@@ -1,4 +1,4 @@
-import { MAX_TABLE_GAME_PGN_LENGTH, TABLE_END_REASONS } from "../game/tableGame.js";
+import { MAX_TABLE_GAME_PGN_LENGTH, TABLE_END_REASONS, TABLE_GAME_CLIENT_ID } from "../game/tableGame.js";
 import { TIME_LIMITS } from "../models/common.js";
 import { z } from "zod";
 import { MAX_BOT_GAME_PGN_LENGTH } from "../game/botGame.js";
@@ -45,5 +45,8 @@ export const saveTableGameSchema = z
       z.object({ kind: z.literal("guest"), name: z.string().min(1).max(100) }).strict(),
       z.object({ kind: z.literal("friend"), userId: z.number().int().positive().max(2_147_483_647) }).strict(),
     ]),
+    // The browser's own id for the game (migration 041): the same game sent
+    // again returns the one stored the first time
+    clientId: z.string().regex(TABLE_GAME_CLIENT_ID).optional(),
   })
   .strict();

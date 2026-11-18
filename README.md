@@ -138,13 +138,17 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
   the end, and one still going then is played out and counts. No abort or
   rematch while it runs; a player who never makes their first move loses
   the game (unrated), and two such games in a row end the match
-  ("abandoned"). The time control must fit the match (`gameFitsMatch`)
+  ("abandoned"): it goes to the opponent when the same player missed both,
+  and is decided on points otherwise. The time control must fit the match
+  (`gameFitsMatch`)
 - `src/game/openings.ts`, `GET /api/openings` – openings a friend challenge
   (or every game of its series) can start from, sent as `openingId`
   (migration 036). The opening's moves are written into the new game's PGN,
   and `startPly` counts them: clocks, abort, the first-move timeout and
   takebacks count from there, so the opening is never taken back. Such games
-  are left out of repertoire checks
+  are unrated unless they are a mirror match (`openingAllowsRating`: the
+  challenger picked the opening, and outside a mirror match the colour
+  too), and are left out of repertoire checks
 - `src/game/conversion.ts`, `src/services/conversionDrillService.ts`,
   `src/routes/conversionDrills.ts` – conversion drills (migration 037):
   positions from a player's own draws and losses where they were clearly

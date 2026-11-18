@@ -13,6 +13,7 @@ import {
 import { createGame } from "../src/services/gameService.js";
 import { MAX_ROOMS_PER_OWNER, STUDY_CHAT_BURST } from "../src/services/studyService.js";
 import { RETENTION_AFTER_END_MS } from "../src/services/gameChatService.js";
+import { MAX_STUDY_NODES } from "../src/game/studyState.js";
 
 const skip = !integrationEnabled && "TEST_POSTGRES_URL / TEST_REDIS_URL not set";
 type User = { id: number; clerkId: string };
@@ -93,7 +94,7 @@ describe("watch together: study rooms linked to a live game", { skip }, () => {
     assert.equal(first.state.game.over, false);
     // Watching live: at the latest move
     assert.equal(first.state.cursor, first.state.game.line[1]);
-    assert.deepEqual(first.chat, { enabled: true, messages: [] });
+    assert.deepEqual(first.chat, { enabled: true, reason: null, messages: [] });
     const sb = await open(`/study/${roomId}`, ben);
     await sb.next("study_state");
 
@@ -126,6 +127,74 @@ describe("watch together: study rooms linked to a live game", { skip }, () => {
     assert.equal(ended.game.line.length, 3);
     sa.send({ type: "delete", nodeId: update.game.line[2] });
     await sb.next("node_deleted");
+
+    // The deleted move leaves the stored line, and no later sync (a member
+    // connecting) puts it back
+    const stored = async () =>
+      (await app.pg.query(`SELECT state, version FROM study_rooms WHERE id = $1`, [roomId])).rows[0];
+    const afterDelete = await stored();
+    assert.deepEqual(afterDelete.state.game, { line: update.game.line.slice(0, 2), over: true });
+    await sb.next("game_line", (m) => m.game.over === true);
+    sa.send({ type: "sync_game" });
+    sb.send({ type: "sync_game" });
+    await sb.none("game_line");
+    assert.equal((await stored()).version, afterDelete.version);
+    const reconnected = await open(`/study/${roomId}`, ben);
+    const fresh = await reconnected.next("study_state");
+    assert.deepEqual(fresh.state.game.line, update.game.line.slice(0, 2));
+    assert.equal(Object.hasOwn(fresh.state.nodes, update.game.line[2]), false);
+  });
+
+  test("a room too full for the game's line isn't replayed again until it changes", async () => {
+    const game = await newGame();
+    await play(game.id, ["e2e4"]);
+    const created = await createLinked(game.id);
+    const roomId: number = created.json().room.id;
+    // Fill the tree to MAX_STUDY_NODES with moves of the members' own (the
+    // root's children, none of them the game's move)
+    const { rows } = await app.pg.query(`SELECT state FROM study_rooms WHERE id = $1`, [roomId]);
+    const state = rows[0].state;
+    const root = state.nodes.root;
+    state.nodes.root = { ...root, children: [] };
+    for (const id of Object.keys(state.nodes)) if (id !== "root") delete state.nodes[id];
+    for (let i = 1; i < MAX_STUDY_NODES; i++) {
+      const id = `d${i}`;
+      state.nodes[id] = { id, parentId: "root", san: "x", uci: "a1a1", fen: root.fen, ply: 1, children: [], comment: "", shapes: [] };
+      state.nodes.root.children.push(id);
+    }
+    state.game = { line: [], over: false };
+    await app.pg.query(`UPDATE study_rooms SET state = $2::jsonb, cursor = 'root', "nodeCount" = $3 WHERE id = $1`, [
+      roomId,
+      JSON.stringify(state),
+      MAX_STUDY_NODES,
+    ]);
+
+    // Counts the locked replays
+    const transact = app.pg.transact;
+    let replays = 0;
+    app.pg.transact = ((...args: Parameters<typeof transact>) => {
+      replays++;
+      return transact.apply(app.pg, args);
+    }) as typeof transact;
+    try {
+      await assert.rejects(app.study.apply(roomId, ann.id, { type: "sync_game" }), /up to 1000 moves/);
+      assert.equal(replays, 1);
+      // Every member's sync_game after that gets the same answer, without a replay
+      await assert.rejects(app.study.apply(roomId, ann.id, { type: "sync_game" }), /up to 1000 moves/);
+      await assert.rejects(app.study.apply(roomId, ann.id, { type: "sync_game" }), /up to 1000 moves/);
+      assert.equal(replays, 1);
+
+      // A variation deleted: the next sync takes the line, and forgets the refusal
+      await app.study.apply(roomId, ann.id, { type: "delete", nodeId: "d1" });
+      const before = replays;
+      await app.study.apply(roomId, ann.id, { type: "sync_game" });
+      assert.equal(replays, before + 1);
+      const { rows: after } = await app.pg.query(`SELECT state FROM study_rooms WHERE id = $1`, [roomId]);
+      assert.equal(after[0].state.game.line.length, 1);
+      assert.equal(await app.redis.get(`study:gamesync:refused:${roomId}`), null);
+    } finally {
+      app.pg.transact = transact;
+    }
   });
 
   test("an ordinary room has no game to sync and no chat", async () => {
@@ -253,6 +322,92 @@ describe("watch together: study rooms linked to a live game", { skip }, () => {
     const annReload = await open(`/study/${roomId}`, ann);
     const texts = (await annReload.next("study_state")).chat.messages.map((m: { text: string }) => m.text);
     assert.deepEqual(texts, ["Nice move !"]);
+  });
+
+  test("room chat follows each member's game-chat setting, as game chat does", async () => {
+    const game = await newGame();
+    const roomId = await linkedRoom(game.id);
+    // Carl is Ann's friend, not Ben's
+    const carl = await createUser(app, "carly");
+    await befriend(ann, carl);
+    assert.equal((await request("POST", `/api/study/${roomId}/members`, ann, { userId: carl.id })).statusCode, 201);
+    const setting = (user: User, value: string) =>
+      app.pg.query(
+        `INSERT INTO user_settings ("userId", "gameChatAllowedFrom") VALUES ($1, $2)
+         ON CONFLICT ("userId") DO UPDATE SET "gameChatAllowedFrom" = EXCLUDED."gameChatAllowedFrom"`,
+        [user.id, value]
+      );
+    await app.study.sendChat(roomId, carl.id, "before");
+
+    // Ben: friends only. Ann's messages reach him and his reach her; Carl's don't
+    await setting(ben, "only_friends");
+    const sa = await open(`/study/${roomId}`, ann);
+    const sb = await open(`/study/${roomId}`, ben);
+    const sc = await open(`/study/${roomId}`, carl);
+    assert.deepEqual((await sb.next("study_state")).chat.messages, []);
+    await sa.next("study_state");
+    await sc.next("study_state");
+    await app.study.sendChat(roomId, ann.id, "from ann");
+    assert.equal((await sb.next("chat")).data.text, "from ann");
+    await app.study.sendChat(roomId, carl.id, "from carl");
+    await app.study.sendChat(roomId, ben.id, "from ben");
+    assert.equal((await sa.next("chat", (m) => m.data.text === "from ben")).data.userId, ben.id);
+    // His own copy comes back; Carl's message never did
+    await sb.next("chat", (m) => m.data.text === "from ben");
+    assert.equal(sb.messages.some((m) => m.type === "chat" && m.data.text === "from carl"), false);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(sc.messages.some((m) => m.type === "chat" && m.data.text === "from ben"), false);
+
+    // Ben: nobody. No chat at all: nothing to read, can't write, sent nothing
+    await setting(ben, "nobody");
+    await app.redis.flushDb();
+    const reload = await open(`/study/${roomId}`, ben);
+    assert.deepEqual((await reload.next("study_state")).chat, { enabled: false, reason: "off_by_you", messages: [] });
+    reload.send({ type: "chat", text: "hi" });
+    assert.equal((await reload.next("error")).data.code, "CHAT_DISABLED");
+    await app.study.sendChat(roomId, ann.id, "anyone?");
+    await sa.next("chat", (m) => m.data.text === "anyone?");
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(reload.messages.some((m) => m.type === "chat"), false);
+  });
+
+  test("a member can report another from the room, with the room's chat", async () => {
+    const game = await newGame();
+    const roomId = await linkedRoom(game.id);
+    await app.study.sendChat(roomId, ben.id, "rude words");
+    const report = (user: User, payload: object) => request("POST", "/api/reports", user, payload);
+
+    const filed = await report(ann, { reportedId: ben.id, reason: "abusive_chat", studyRoomId: roomId });
+    assert.equal(filed.statusCode, 201, filed.body);
+    const { rows } = await app.pg.query(`SELECT "studyRoomId", "gameId", "chatExcerpt" FROM user_reports WHERE id = $1`, [
+      filed.json().data.id,
+    ]);
+    assert.equal(rows[0].studyRoomId, roomId);
+    assert.equal(rows[0].gameId, null);
+    assert.deepEqual(
+      rows[0].chatExcerpt.map((m: { userId: number; text: string }) => [m.userId, m.text]),
+      [[ben.id, "rude words"]]
+    );
+
+    // Someone who left can still be reported for what they wrote
+    const carl = await createUser(app, "carly");
+    await app.pg.query(`INSERT INTO study_room_members ("roomId", "userId") VALUES ($1, $2)`, [roomId, carl.id]);
+    assert.equal((await request("DELETE", `/api/study/${roomId}/members/${ben.id}`, ben)).statusCode, 204);
+    assert.equal((await report(carl, { reportedId: ben.id, reason: "abusive_chat", studyRoomId: roomId })).statusCode, 201);
+
+    // Not from a room they aren't in (Ben left), nor about someone who never
+    // was in it nor wrote there, nor by a player of its live game
+    const outsider = await report(ben, { reportedId: carl.id, reason: "other", studyRoomId: roomId });
+    assert.equal(outsider.statusCode, 400);
+    assert.match(outsider.body, /NOT_YOUR_ROOM/);
+    await app.pg.query(`INSERT INTO study_room_members ("roomId", "userId") VALUES ($1, $2)`, [roomId, white.id]);
+    assert.match((await report(white, { reportedId: ann.id, reason: "other", studyRoomId: roomId })).body, /NOT_YOUR_ROOM/);
+    const stranger = await report(carl, { reportedId: black.id, reason: "other", studyRoomId: roomId });
+    assert.match(stranger.body, /NOT_YOUR_ROOM/);
+    // Not a game and a room at once
+    const both = await report(carl, { reportedId: ann.id, reason: "other", studyRoomId: roomId, gameId: game.id });
+    assert.equal(both.statusCode, 400);
+    assert.match(both.body, /VALIDATION_ERROR/);
   });
 
   test("room chat closes after the game and goes on game chat's schedule", async () => {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { FastifyInstance } from "fastify";
 import { Chess } from "chess.js";
 import { createUser, integrationEnabled, resetDb, startTestApp } from "./helpers.js";
+import { CANDIDATE_WINDOW } from "../src/services/conversionDrillService.js";
 
 const skip = !integrationEnabled && "TEST_POSTGRES_URL / TEST_REDIS_URL not set";
 
@@ -78,6 +79,40 @@ describe("conversion drills", { skip }, () => {
       after.games.map((g: any) => g.gameId),
       [lost]
     );
+  });
+
+  test("only each colour's most recent CANDIDATE_WINDOW games are looked through", async () => {
+    // An old loss, then a window's worth of newer games Alice won
+    const old = await game("black_win", { ago: CANDIDATE_WINDOW + 10 });
+    await app.pg.query(
+      `INSERT INTO games ("whiteId", "blackId", "whiteUsername", "blackUsername", "whiteRating", "blackRating",
+         time, increment, status, result, "endReason", "numMoves", pgn, fen, "endedAt", "createdAt")
+       SELECT $1, $2, 'alice', 'bobby', 1200, 1200, 180, 0, 'finished', 'white_win', 'resignation', $3, $4, '', now(),
+         now() - make_interval(mins => n)
+       FROM generate_series(1, ${CANDIDATE_WINDOW}) n`,
+      [alice.id, bob.id, MOVES.length, PGN]
+    );
+    const candidates = async () =>
+      (await request("GET", "/api/conversion-drills/candidates", alice.clerkId)).json().games.map((g: any) => g.gameId);
+    assert.deepEqual(await candidates(), []);
+    // One game fewer in the window, and the loss is in it again
+    await app.pg.query(
+      `DELETE FROM games WHERE id = (SELECT id FROM games WHERE "whiteId" = $1 AND result = 'white_win'
+         ORDER BY "createdAt" DESC LIMIT 1)`,
+      [alice.id]
+    );
+    assert.deepEqual(await candidates(), [old]);
+    // As Black, Alice's games are a window of their own
+    const asBlack = (
+      await app.pg.query<{ id: number }>(
+        `INSERT INTO games ("whiteId", "blackId", "whiteUsername", "blackUsername", "whiteRating", "blackRating",
+           time, increment, status, result, "endReason", "numMoves", pgn, fen, "endedAt")
+         VALUES ($1, $2, 'bobby', 'alice', 1200, 1200, 180, 0, 'finished', 'draw', 'draw_agreement', $3, $4, '', now())
+         RETURNING id`,
+        [bob.id, alice.id, MOVES.length, PGN]
+      )
+    ).rows[0]!.id;
+    assert.deepEqual(await candidates(), [asBlack, old]);
   });
 
   test("a reported position becomes a drill computed from the game itself", async () => {

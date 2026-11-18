@@ -80,17 +80,38 @@ export function timedMatchWinner(score: TimedScore): number | null {
 }
 
 /**
+ * Who wins a match that ended because players kept not showing up. If one
+ * player missed every one of the last MAX_NO_SHOWS games, the other wins,
+ * whatever the points (otherwise a player in the lead could end the match
+ * early by walking away); if each missed some, it is decided on points.
+ * `absentees` are the players who missed those games, newest first.
+ */
+export function abandonedMatchWinner(score: TimedScore, absentees: readonly number[]): number | null {
+  const last = absentees.slice(0, MAX_NO_SHOWS);
+  const absent = last[0];
+  if (last.length === MAX_NO_SHOWS && last.every((id) => id === absent)) {
+    return absent === score.playerOneId ? score.playerTwoId : score.playerOneId;
+  }
+  return timedMatchWinner(score);
+}
+
+/**
  * Whether the match is over once a game has ended at `now` (ms): the time
- * for new games is up, or players kept not showing up. Null while it goes on.
+ * for new games is up, or players kept not showing up (`absentees`: who
+ * missed the no-show games in a row that just ended, newest first; see
+ * abandonedMatchWinner). Null while it goes on.
  */
 export function timedMatchEnd(
   score: TimedScore,
   match: { endsAt: number; time: number },
-  now: number
+  now: number,
+  absentees: readonly number[] = []
 ): { winnerId: number | null; endReason: "time_up" | "abandoned" } | null {
   if (now >= lastGameStartAt(match.endsAt, match.time)) {
     return { winnerId: timedMatchWinner(score), endReason: "time_up" };
   }
-  if (score.noShows >= MAX_NO_SHOWS) return { winnerId: timedMatchWinner(score), endReason: "abandoned" };
+  if (score.noShows >= MAX_NO_SHOWS) {
+    return { winnerId: abandonedMatchWinner(score, absentees), endReason: "abandoned" };
+  }
   return null;
 }

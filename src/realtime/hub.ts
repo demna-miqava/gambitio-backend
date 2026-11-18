@@ -16,6 +16,14 @@ const INSTANCE_TTL_MS = 3 * HEARTBEAT_MS;
  */
 const KEY_TTL_MS = 6 * 60 * 60_000;
 const KEY_REFRESH_MS = 60 * 60_000;
+/**
+ * How long presentUserIds reuses what it read about a user's presence on
+ * other instances: under the friends list's 30 s poll, so each poll still
+ * sees changes from the one before
+ */
+export const REMOTE_PRESENCE_CACHE_MS = 15_000;
+/** Users whose remote presence is remembered at once (the oldest go first) */
+const REMOTE_PRESENCE_CACHE_MAX = 10_000;
 
 export type PresenceKind = "notifications" | "matchmaking";
 
@@ -109,6 +117,12 @@ export class RealtimeHub {
    * has had time to hear everyone's heartbeat: see othersAlive.
    */
   private othersSeenAt = Date.now();
+  /**
+   * presentUserIds' answers for users with no socket here, by
+   * "<kind>:<userId>", oldest first: whether they had one on another live
+   * instance, and when that was read
+   */
+  private remotePresence = new Map<string, { present: boolean; at: number }>();
   /** Starts every envelope this instance sends, to drop our own echoes unread */
   private readonly ownPrefix = `{"origin":${JSON.stringify(this.instanceId)},`;
 
@@ -388,30 +402,64 @@ export class RealtimeHub {
 
   /**
    * Which of these users are present (isPresent) for this kind, on any
-   * instance: for a friends list, not for the whole site. Users with a
-   * socket here need no Redis read; the rest cost one read each, sent
-   * together (node-redis pipelines them into one round trip), plus one
-   * liveness read for the other instances found. Members of this instance
-   * whose socket is no longer counted here are on their way out (detach
-   * removes them from Redis just after), so they don't count.
+   * instance: for a friends list, not for the whole site, and polled (GET
+   * /friends/status), so it is kept cheap in Redis commands:
+   *
+   * - Users with a socket here need no Redis read.
+   * - While no other instance is alive (othersAlive, the rule publish()
+   *   uses, which holds for a new instance's first INSTANCE_TTL_MS) nobody
+   *   can have a socket elsewhere, so nothing is read at all.
+   * - Otherwise each other user costs one read (sent together; node-redis
+   *   pipelines them into one round trip), plus one liveness read for the
+   *   other instances found, and the answer is reused for
+   *   REMOTE_PRESENCE_CACHE_MS, so friends lists that overlap and polls
+   *   close together don't repeat it. A user can so show online or offline
+   *   that long after they changed on another instance.
+   *
+   * Members of this instance whose socket is no longer counted here are on
+   * their way out (detach removes them from Redis just after), so they
+   * don't count.
    */
   async presentUserIds(kind: PresenceKind, userIds: readonly number[]): Promise<Set<number>> {
     const present = new Set<number>();
     const remote: number[] = [];
+    const othersAlive = this.othersAlive;
+    const now = Date.now();
     for (const userId of new Set(userIds)) {
-      if ((this.presenceSockets.get(`${kind}:${userId}`) ?? 0) > 0) present.add(userId);
-      else remote.push(userId);
+      if ((this.presenceSockets.get(`${kind}:${userId}`) ?? 0) > 0) {
+        present.add(userId);
+        continue;
+      }
+      if (!othersAlive) continue;
+      const cached = this.remotePresence.get(`${kind}:${userId}`);
+      if (cached && now - cached.at < REMOTE_PRESENCE_CACHE_MS) {
+        if (cached.present) present.add(userId);
+      } else {
+        remote.push(userId);
+      }
     }
     if (remote.length === 0) return present;
     const memberLists = await Promise.all(remote.map((userId) => this.redis.zRange(presenceKey(kind, userId), 0, -1)));
     const others = [...new Set(memberLists.flat().map(instanceOf))].filter((id) => id !== this.instanceId);
-    if (others.length === 0) return present;
-    const flags = await this.redis.mGet(others.map(instanceKey));
+    const flags = others.length > 0 ? await this.redis.mGet(others.map(instanceKey)) : [];
     const alive = new Set(others.filter((_, i) => flags[i] !== null));
     remote.forEach((userId, i) => {
-      if (memberLists[i]!.some((member) => alive.has(instanceOf(member)))) present.add(userId);
+      const isPresent = memberLists[i]!.some((member) => alive.has(instanceOf(member)));
+      if (isPresent) present.add(userId);
+      this.cacheRemotePresence(`${kind}:${userId}`, isPresent, now);
     });
     return present;
+  }
+
+  /** Remembers a remote presence answer; the oldest entry goes once the cache is full. */
+  private cacheRemotePresence(key: string, present: boolean, at: number): void {
+    // Re-inserted, so the Map's order stays oldest first
+    this.remotePresence.delete(key);
+    if (this.remotePresence.size >= REMOTE_PRESENCE_CACHE_MAX) {
+      const oldest = this.remotePresence.keys().next().value;
+      if (oldest !== undefined) this.remotePresence.delete(oldest);
+    }
+    this.remotePresence.set(key, { present, at });
   }
 
   /** Sockets this instance holds for a user, across all socket types. */

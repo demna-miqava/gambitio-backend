@@ -32,6 +32,13 @@ const FRIEND_CONFIG = {
 } as const;
 
 /**
+ * Friends GET /friends/status looks at, at most (getFriendStatuses). Far
+ * more than anyone keeps up with, few enough that a poll costs one bounded
+ * query and presence reads for that many players.
+ */
+export const FRIEND_STATUS_LIMIT = 300;
+
+/**
  * Limits on friend requests, so sending one (a list update and a push
  * notification for the receiver) can't be used to pester:
  *
@@ -112,10 +119,12 @@ export class FriendService {
    * The user's friends who are online or playing (FriendStatus), available
    * ones (online, not in a game: the ones who can be challenged) first, then
    * those playing, each group by username. Only ever the user's own
-   * friends: nobody else learns whether a player is online.
+   * friends: nobody else learns whether a player is online. Friendships
+   * have no cap, so only the first FRIEND_STATUS_LIMIT friends in the
+   * friends list's order are looked at.
    */
   async getFriendStatuses(userId: number): Promise<FriendStatus[]> {
-    const friends = await this.friendRepository.getFriendsWithLiveGame(userId);
+    const friends = await this.friendRepository.getFriendsWithLiveGame(userId, FRIEND_STATUS_LIMIT);
     const online = await this.fastify.hub.presentUserIds(
       "notifications",
       friends.filter((f) => f.gameId === null).map((f) => f.id)

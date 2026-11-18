@@ -340,6 +340,25 @@ export const gameRepository = {
     return rows[0]!;
   },
 
+  /** The table game a player saved under the browser's id for it (migration 041), if any. */
+  async findTableGameByClientId(db: Queryable, recorderId: number, clientId: string): Promise<Game | null> {
+    const { rows } = await db.query<Game>(
+      `SELECT ${GAME_COLUMNS} FROM games
+       WHERE id = (SELECT "gameId" FROM table_game_saves WHERE "recorderId" = $1 AND "clientId" = $2)`,
+      [recorderId, clientId]
+    );
+    return rows[0] ?? null;
+  },
+
+  /** Notes the browser's id of a table game just stored, so the same save again finds it. */
+  async recordTableGameClientId(db: Queryable, recorderId: number, clientId: string, gameId: number): Promise<void> {
+    await db.query(`INSERT INTO table_game_saves ("recorderId", "clientId", "gameId") VALUES ($1, $2, $3)`, [
+      recorderId,
+      clientId,
+      gameId,
+    ]);
+  },
+
   /**
    * Stores a new position: a move, or an accepted takeback. Either clears a
    * pending takeback request and a declined one's block (migration 021).

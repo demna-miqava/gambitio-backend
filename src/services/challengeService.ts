@@ -12,7 +12,7 @@ import type { AllowedFrom } from "../models/Settings.js";
 import { withinLimit } from "../utils/rateLimit.js";
 import { clockLabel, timeControlLabel } from "./pushService.js";
 import { blocksBetween } from "../repositories/blockRepository.js";
-import { openingSummary } from "../game/openings.js";
+import { openingAllowsRating, openingSummary } from "../game/openings.js";
 
 export interface Challenge {
   id: number;
@@ -39,7 +39,8 @@ export interface Challenge {
   seriesId: number | null;
   /**
    * False for a casual challenge (migration 035): its game, or every game of
-   * its series, changes no ratings. Always false with time odds.
+   * its series, changes no ratings. Always false with time odds, and with
+   * an opening unless it is a mirror match (openingAllowsRating).
    */
   rated: boolean;
   /**
@@ -298,8 +299,6 @@ export class ChallengeService {
       data.color === "random" ? (Math.random() < 0.5 ? "white" : "black") : data.color;
     const hasOdds = data.opponentTime !== undefined && data.opponentTime !== data.time;
     const time = hasOdds ? Math.max(data.time, data.opponentTime!) : data.time;
-    // Time odds always make the game unrated
-    const rated = !hasOdds && data.rated !== false;
     const ratingColumn = ratingColumns(getTimeControl(time)).rating;
     // The schema only lets known ids through; this keeps a bad one out of the table anyway
     const opening = openingSummary(data.openingId);
@@ -307,6 +306,13 @@ export class ChallengeService {
       throw new AppError("Unknown opening", "UNKNOWN_OPENING", 400);
     }
     const matchMinutes = data.matchMinutes ?? null;
+    // Time odds always make the game unrated, and so does an opening unless
+    // it is a mirror match (openingAllowsRating). Stored that way, so the
+    // challenge reads as unrated everywhere and its version follows it
+    const rated =
+      !hasOdds &&
+      data.rated !== false &&
+      openingAllowsRating(opening?.id, { bestOf: data.bestOf ?? 1, matchMinutes });
     if (matchMinutes !== null) {
       if ((data.bestOf ?? 1) !== 1) {
         throw new AppError("A timed match can't also be a best-of series", "BAD_MATCH_FORMAT", 400);

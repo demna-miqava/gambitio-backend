@@ -1,8 +1,10 @@
 import { after, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type { FastifyInstance } from "fastify";
-import { connect, createUser, integrationEnabled, resetDb, startTestApp, type TestSocket } from "./helpers.js";
+import { connect, createUser, integrationEnabled, move, resetDb, startTestApp, type TestSocket } from "./helpers.js";
 import { NEXT_GAME_DELAY_MS } from "../src/game/timedMatch.js";
+import { SeriesService } from "../src/services/seriesService.js";
+import { UserService } from "../src/services/userService.js";
 
 const skip = !integrationEnabled && "TEST_POSTGRES_URL / TEST_REDIS_URL not set";
 
@@ -137,6 +139,117 @@ describe("timed matches", { skip }, () => {
       [row.status, row.endReason, row.playerOnePoints, row.playerTwoPoints, row.winnerId],
       ["finished", "abandoned", 2, 2, null]
     );
+  });
+
+  test("a player who misses both games that end the match loses it, even ahead on points", async () => {
+    const { gameId, state } = await matchStarted();
+    await app.pg.query(`UPDATE series SET "playerOnePoints" = 10 WHERE id = $1`, [state.series.id]);
+    await passDeadline(gameId); // Alice (White) never moves
+    app.series.stop();
+    // The next game is started by another instance's sweep, from what is stored
+    const other = new SeriesService(app, app.hub);
+    await other.sweepTimedMatches(new Date(Date.now() + 3 * NEXT_GAME_DELAY_MS));
+    const [second] = await inProgress(state.series.id);
+    assert.ok(second);
+    // Bob (White now) moves; Alice doesn't
+    const { gb } = await openGame(second.id);
+    gb.send(move("e2e4"));
+    await gb.next("move");
+    await passDeadline(second.id);
+    const row = await seriesRow(state.series.id);
+    assert.deepEqual(
+      [row.status, row.endReason, row.playerOnePoints, row.playerTwoPoints, row.winnerId],
+      ["finished", "abandoned", 10, 4, bob.id]
+    );
+  });
+
+  test("deleting an account during a game's first moves resigns it", async () => {
+    const { gameId, state } = await matchStarted();
+    await new UserService(app).deleteAccount(bob.clerkId);
+    const game = (await app.pg.query(`SELECT result, "endReason" FROM games WHERE id = $1`, [gameId])).rows[0];
+    assert.deepEqual([game.result, game.endReason], ["white_win", "resignation"]);
+    const row = await seriesRow(state.series.id);
+    assert.deepEqual([row.status, row.winnerId], ["finished", alice.id]);
+    await new Promise((r) => setTimeout(r, NEXT_GAME_DELAY_MS + 500));
+    assert.deepEqual(await inProgress(state.series.id), []);
+  });
+
+  test("a search started between games is kept when the match ends instead", async () => {
+    const { gb, ga, state } = await matchStarted();
+    gb.send({ type: "resign" });
+    await ga.next("game_ended");
+    app.series.stop();
+    await app.pg.query(`INSERT INTO matchmaking ("userId", rating, time, increment) VALUES ($1, 1200, 180, 0)`, [
+      alice.id,
+    ]);
+    await app.pg.query(`UPDATE series SET "endsAt" = now() + interval '10 seconds' WHERE id = $1`, [state.series.id]);
+    await app.series.continueTimedMatch(state.series.id);
+    assert.equal((await seriesRow(state.series.id)).endReason, "time_up");
+    const queued = await app.pg.query(`SELECT 1 FROM matchmaking WHERE "userId" = $1`, [alice.id]);
+    assert.equal(queued.rows.length, 1);
+  });
+
+  test("a search started between games goes when the next game starts", async () => {
+    const { gb, ga, state } = await matchStarted();
+    gb.send({ type: "resign" });
+    await ga.next("game_ended");
+    app.series.stop();
+    await app.pg.query(`INSERT INTO matchmaking ("userId", rating, time, increment) VALUES ($1, 1200, 180, 0)`, [
+      alice.id,
+    ]);
+    await app.series.continueTimedMatch(state.series.id);
+    assert.equal((await inProgress(state.series.id)).length, 1);
+    const queued = await app.pg.query(`SELECT 1 FROM matchmaking WHERE "userId" = $1`, [alice.id]);
+    assert.equal(queued.rows.length, 0);
+  });
+
+  test("after the match, a rematch is rated like the match, even after a no-show", async () => {
+    const { gameId, ga, gb, state } = await matchStarted();
+    // The last game: the time for new games is already up when it ends
+    await app.pg.query(`UPDATE series SET "endsAt" = now() + interval '30 seconds' WHERE id = $1`, [state.series.id]);
+    await passDeadline(gameId);
+    const ended = await ga.next("game_ended");
+    assert.deepEqual([ended.series.status, ended.series.endReason], ["finished", "time_up"]);
+    assert.equal((await app.pg.query(`SELECT rated FROM games WHERE id = $1`, [gameId])).rows[0].rated, false);
+    ga.send({ type: "rematch_request" });
+    await gb.next("rematch_request");
+    gb.send({ type: "rematch_response", data: { accepted: true } });
+    const rematch = await ga.next("match_found");
+    assert.equal(rematch.data.rated, true);
+  });
+
+  test("resigning the match while its last game ends it returns the finished match", async () => {
+    const { ga, state } = await matchStarted();
+    // The game being played is the last: resigning it ends the match on time
+    await app.pg.query(`UPDATE series SET "endsAt" = now() + interval '30 seconds' WHERE id = $1`, [state.series.id]);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/series/${state.series.id}/resign`,
+      headers: { authorization: `Bearer ${bob.clerkId}` },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.deepEqual(
+      [res.json().series.status, res.json().series.endReason, res.json().series.winnerId],
+      ["finished", "time_up", alice.id]
+    );
+    await ga.next("game_ended");
+    // Resigning again: the match was already over
+    const again = await app.inject({
+      method: "POST",
+      url: `/api/series/${state.series.id}/resign`,
+      headers: { authorization: `Bearer ${bob.clerkId}` },
+    });
+    assert.equal(again.statusCode, 409);
+  });
+
+  test("an instance that didn't create a match finds it within its refresh", async () => {
+    const { state } = await matchStarted();
+    const other = new SeriesService(app, app.hub);
+    // This instance has sockets attached, so asking starts the refresh
+    assert.equal(other.needsTimedSweep, false);
+    await other.refreshTimedMatches();
+    assert.equal(other.needsTimedSweep, true);
+    assert.ok(state.series.id);
   });
 
   test("time running out between games ends the match on points", async () => {

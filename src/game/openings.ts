@@ -1,4 +1,5 @@
 import { Chess } from "chess.js";
+import { MIRROR_MATCH_LENGTH } from "./series.js";
 
 /**
  * Openings a friend challenge can start from (a mirror match, migration 036,
@@ -117,6 +118,21 @@ export function toOpeningResponse(opening: Opening) {
     moves: opening.moves,
     fen: positions.get(opening.id)!.fen,
   };
+}
+
+/**
+ * Whether games from this opening may be rated in this format. Only a
+ * mirror match is: each player gets both sides of the position. A single
+ * game, a best-of-3/5 series or a timed match from a chosen opening (whose
+ * challenger picks the colours too) is unrated, as games from a set
+ * position are on Lichess. Without an opening, anything may be rated.
+ */
+export function openingAllowsRating(
+  openingId: string | null | undefined,
+  format: { bestOf: number; matchMinutes: number | null }
+): boolean {
+  if (!openingId) return true;
+  return format.bestOf === MIRROR_MATCH_LENGTH && format.matchMinutes === null;
 }
 
 /** The short form attached to challenges, series and games: id and name */

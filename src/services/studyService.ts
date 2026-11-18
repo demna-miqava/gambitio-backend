@@ -43,6 +43,31 @@ const memberSql = (room: string, user: string) =>
   `EXISTS (SELECT 1 FROM study_room_members mm WHERE mm."roomId" = ${room}.id AND mm."userId" = ${user}::int)
    AND ${notLivePlayer(room, user)}`;
 
+/** `user`'s game-chat setting ("gameChatAllowedFrom"), in SQL; `user` is a column or a parameter */
+const chatSetting = (user: string) =>
+  `COALESCE((SELECT cs."gameChatAllowedFrom" FROM user_settings cs WHERE cs."userId" = ${user}::int), 'everyone')`;
+/** Whether `user`'s setting lets `other` chat with them: game chat's rule (allows in src/game/chatText.ts) */
+const chatSettingAllows = (user: string, other: string) =>
+  `CASE ${chatSetting(user)}
+     WHEN 'everyone' THEN true
+     WHEN 'only_friends' THEN EXISTS (SELECT 1 FROM friends cf
+       WHERE LEAST(cf."userOneId", cf."userTwoId") = LEAST(${user}::int, ${other}::int)
+         AND GREATEST(cf."userOneId", cf."userTwoId") = GREATEST(${user}::int, ${other}::int))
+     ELSE false END`;
+/**
+ * Room chat between two members, as game chat has it between two players:
+ * no block either way, and each one's game-chat setting allows the other.
+ * A member whose setting is "nobody" gets no room chat at all.
+ */
+const roomChatBetween = (a: string, b: string) =>
+  `NOT EXISTS (SELECT 1 FROM user_blocks cb
+     WHERE (cb."blockerId" = ${a}::int AND cb."blockedId" = ${b}::int)
+        OR (cb."blockerId" = ${b}::int AND cb."blockedId" = ${a}::int))
+   AND ${chatSettingAllows(a, b)} AND ${chatSettingAllows(b, a)}`;
+
+/** Why a member can't write in a room's chat: their own setting is "nobody", or it closed after the game */
+export type StudyChatOffReason = "off_by_you" | "closed";
+
 export interface StudyChatMessage {
   id: string;
   userId: number;
@@ -64,6 +89,15 @@ export const studyPresenceKey = (roomId: number) => `presence:study:${roomId}`;
  * it, so holding an arrow key down keeps working.
  */
 export const STUDY_WRITE_LIMIT = { max: 40, windowSeconds: 10 };
+
+/**
+ * A linked room whose tree couldn't take the game's line (it is full): the
+ * room's version then, and the reason. Until the room changes, sync_game
+ * answers with the reason without replaying the game under the row lock;
+ * after a change, one member's retry counts against STUDY_WRITE_LIMIT.
+ */
+const gameSyncRefusedKey = (roomId: number) => `study:gamesync:refused:${roomId}`;
+const GAME_SYNC_REFUSED_TTL_SECONDS = 6 * 60 * 60;
 
 /**
  * The cursor to use with a stored document. The column can name a node
@@ -442,15 +476,19 @@ export class StudyService {
    * game's own tables are only read, never locked.
    */
   private async syncGame(roomId: number, userId: number) {
+    // A line stored as over is never synced again (see syncGameLine): the
+    // members may have deleted some of its moves since
     const { rows } = await this.fastify.pg.query<{
       gameId: number | null;
       member: boolean;
       synced: boolean;
+      version: number;
     }>(
-      `SELECT r."gameId", ${memberSql("r", "$2")} AS member,
-         COALESCE(jsonb_array_length(r.state->'game'->'line'), -1) = g."numMoves"
-           AND COALESCE((r.state->'game'->>'over')::boolean, false) = (g.status <> 'in_progress')
-           AND (g."numMoves" = 0 OR g.fen = r.state->'nodes'->(r.state->'game'->'line'->>-1)->>'fen') AS synced
+      `SELECT r."gameId", r.version, ${memberSql("r", "$2")} AS member,
+         COALESCE((r.state->'game'->>'over')::boolean, false)
+         OR (COALESCE(jsonb_array_length(r.state->'game'->'line'), -1) = g."numMoves"
+           AND g.status = 'in_progress'
+           AND (g."numMoves" = 0 OR g.fen = r.state->'nodes'->(r.state->'game'->'line'->>-1)->>'fen')) AS synced
        FROM study_rooms r LEFT JOIN games g ON g.id = r."gameId"
        WHERE r.id = $1`,
       [roomId, userId]
@@ -460,7 +498,15 @@ export class StudyService {
     if (found.gameId === null) throw notLinked();
     if (found.synced) return null;
 
-    return this.fastify.pg.transact(async (tx) => {
+    // A room that couldn't take the line (full) isn't replayed again until
+    // it has changed, and then only within the member's write limit
+    const refused = await this.gameSyncRefusal(roomId);
+    if (refused) {
+      if (refused.version === found.version) throw new AppError(refused.message, "INVALID_STUDY_ACTION", 400);
+      await this.limit(`study:writes:${roomId}:${userId}`, STUDY_WRITE_LIMIT);
+    }
+
+    const outcome = await this.fastify.pg.transact(async (tx) => {
       const { rows: locked } = await tx.query<{ state: StudyState; cursor: string; version: number }>(
         `SELECT state, cursor, version FROM study_rooms WHERE id = $1 FOR UPDATE`,
         [roomId]
@@ -473,11 +519,26 @@ export class StudyService {
       );
       const game = games[0];
       if (!game) throw notLinked();
-      const { state, change } = syncGameLine(
-        { ...room.state, cursor: cursorIn(room.state, room.cursor) },
-        loadGame(game.pgn).history(),
-        game.status !== "in_progress"
-      );
+      let synced: ReturnType<typeof syncGameLine>;
+      try {
+        synced = syncGameLine(
+          { ...room.state, cursor: cursorIn(room.state, room.cursor) },
+          loadGame(game.pgn).history(),
+          game.status !== "in_progress"
+        );
+      } catch (error) {
+        // The tree can't take the line as it stands (full): remembered with
+        // the room's version, so the next sync_game doesn't replay it again
+        if (error instanceof AppError && error.code === "INVALID_STUDY_ACTION") {
+          await this.fastify.redis
+            .set(gameSyncRefusedKey(roomId), JSON.stringify({ version: room.version, message: error.message }), {
+              expiration: { type: "EX", value: GAME_SYNC_REFUSED_TTL_SECONDS },
+            })
+            .catch((err) => this.fastify.log.warn({ err, roomId }, "Failed to remember a refused game sync"));
+        }
+        throw error;
+      }
+      const { state, change } = synced;
       if (change.kind === "none") return null;
       const version = room.version + 1;
       await tx.query(
@@ -487,40 +548,79 @@ export class StudyService {
       );
       return { change, version };
     });
+    if (refused) {
+      await this.fastify.redis
+        .del(gameSyncRefusedKey(roomId))
+        .catch((err) => this.fastify.log.warn({ err, roomId }, "Failed to forget a refused game sync"));
+    }
+    return outcome;
+  }
+
+  /** Why the room last couldn't take its game's line, and at which version (see syncGame). */
+  private async gameSyncRefusal(roomId: number): Promise<{ version: number; message: string } | null> {
+    const raw = await this.fastify.redis.get(gameSyncRefusedKey(roomId)).catch((err) => {
+      this.fastify.log.warn({ err, roomId }, "Failed to read a refused game sync");
+      return null;
+    });
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as { version?: unknown; message?: unknown };
+      return typeof parsed.version === "number" && typeof parsed.message === "string"
+        ? { version: parsed.version, message: parsed.message }
+        : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
    * Room chat for a member, in a room linked to a game: whether they can
    * write, and the latest messages. Null when the room has no chat for them:
    * the game's own players never get the room's chat, even once they are
-   * invited after the game. Messages from someone the viewer blocked, or
-   * who blocked them, are left out.
+   * invited after the game. A viewer whose game-chat setting is "nobody"
+   * gets none of it ("off_by_you"); otherwise messages they couldn't have
+   * been sent (a block either way, or either one's setting: roomChatBetween)
+   * are left out.
    */
-  private async chatState(roomId: number, gameId: number, viewerId: number) {
-    const { rows: games } = await this.fastify.pg.query<{ whiteId: number; blackId: number; open: boolean }>(
+  private async chatState(
+    roomId: number,
+    gameId: number,
+    viewerId: number
+  ): Promise<{ enabled: boolean; reason: StudyChatOffReason | null; messages: StudyChatMessage[] } | null> {
+    const { rows: games } = await this.fastify.pg.query<{
+      whiteId: number;
+      blackId: number;
+      open: boolean;
+      setting: string;
+    }>(
       `SELECT "whiteId", "blackId",
-         (status = 'in_progress' OR "endedAt" > now() - ($2::int * interval '1 millisecond')) AS open
+         (status = 'in_progress' OR "endedAt" > now() - ($2::int * interval '1 millisecond')) AS open,
+         ${chatSetting("$3")} AS setting
        FROM games WHERE id = $1`,
-      [gameId, CHAT_OPEN_AFTER_END_MS]
+      [gameId, CHAT_OPEN_AFTER_END_MS, viewerId]
     );
     const game = games[0];
     if (!game || viewerId === game.whiteId || viewerId === game.blackId) return null;
+    if (game.setting === "nobody") return { enabled: false, reason: "off_by_you", messages: [] };
     const { rows } = await this.fastify.pg.query<{ id: string; senderId: number; body: string; createdAt: Date }>(
       `SELECT c.id::text AS id, c."senderId", c.body, c."createdAt" FROM study_chat_messages c
-       WHERE c."roomId" = $1
-         AND NOT EXISTS (SELECT 1 FROM user_blocks b
-           WHERE (b."blockerId" = $2 AND b."blockedId" = c."senderId") OR (b."blockerId" = c."senderId" AND b."blockedId" = $2))
+       WHERE c."roomId" = $1 AND (c."senderId" = $2 OR (${roomChatBetween("$2", `c."senderId"`)}))
        ORDER BY c.id DESC LIMIT $3`,
       [roomId, viewerId, CHAT_HISTORY_LIMIT]
     );
-    return { enabled: game.open, messages: rows.reverse().map(toChatMessage) };
+    return {
+      enabled: game.open,
+      reason: game.open ? null : "closed",
+      messages: rows.reverse().map(toChatMessage),
+    };
   }
 
   /**
    * A chat message to the room (linked rooms only). Who writes always comes
    * from the authenticated socket. It goes to each member's own topic for
-   * the room, except the game's players and anyone with a block either way
-   * with the sender.
+   * the room, except the game's players and anyone chat between them and
+   * the sender is off for (roomChatBetween: a block either way, or either
+   * one's game-chat setting). A sender whose setting is "nobody" can't write.
    */
   async sendChat(roomId: number, userId: number, rawText: string): Promise<void> {
     const cleaned = cleanChatText(rawText);
@@ -545,6 +645,7 @@ export class StudyService {
        FROM study_rooms r JOIN games g ON g.id = r."gameId"
        WHERE r.id = $1 AND ${memberSql("r", "$2")}
          AND $2::int NOT IN (g."whiteId", g."blackId")
+         AND ${chatSetting("$2")} <> 'nobody'
          AND (g.status = 'in_progress' OR g."endedAt" > now() - ($4::int * interval '1 millisecond'))
          AND (SELECT count(*) FROM study_chat_messages c WHERE c."roomId" = r.id AND c."senderId" = $2::int) < $5::int
        RETURNING id::text AS id, "senderId", body, "createdAt"`,
@@ -558,8 +659,8 @@ export class StudyService {
        JOIN study_rooms r ON r.id = m."roomId"
        JOIN games g ON g.id = r."gameId"
        WHERE m."roomId" = $1 AND m."userId" NOT IN (g."whiteId", g."blackId")
-         AND NOT EXISTS (SELECT 1 FROM user_blocks b
-           WHERE (b."blockerId" = m."userId" AND b."blockedId" = $2) OR (b."blockerId" = $2 AND b."blockedId" = m."userId"))`,
+         -- The sender's copy is their confirmation (and their other tabs')
+         AND (m."userId" = $2 OR (${roomChatBetween(`m."userId"`, "$2")}))`,
       [roomId, userId]
     );
     const message = { type: "chat", data: toChatMessage(row) };
@@ -572,18 +673,44 @@ export class StudyService {
     );
   }
 
+  /**
+   * Whether `reporterId` can report `reportedId` from this room
+   * (ModerationService.report): the reporter is a member (a player of the
+   * room's live game isn't, see memberSql), and the reported player is one
+   * too or has written in the room's chat (they may have left since).
+   */
+  async canReportFrom(roomId: number, reporterId: number, reportedId: number): Promise<boolean> {
+    const { rows } = await this.fastify.pg.query(
+      `SELECT 1 FROM study_rooms r
+       WHERE r.id = $1 AND ${memberSql("r", "$2")}
+         AND (EXISTS (SELECT 1 FROM study_room_members m WHERE m."roomId" = r.id AND m."userId" = $3)
+           OR EXISTS (SELECT 1 FROM study_chat_messages c WHERE c."roomId" = r.id AND c."senderId" = $3))`,
+      [roomId, reporterId, reportedId]
+    );
+    return rows.length > 0;
+  }
+
   /** Why a chat message wasn't stored (rare, so the insert doesn't pay for it). */
   private async chatRefusal(roomId: number, userId: number): Promise<AppError> {
-    const { rows } = await this.fastify.pg.query<{ member: boolean; linked: boolean; player: boolean; open: boolean }>(
+    const { rows } = await this.fastify.pg.query<{
+      member: boolean;
+      linked: boolean;
+      player: boolean;
+      open: boolean;
+      off: boolean;
+    }>(
       `SELECT ${memberSql("r", "$2")} AS member, g.id IS NOT NULL AS linked,
          COALESCE($2::int IN (g."whiteId", g."blackId"), false) AS player,
-         COALESCE(g.status = 'in_progress' OR g."endedAt" > now() - ($3::int * interval '1 millisecond'), false) AS open
+         COALESCE(g.status = 'in_progress' OR g."endedAt" > now() - ($3::int * interval '1 millisecond'), false) AS open,
+         ${chatSetting("$2")} = 'nobody' AS off
        FROM study_rooms r LEFT JOIN games g ON g.id = r."gameId" WHERE r.id = $1`,
       [roomId, userId, CHAT_OPEN_AFTER_END_MS]
     );
     const room = rows[0];
     if (!room || !room.member) return roomNotFound();
     if (!room.linked || room.player) return new AppError("This room has no chat", "CHAT_UNAVAILABLE", 400);
+    // Same message and code as game chat (GameChatService)
+    if (room.off) return new AppError("Chat is turned off in your settings", "CHAT_DISABLED", 403);
     if (!room.open) return new AppError("This chat has closed", "CHAT_CLOSED", 403);
     return new AppError(
       `You can send up to ${STUDY_CHAT_MAX_PER_MEMBER} messages in one room`,

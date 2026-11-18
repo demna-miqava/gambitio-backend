@@ -1,6 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  abandonedMatchWinner,
   gameFitsMatch,
   lastGameStartAt,
   MAX_NO_SHOWS,
@@ -72,5 +73,21 @@ describe("timed matches", () => {
       winnerId: 1,
       endReason: "abandoned",
     });
+  });
+
+  test("an abandoned match goes to the player who showed up", () => {
+    const leading = { ...start, playerOnePoints: 10, playerTwoPoints: 4, noShows: MAX_NO_SHOWS };
+    const match = { endsAt: 1_000_000, time: 180 };
+    // Player one, in the lead, missed both games: player two wins anyway
+    assert.equal(abandonedMatchWinner(leading, [1, 1]), 2);
+    assert.deepEqual(timedMatchEnd(leading, match, 0, [1, 1]), { winnerId: 2, endReason: "abandoned" });
+    assert.equal(abandonedMatchWinner({ ...leading, playerOnePoints: 0 }, [2, 2]), 1);
+    // Each missed one: on points
+    assert.equal(abandonedMatchWinner(leading, [2, 1]), 1);
+    assert.equal(abandonedMatchWinner({ ...leading, playerTwoPoints: 10 }, [1, 2]), null);
+    // Not knowing the earlier game: on points
+    assert.equal(abandonedMatchWinner(leading, [1]), 1);
+    // Older no-shows don't count
+    assert.equal(abandonedMatchWinner(leading, [2, 1, 1]), 1);
   });
 });

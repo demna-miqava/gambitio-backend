@@ -28,7 +28,7 @@ import {
   type MoveTiming,
 } from "../game/clock.js";
 import { STARTING_FEN } from "../game/engine.js";
-import { bothPlayersMoved, colorOf, createGame, finishGame, matchFoundData, opponentOf } from "./gameService.js";
+import { bothPlayersMoved, colorOf, createGame, finishGame, linkNextGame, opponentOf } from "./gameService.js";
 import { openingSummary } from "../game/openings.js";
 import { AppError } from "../errors/AppError.js";
 import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
@@ -36,6 +36,7 @@ import { blocksBetween } from "../repositories/blockRepository.js";
 import { invalidateStats } from "./statsService.js";
 import { PositionCache } from "../game/positionCache.js";
 import {
+  inActiveTimedMatch,
   isTimedMatch,
   nextSeriesGame,
   recordSeriesResult,
@@ -632,10 +633,7 @@ export class LiveGameService {
     const now = new Date();
     const finished = await finishGame(tx, played, outcome, clock);
     if (!finished) return;
-    const series = await recordSeriesResult(tx, game, outcome.result, lockedSeries, {
-      noShow: noShowUserId !== null,
-      now,
-    });
+    const series = await recordSeriesResult(tx, game, outcome.result, lockedSeries, { noShowUserId, now });
     if (series && series.matchMinutes !== null && series.status === "active") {
       fx.timedMatches.push({ id: series.id, endsAt: series.endsAt });
     }
@@ -1051,10 +1049,8 @@ export class LiveGameService {
   }
 
   /** Whether the game is part of a timed match that is still being played. */
-  private async inTimedMatch(tx: TxClient, game: LiveGame): Promise<boolean> {
-    if (game.seriesId === null) return false;
-    const series = await seriesRepository.find(tx, game.seriesId);
-    return series !== null && series.status === "active" && isTimedMatch(series);
+  private inTimedMatch(tx: TxClient, game: LiveGame): Promise<boolean> {
+    return inActiveTimedMatch(tx, game);
   }
 
   /** Ends a game whose deadline has passed: an abort, or a flag fall. */
@@ -1207,7 +1203,8 @@ export class LiveGameService {
     await tx.query(`DELETE FROM matchmaking WHERE "userId" = ANY($1)`, [[game.whiteId, game.blackId]]);
     // In a series the next game follows the series' colours; otherwise
     // (and after a series is over) colours swap
-    const next = await nextSeriesGame(tx, game);
+    const series = await nextSeriesGame(tx, game);
+    const next = series?.next ?? null;
     const whiteId = next ? next.whiteId : game.blackId;
     // Time odds belong to the players, not the colours: each keeps their clock
     const timeOf = (playerId: number) => (playerId === game.whiteId ? game.whiteTime : game.blackTime);
@@ -1220,21 +1217,16 @@ export class LiveGameService {
       increment: game.increment,
       odds: whiteTime !== null && blackTime !== null ? { whiteTime, blackTime } : null,
       // A casual game's rematch is casual too, as is every game of a casual
-      // series. (Tournament games have no rematch.)
-      rated: game.rated,
+      // series. A series game takes the series' setting, not its own: one
+      // made unrated only because a player never moved (a timed match) says
+      // nothing of the next. (Tournament games have no rematch.)
+      rated: series ? series.rated : game.rated,
       // From the same opening (in a series, the series' opening is the game's)
       openingId: game.openingId,
       ...(next && { series: { id: next.seriesId, game: next.number } }),
     });
-    await gameRepository.setRematchGame(tx, game.id, rematch.id);
     fx.deadlines.push({ gameId: rematch.id, at: rematch.deadlineAt });
-    for (const playerId of [game.whiteId, game.blackId]) {
-      fx.out.push({
-        topic: topics.gameUser(game.id, playerId),
-        message: { type: "match_found", data: matchFoundData(rematch, playerId) },
-      });
-      fx.out.push({ topic: topics.notifications(playerId), message: activeGameMessage(rematch.id) });
-    }
+    fx.out.push(...(await linkNextGame(tx, game.id, rematch)));
   }
 }
 

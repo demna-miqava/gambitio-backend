@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import {
   applyStudyOp,
   createStudyState,
-  liveNodeId,
   ROOT_ID,
   syncGameLine,
   type StudyState,
@@ -25,7 +24,7 @@ describe("a study room's game line (Watch together)", () => {
     const { state, change } = syncGameLine(createStudyState(), ["e4", "e5", "Nf3"], false);
     assert.deepEqual(mainLine(state), ["e4", "e5", "Nf3"]);
     assert.equal(state.game!.line.length, 3);
-    assert.equal(state.cursor, liveNodeId(state));
+    assert.equal(state.cursor, state.game!.line.at(-1));
     assert.equal(state.nodes[state.cursor]!.san, "Nf3");
     assert.equal(change.kind, "game");
   });
@@ -100,6 +99,34 @@ describe("a study room's game line (Watch together)", () => {
     assert.ok(change.kind === "game" && change.game.over);
     assert.equal(applyStudyOp(over, { type: "promote", nodeId: c5 }).change.kind, "children");
     assert.equal(applyStudyOp(over, { type: "delete", nodeId: e5 }).change.kind, "deleted");
+  });
+
+  test("once the game is over, deleted game moves stay deleted and leave the line", () => {
+    const live = syncGameLine(createStudyState(), ["e4", "e5", "Nf3"], false).state;
+    const over = syncGameLine(live, ["e4", "e5", "Nf3"], true).state;
+    const [e4, e5] = over.game!.line as [string, string, string];
+    const { state: deleted } = applyStudyOp(over, { type: "delete", nodeId: e5 });
+    // The line ends before the deleted move, so it never names a missing node
+    assert.deepEqual(deleted.game!.line, [e4]);
+    assert.ok(deleted.game!.over);
+    // A later sync (a member connecting) puts nothing back
+    const again = syncGameLine(deleted, ["e4", "e5", "Nf3"], true);
+    assert.equal(again.change.kind, "none");
+    assert.equal(again.state, deleted);
+    assert.deepEqual(mainLine(again.state), ["e4"]);
+    // Nor does it undo a promoted variation
+    let state = applyStudyOp(over, { type: "move", nodeId: e4, uci: "c7c5" }).state;
+    state = applyStudyOp(state, { type: "promote", nodeId: state.cursor }).state;
+    assert.equal(syncGameLine(state, ["e4", "e5", "Nf3"], true).change.kind, "none");
+    assert.deepEqual(mainLine(state), ["e4", "c5"]);
+  });
+
+  test("deleting a variation leaves the game's line alone", () => {
+    let state = syncGameLine(createStudyState(), ["e4", "e5"], false).state;
+    const line = state.game!.line;
+    state = applyStudyOp(state, { type: "move", nodeId: line[0]!, uci: "c7c5" }).state;
+    const { state: after } = applyStudyOp(state, { type: "delete", nodeId: state.cursor });
+    assert.equal(after.game, state.game);
   });
 
   test("refuses moves that don't follow from the room's start", () => {

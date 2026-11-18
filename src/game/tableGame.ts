@@ -20,6 +20,8 @@ export const MAX_TABLE_GAME_PGN_LENGTH = 8_000;
 export const TABLE_GAMES_PER_DAY = 100;
 /** Games waiting for one friend to confirm, from one player */
 export const MAX_PENDING_TABLE_GAMES_PER_PAIR = 5;
+/** The browser's id for a game, so a save sent twice stores one game (migration 041 checks it too) */
+export const TABLE_GAME_CLIENT_ID = /^[A-Za-z0-9_-]{8,64}$/;
 /** A guest is stored as a name only; the games table holds up to 30 characters */
 export const MAX_GUEST_NAME_LENGTH = 30;
 
@@ -43,7 +45,7 @@ export interface TableGameClaim {
 }
 
 export interface ReplayedTableGame {
-  /** Moves only, no headers: the format live games store */
+  /** The moves as replayed, in the format bot games are stored in (playBrowserPgn) */
   pgn: string;
   fen: string;
   numMoves: number;

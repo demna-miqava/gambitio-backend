@@ -6,6 +6,8 @@ import type WebSocket from "ws";
 import { connect, createUser, integrationEnabled, resetDb, startTestApp, type TestSocket } from "./helpers.js";
 import { createGame } from "../src/services/gameService.js";
 import { RealtimeHub } from "../src/realtime/hub.js";
+import { FriendRepository } from "../src/repositories/friendRepository.js";
+import { FRIEND_STATUS_LIMIT } from "../src/services/friendService.js";
 
 describe("friends online and in game", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_REDIS_URL not set" }, () => {
   let app: FastifyInstance;
@@ -81,6 +83,30 @@ describe("friends online and in game", { skip: !integrationEnabled && "TEST_POST
     assert.deepEqual(await statuses(bob.clerkId), []);
   });
 
+  test("only the first friends in the friends list's order are looked at, with their games", async () => {
+    const me = await createUser(app, "myself");
+    const cara = await createUser(app, "cara");
+    const abe = await createUser(app, "abe");
+    const bea = await createUser(app, "bea");
+    for (const friend of [cara, abe, bea]) await befriend(me.id, friend.id);
+    const game = await app.pg.transact((tx) => createGame(tx, { whiteId: bea.id, blackId: cara.id, time: 60, increment: 0 }));
+
+    const first = await new FriendRepository(app).getFriendsWithLiveGame(me.id, 2);
+    assert.deepEqual(
+      first.map((f) => [f.username, f.gameId]),
+      [
+        ["abe", null],
+        ["bea", game.id],
+      ]
+    );
+    // The endpoint has a limit of its own, far above this
+    assert.ok(FRIEND_STATUS_LIMIT >= 100);
+    assert.deepEqual(
+      (await statuses(me.clerkId)).map((s) => s.id),
+      [bea.id, cara.id]
+    );
+  });
+
   test("a friend who closes their last tab drops off the list", async () => {
     const me = await createUser(app, "myself");
     const friend = await createUser(app, "friend");
@@ -129,9 +155,12 @@ describe("friends online and in game", { skip: !integrationEnabled && "TEST_POST
       assert.deepEqual([...(await b.presentUserIds("notifications", [901, 902, 903, 904]))].sort(), [901, 902]);
       assert.deepEqual([...(await b.presentUserIds("notifications", []))], []);
 
-      // a crashes: its liveness key expires (simulated by deleting it)
+      // a crashes: its liveness key expires (simulated by deleting it). b
+      // reuses what it read for a while (REMOTE_PRESENCE_CACHE_MS), so a
+      // third instance, which hasn't read it yet, is asked
       await app.redis.del(`instance:${a.instanceId}`);
-      assert.deepEqual([...(await b.presentUserIds("notifications", [901, 902]))], [902]);
+      const c = new RealtimeHub(app.redis, app.log);
+      assert.deepEqual([...(await c.presentUserIds("notifications", [901, 902]))], [902]);
     } finally {
       await a.stop();
       await b.stop();

@@ -20,7 +20,8 @@ import { getBotById } from "../game/bots.js";
 import { AppError } from "../errors/AppError.js";
 import { withinLimit } from "../utils/rateLimit.js";
 import { newShareToken } from "../utils/shareToken.js";
-import { openingPosition, openingSummary } from "../game/openings.js";
+import { openingAllowsRating, openingPosition, openingSummary } from "../game/openings.js";
+import { activeGameMessage, topics } from "../realtime/hub.js";
 
 /**
  * Bot games one user can save a day. A bot game takes a few minutes, so 200
@@ -152,6 +153,25 @@ export function matchFoundData(game: LiveGame, userId: number) {
     // The opening the game starts from, already on the board
     opening: openingSummary(game.openingId),
   };
+}
+
+/**
+ * Links a finished game to the game that follows it between the same two
+ * players (a rematch, or a timed match's next game), inside the caller's
+ * transaction, and returns the messages that move both players on: the
+ * finished game's page goes to the new one (match_found), and their other
+ * tabs learn the game in progress. The caller sends them after the commit.
+ */
+export async function linkNextGame(
+  tx: Queryable,
+  previousGameId: number,
+  game: LiveGame
+): Promise<{ topic: string; message: object }[]> {
+  await gameRepository.setRematchGame(tx, previousGameId, game.id);
+  return [game.whiteId, game.blackId].flatMap((playerId) => [
+    { topic: topics.gameUser(previousGameId, playerId), message: { type: "match_found", data: matchFoundData(game, playerId) } },
+    { topic: topics.notifications(playerId), message: activeGameMessage(game.id) },
+  ]);
 }
 
 export class GameService {
@@ -446,7 +466,13 @@ export async function createGame(
     seriesId: series?.id ?? null,
     seriesGame: series?.game ?? null,
     tournamentId: params.tournament?.id ?? null,
-    rated: (params.tournament?.rated ?? true) && params.rated !== false,
+    // A game from an opening is rated only as part of a mirror match, whose
+    // series row already says so (seriesRepository.create); a single game
+    // from one (a challenge, or a rematch after the match) never is
+    rated:
+      (params.tournament?.rated ?? true) &&
+      params.rated !== false &&
+      (series !== undefined || openingAllowsRating(params.openingId, { bestOf: 1, matchMinutes: null })),
     opening: position && { id: params.openingId!, ...position },
   });
 }

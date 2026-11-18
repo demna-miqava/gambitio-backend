@@ -28,7 +28,8 @@ export async function challengeRoutes(fastify: FastifyInstance) {
         bestOf: challenge.bestOf,
         seriesId: challenge.seriesId,
         seriesGame: challenge.seriesGame,
-        // False for a casual game (or series); always false with time odds
+        // False for a casual game (or series); always false with time odds,
+        // and from an opening unless it is a mirror match (bestOf 2)
         rated: challenge.rated,
         // The opening the game starts from; null for the initial position
         opening: openingSummary(challenge.openingId),

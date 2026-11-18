@@ -8,6 +8,12 @@ import { nextDue } from "../game/repertoire.js";
 /** Drills one player can keep; scanning stops adding new ones beyond it */
 export const MAX_DRILLS_PER_USER = 300;
 
+/**
+ * Games with each colour, newest first, that candidates() looks through:
+ * months of play for most players, and a bounded read for anyone.
+ */
+export const CANDIDATE_WINDOW = 300;
+
 export type DrillEval = { cp: number } | { mate: number };
 
 /** A drill as sent to clients. */
@@ -139,14 +145,19 @@ export class ConversionDrillService {
 
   /**
    * The player's most recent finished games they didn't win and haven't had
-   * scanned, with their moves. Each colour is read from its own
-   * (player, createdAt) index.
+   * scanned, with their moves, from their last CANDIDATE_WINDOW games with
+   * each colour: a long history that is mostly scanned isn't walked again
+   * on every call, and older games are never offered. Each colour is read
+   * from its own (player, createdAt) index.
    */
   async candidates(userId: number, limit: number): Promise<ScanCandidate[]> {
     const side = (column: "whiteId" | "blackId", color: PlayerColor, loss: GameResult) => `(
       SELECT g.id AS "gameId", g.pgn, '${color}' AS color, g."createdAt"
-      FROM games g
-      WHERE g."${column}" = $1 AND g.status = 'finished' AND g.result IS NOT NULL
+      FROM (
+        SELECT id FROM games WHERE "${column}" = $1 ORDER BY "createdAt" DESC, id DESC LIMIT ${CANDIDATE_WINDOW}
+      ) recent
+      JOIN games g ON g.id = recent.id
+      WHERE g.status = 'finished' AND g.result IS NOT NULL
         AND g.result IN ('draw', '${loss}') AND g."numMoves" >= ${CONVERSION_MIN_PLIES} AND g.pgn IS NOT NULL
         -- Table games (migration 040) show in history and review only
         AND NOT g."tableGame"

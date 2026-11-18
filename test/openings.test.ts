@@ -1,7 +1,14 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Chess } from "chess.js";
-import { findOpening, OPENING_IDS, OPENINGS, openingPosition, openingSummary } from "../src/game/openings.js";
+import {
+  findOpening,
+  OPENING_IDS,
+  OPENINGS,
+  openingAllowsRating,
+  openingPosition,
+  openingSummary,
+} from "../src/game/openings.js";
 import { applyMove, takebackPlies } from "../src/game/engine.js";
 import { afterMove, chargedTime, deadline, FIRST_MOVE_TIMEOUT_MS, isClockRunning, type ClockState } from "../src/game/clock.js";
 import { scoreGame, seriesDecision, type SeriesScore } from "../src/game/series.js";
@@ -39,6 +46,21 @@ describe("openings", () => {
     chess.loadPgn(position.pgn);
     chess.move("e6");
     assert.equal(result.pgn, chess.pgn());
+  });
+});
+
+describe("rating games from an opening", () => {
+  test("only a mirror match from an opening may be rated", () => {
+    const single = { bestOf: 1, matchMinutes: null };
+    assert.equal(openingAllowsRating(null, single), true);
+    assert.equal(openingAllowsRating(undefined, { bestOf: 3, matchMinutes: null }), true);
+    assert.equal(openingAllowsRating(null, { bestOf: 0, matchMinutes: 15 }), true);
+    assert.equal(openingAllowsRating("sicilian", single), false);
+    assert.equal(openingAllowsRating("sicilian", { bestOf: 3, matchMinutes: null }), false);
+    assert.equal(openingAllowsRating("sicilian", { bestOf: 5, matchMinutes: null }), false);
+    assert.equal(openingAllowsRating("sicilian", { bestOf: 0, matchMinutes: 15 }), false);
+    assert.equal(openingAllowsRating("sicilian", { bestOf: 1, matchMinutes: 15 }), false);
+    assert.equal(openingAllowsRating("sicilian", { bestOf: 2, matchMinutes: null }), true);
   });
 });
 

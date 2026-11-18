@@ -205,13 +205,26 @@ export class ModerationService {
   /**
    * Files a report. With a game, both players must have played in it, and
    * its chat is copied onto the report (chat is deleted an hour after the
-   * game). One player can be reported once a day by the same account.
+   * game). With a study room instead (migration 041), the reporter must be
+   * in it (and not kept out of it as a player of its live game), and the
+   * reported player must be in it too or have written in its chat, which
+   * is copied the same way. One player can be reported once a day by the
+   * same account.
    */
   async report(
     reporterId: number,
-    input: { reportedId: number; reason: ReportReason; details?: string | undefined; gameId?: number | undefined }
+    input: {
+      reportedId: number;
+      reason: ReportReason;
+      details?: string | undefined;
+      gameId?: number | undefined;
+      studyRoomId?: number | undefined;
+    }
   ): Promise<{ id: number }> {
-    const { reportedId, reason, gameId } = input;
+    const { reportedId, reason, gameId, studyRoomId } = input;
+    if (gameId !== undefined && studyRoomId !== undefined) {
+      throw new AppError("A report is about a game or a study room, not both", "INVALID_REPORT", 400);
+    }
     if (reporterId === reportedId) throw new AppError("You can't report yourself", "SELF_REPORT", 400);
     const details = cleanReportDetails(input.details);
 
@@ -232,6 +245,10 @@ export class ModerationService {
       if (game.length === 0) {
         throw new AppError("That isn't a game between you and this player", "NOT_YOUR_GAME", 400);
       }
+    }
+
+    if (studyRoomId !== undefined && !(await this.fastify.study.canReportFrom(studyRoomId, reporterId, reportedId))) {
+      throw new AppError("That isn't a study room you share with this player", "NOT_YOUR_ROOM", 400);
     }
 
     const { rows: recent } = await this.fastify.pg.query(
@@ -259,14 +276,19 @@ export class ModerationService {
     }
 
     const { rows } = await this.fastify.pg.query<{ id: number }>(
-      `INSERT INTO user_reports ("reporterId", "reportedId", reason, details, "gameId", "chatExcerpt")
-       VALUES ($1, $2, $3, $4, $5::int,
+      // The latest messages of the game's chat, or of the room's (at most one is given)
+      `INSERT INTO user_reports ("reporterId", "reportedId", reason, details, "gameId", "studyRoomId", "chatExcerpt")
+       VALUES ($1, $2, $3, $4, $5::int, $7::int, COALESCE(
          (SELECT jsonb_agg(jsonb_build_object('userId', m."senderId", 'text', m.body, 'at', m."createdAt")
                            ORDER BY m.id)
           FROM (SELECT id, "senderId", body, "createdAt" FROM game_chat_messages
-                WHERE "gameId" = $5::int ORDER BY id DESC LIMIT $6) m))
+                WHERE "gameId" = $5::int ORDER BY id DESC LIMIT $6) m),
+         (SELECT jsonb_agg(jsonb_build_object('userId', m."senderId", 'text', m.body, 'at', m."createdAt")
+                           ORDER BY m.id)
+          FROM (SELECT id, "senderId", body, "createdAt" FROM study_chat_messages
+                WHERE "roomId" = $7::int ORDER BY id DESC LIMIT $6) m)))
        RETURNING id`,
-      [reporterId, reportedId, reason, details, gameId ?? null, CHAT_EXCERPT_LIMIT]
+      [reporterId, reportedId, reason, details, gameId ?? null, CHAT_EXCERPT_LIMIT, studyRoomId ?? null]
     );
     return { id: rows[0]!.id };
   }

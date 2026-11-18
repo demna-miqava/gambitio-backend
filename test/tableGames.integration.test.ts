@@ -217,6 +217,73 @@ describe("table mode: games at a real board", { skip }, () => {
     assert.equal(JSON.stringify(check).includes(`"gameId":${saved.json().id}`) || JSON.stringify(check).includes(`"id":${saved.json().id}`), false);
   });
 
+  test("a save sent again with the same clientId returns the game stored the first time", async () => {
+    // Another recorder: the route's per-minute limit is counted per user id
+    const rec = await createUser(app, "rhea");
+    await befriend(rec, ben);
+    const notes = await open("/notifications", ben);
+    const clientId = "local-game_0001";
+    const first = await save(rec, { kind: "friend", userId: ben.id }, { clientId });
+    assert.equal(first.statusCode, 201, first.body);
+    const again = await save(rec, { kind: "friend", userId: ben.id }, { clientId });
+    assert.equal(again.statusCode, 201);
+    assert.deepEqual(again.json(), first.json());
+    // Two at once: still one game
+    const [x, y] = await Promise.all([
+      save(rec, { kind: "guest", name: "G" }, { clientId: "concurrent-1" }),
+      save(rec, { kind: "guest", name: "G" }, { clientId: "concurrent-1" }),
+    ]);
+    assert.deepEqual([x.statusCode, y.statusCode], [201, 201]);
+    assert.equal(x.json().id, y.json().id);
+
+    const { rows } = await app.pg.query(`SELECT id FROM games WHERE "tableGame"`);
+    assert.equal(rows.length, 2);
+    assert.equal(await listed(rec), 2);
+    assert.equal((await app.pg.query(`SELECT 1 FROM table_game_requests`)).rows.length, 1);
+    await notes.next("table_game_request");
+    await notes.none("table_game_request");
+    // The id is the recorder's own: Ben may use the same one; it must look like an id
+    assert.equal((await save(ben, { kind: "guest", name: "G" }, { clientId })).json().id === first.json().id, false);
+    assert.equal((await save(rec, { kind: "guest", name: "G" }, { clientId: "short" })).statusCode, 400);
+    assert.equal((await save(rec, { kind: "guest", name: "G" }, { clientId: "has space in it" })).statusCode, 400);
+  });
+
+  test("a friend's rating goes on the game only once they confirm", async () => {
+    // Another recorder: the route's per-minute limit is counted per user id
+    const rec = await createUser(app, "rhea");
+    await befriend(rec, ben);
+    await app.pg.query(`UPDATE users SET "blitzRating" = 1734 WHERE id = $1`, [ben.id]);
+    const pending = (await save(rec, { kind: "friend", userId: ben.id })).json();
+    assert.deepEqual([pending.whitePlayer.rating, pending.whitePlayer.avatarUrl], [0, null]);
+    const declined = (await save(rec, { kind: "friend", userId: ben.id })).json();
+    await request("POST", `/api/games/table/requests/${declined.id}/decline`, ben);
+    const kept = (await request("GET", `/api/games/${declined.id}`, rec)).json();
+    assert.deepEqual([kept.whitePlayer.id, kept.whitePlayer.username, kept.whitePlayer.rating], [null, "benny", 0]);
+
+    await request("POST", `/api/games/table/requests/${pending.id}/confirm`, ben);
+    const confirmed = (await request("GET", `/api/games/${pending.id}`, rec)).json();
+    assert.deepEqual([confirmed.whitePlayer.id, confirmed.whitePlayer.rating], [ben.id, 1734]);
+  });
+
+  test("a friend's name still goes after the recorder deleted their account", async () => {
+    // Another recorder: the route's per-minute limit is counted per user id
+    const rec = await createUser(app, "rhea");
+    await befriend(rec, ben);
+    const pending = (await save(rec, { kind: "friend", userId: ben.id }, { clientId: "recorded-01" })).json();
+    const declined = (await save(rec, { kind: "friend", userId: ben.id })).json();
+    await request("POST", `/api/games/table/requests/${declined.id}/decline`, ben);
+    assert.equal((await request("DELETE", "/api/users/me", rec)).statusCode, 204);
+    // Rhea's pending request left Ben's inbox
+    assert.deepEqual((await request("GET", "/api/games/table/requests", ben)).json().requests, []);
+    assert.equal((await app.pg.query(`SELECT 1 FROM table_game_saves`)).rows.length, 0);
+
+    assert.equal((await request("DELETE", "/api/users/me", ben)).statusCode, 204);
+    for (const id of [pending.id, declined.id]) {
+      const { rows } = await app.pg.query(`SELECT "whiteUsername" FROM games WHERE id = $1`, [id]);
+      assert.equal(rows[0].whiteUsername, `deleted-${ben.id}`);
+    }
+  });
+
   test("deleting the account of a friend who never confirmed takes their name off", async () => {
     await befriend(ann, ben);
     const game = (await save(ann, { kind: "friend", userId: ben.id })).json();

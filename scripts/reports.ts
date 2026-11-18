@@ -4,7 +4,7 @@
  *
  *   npm run reports                    open reports, oldest first
  *   npm run reports -- all             every report, newest first (latest 200)
- *   npm run reports -- show 12         one report in full, with its chat excerpt
+ *   npm run reports -- show 12         one report in full, with its chat excerpt (a game's or a study room's)
  *   npm run reports -- resolve 12      close it as acted on
  *   npm run reports -- dismiss 12      close it as not a problem
  *
@@ -30,7 +30,7 @@ if (!connectionString) {
 }
 
 const LIST_SQL = (where: string, order: string) => `
-  SELECT r.id, r."createdAt", r.status, r.reason, r."gameId", r.details,
+  SELECT r.id, r."createdAt", r.status, r.reason, r."gameId", r."studyRoomId", r.details,
          reporter.username AS reporter, reported.username AS reported, r."reportedId",
          (SELECT COUNT(*) FROM user_reports o WHERE o."reportedId" = r."reportedId") AS "reportsOfPlayer",
          (SELECT COUNT(DISTINCT o."reporterId") FROM user_reports o WHERE o."reportedId" = r."reportedId")
@@ -56,6 +56,7 @@ try {
           `${safe(r.reported)} (id ${r.reportedId}; ${r.reportsOfPlayer} report(s) from ${r.reporters} player(s))` +
           `  by ${safe(r.reporter)}` +
           (r.gameId ? `  game ${r.gameId}` : "") +
+          (r.studyRoomId ? `  study room ${r.studyRoomId}` : "") +
           (r.details ? `\n      ${safe(r.details.replace(/\s+/g, " "))}` : "")
       );
     }
@@ -86,10 +87,12 @@ try {
           `  ${safe(r.reporter)} (id ${r.reporterId}) reported ${safe(r.reported)} (id ${r.reportedId}) for ${safe(r.reason)}`
         );
         if (r.gameId) console.log(`  Game ${r.gameId}`);
+        // Migration 041; a room that was deleted since is no longer named
+        if (r.studyRoomId) console.log(`  Study room ${r.studyRoomId}`);
         if (r.details) console.log(`  Details: ${safeBlock(r.details, "           ")}`);
         const chat: { userId: number; text: string; at: string }[] = r.chatExcerpt ?? [];
         if (chat.length > 0) {
-          console.log("  Chat in that game:");
+          console.log(r.studyRoomId ? "  Chat in that study room:" : "  Chat in that game:");
           for (const m of chat) {
             const who = m.userId === r.reportedId ? r.reported : m.userId === r.reporterId ? r.reporter : m.userId;
             console.log(`    [${safe(m.at)}] ${safe(who)}: ${safe(m.text)}`);

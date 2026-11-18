@@ -406,26 +406,31 @@ export class FriendRepository {
   }
 
   /**
-   * Every friend of the user, with the live game each has in progress (if
-   * any): what the friends status list needs besides presence. The game is
-   * found through the partial indexes on live games (migration 014), one
-   * lookup per friend.
+   * The user's first `limit` friends in the friends list's order (username,
+   * then id), with the live game each has in progress (if any): what the
+   * friends status list needs besides presence. The friends are picked
+   * first, so only those get the game lookup, through the partial indexes
+   * on live games (migration 014), one per friend.
    */
-  async getFriendsWithLiveGame(userId: number): Promise<FriendWithLiveGame[]> {
+  async getFriendsWithLiveGame(userId: number, limit: number): Promise<FriendWithLiveGame[]> {
     const { rows } = await this.fastify.pg.query<FriendWithLiveGame>(
-      `SELECT u.id, u.username, u."avatarUrl", f."createdAt" AS "friendsSince",
-              u."blitzRating", u."bulletRating", u."rapidRating",
-              g.id AS "gameId", g.time AS "gameTime"
-       FROM friends f
-       INNER JOIN users u ON (${this.buildFriendJoinCondition()})
+      `SELECT fu.*, g.id AS "gameId", g.time AS "gameTime"
+       FROM (
+         SELECT u.id, u.username, u."avatarUrl", f."createdAt" AS "friendsSince",
+                u."blitzRating", u."bulletRating", u."rapidRating"
+         FROM friends f
+         INNER JOIN users u ON (${this.buildFriendJoinCondition()})
+         WHERE f."userOneId" = $1 OR f."userTwoId" = $1
+         ORDER BY u.username, u.id
+         LIMIT $2
+       ) fu
        LEFT JOIN LATERAL (
          SELECT id, time FROM games
-         WHERE status = 'in_progress' AND ("whiteId" = u.id OR "blackId" = u.id)
+         WHERE status = 'in_progress' AND ("whiteId" = fu.id OR "blackId" = fu.id)
          LIMIT 1
        ) g ON true
-       WHERE f."userOneId" = $1 OR f."userTwoId" = $1
-       ORDER BY u.username`,
-      [userId]
+       ORDER BY fu.username, fu.id`,
+      [userId, limit]
     );
     return rows;
   }

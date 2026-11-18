@@ -270,6 +270,14 @@ export function applyStudyOp(current: StudyState, op: StudyOp): { state: StudySt
       state.nodes[parent.id] = { ...parent, children: parent.children.filter((id) => id !== node.id) };
       for (const id of removed) delete state.nodes[id];
       if (removed.includes(state.cursor)) state.cursor = parent.id;
+      // Only once the game is over can its moves be among them: the line
+      // then ends before the deleted node, so it never names a missing one.
+      // Clients drop the same ids from their copy of the line
+      if (state.game) {
+        const gone = new Set(removed);
+        const line = state.game.line.filter((id) => !gone.has(id));
+        if (line.length !== state.game.line.length) state.game = { ...state.game, line };
+      }
       return { state, change: { kind: "deleted", nodeId: node.id, parentId: parent.id, cursor: state.cursor } };
     }
     case "promote": {
@@ -301,11 +309,16 @@ export function applyStudyOp(current: StudyState, op: StudyOp): { state: StudySt
  * continuation after the latest move. Anyone looking at the latest move
  * ("Live") moves on to the new latest move; anyone elsewhere stays there.
  * Idempotent: the same moves again change nothing.
+ *
+ * Once the stored line is over the room is an ordinary study room and this
+ * changes nothing: the members may delete or reorder the game's moves, and
+ * a later sync must not put them back.
  */
 export function syncGameLine(current: StudyState, sans: readonly string[], over: boolean): {
   state: StudyState;
   change: StudyChange;
 } {
+  if (current.game?.over) return { state: current, change: { kind: "none" } };
   const state: StudyState = { ...current, nodes: { ...current.nodes } };
   const chess = new Chess(state.nodes[ROOT_ID]!.fen);
   const changed = new Set<string>();
@@ -350,11 +363,6 @@ export function syncGameLine(current: StudyState, sans: readonly string[], over:
     state,
     change: { kind: "game", nodes: [...changed].map((id) => state.nodes[id]!), game, cursor: state.cursor },
   };
-}
-
-/** The node of the linked game's latest move (the root before the first move). */
-export function liveNodeId(state: StudyState): string {
-  return state.game?.line.at(-1) ?? ROOT_ID;
 }
 
 /** The child of `parent` reached by the move `uci`, if the tree has it. */

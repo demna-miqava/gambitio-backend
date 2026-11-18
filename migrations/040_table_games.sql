@@ -5,19 +5,23 @@
 --
 -- A table game is always finished and unrated, and is never a bot, series
 -- or tournament game: it shows in its players' history and in review, and
--- every other reader of the games table leaves it out ("tableGame"), so it
 -- touches no ratings, stats, head-to-head, leaderboard counters, chat,
--- rematches, share links or repertoire checks.
+-- rematches, share links or repertoire checks. Most readers of the games
+-- table leave it out because it is unrated (stats) or never in progress
+-- (live lists, rematches); the ones that would otherwise take it (chat,
+-- share links, reports, head-to-head, drills, the repertoire check) test
+-- "tableGame" themselves. A new reader must do one or the other.
 --
 -- The other player is a guest (a name in the username column, no user id)
 -- or a friend. A friend's id goes on the game only once they confirm it
 -- (table_game_requests); until then, or if they decline, their side is just
 -- their name, so the game is in nobody's history but the recorder's.
 ALTER TABLE games ADD COLUMN "tableGame" boolean NOT NULL DEFAULT false;
+-- NOT VALID, validated in migration 042: see migration 036
 ALTER TABLE games ADD CONSTRAINT games_table_unrated_finished CHECK (
   NOT "tableGame"
   OR (NOT rated AND status = 'finished' AND "botId" IS NULL AND "seriesId" IS NULL AND "tournamentId" IS NULL)
-);
+) NOT VALID;
 
 CREATE TABLE table_game_requests (
   "gameId" integer PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,

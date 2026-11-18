@@ -6,13 +6,23 @@ import { REPORT_DETAILS_MAX_LENGTH, REPORT_REASONS } from "../services/moderatio
 // Capped at Postgres' integer max: a larger id would be a 500, not a 404
 const id = z.coerce.number().int().positive().max(2_147_483_647);
 const userIdParams = z.object({ userId: id });
-const reportSchema = z.object({
-  reportedId: id,
-  reason: z.enum(REPORT_REASONS),
-  details: z.string().max(REPORT_DETAILS_MAX_LENGTH).optional(),
-  /** The game it happened in; both players must have played in it */
-  gameId: id.optional(),
-});
+const reportSchema = z
+  .object({
+    reportedId: id,
+    reason: z.enum(REPORT_REASONS),
+    details: z.string().max(REPORT_DETAILS_MAX_LENGTH).optional(),
+    /** The game it happened in; both players must have played in it */
+    gameId: id.optional(),
+    /**
+     * Or the study room whose chat it happened in (migration 041): the
+     * reporter must be in it, and the reported player too or have written
+     * in its chat
+     */
+    studyRoomId: id.optional(),
+  })
+  .refine((body) => body.gameId === undefined || body.studyRoomId === undefined, {
+    message: "A report is about a game or a study room, not both",
+  });
 
 /** Blocking and reporting can't be used to probe or flood: a few a minute is plenty */
 const limited = { rateLimit: { max: 30, timeWindow: "1 minute" } };

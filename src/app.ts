@@ -275,6 +275,10 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   await app.register(cors, {
     origin: (origin, callback) => callback(null, origin !== undefined && isAllowedOrigin(origin)),
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    // The browser corrects its countdowns by the server's clock (the
+    // frontend's serverClock); a page on another origin (local development)
+    // can only read the header when it is exposed
+    exposedHeaders: ["Date"],
   });
   // Per signed-in user, so a school or club behind one address doesn't
   // share a single bucket; anonymous requests are limited per address. Runs

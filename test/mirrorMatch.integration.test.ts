@@ -182,6 +182,61 @@ describe("mirror matches and openings", { skip }, () => {
     assert.equal((await get(`/api/games/${gameId}`, alice.clerkId)).opening.id, "italian");
   });
 
+  test("from an opening only a mirror match is rated", async () => {
+    const rated = async (gameId: number) =>
+      (await app.pg.query(`SELECT rated FROM games WHERE id = $1`, [gameId])).rows[0].rated;
+
+    // A single game: unrated whatever the challenge asks, and shown so
+    const single = await challengeAccepted({ color: "white", openingId: "kings-gambit", rated: true });
+    assert.equal(single.received.data.rated, false);
+    assert.equal(single.created.data.rated, false);
+    assert.equal(await rated(single.gameId), false);
+    await app.pg.query(`UPDATE games SET status = 'finished', result = 'draw', "endReason" = 'draw_agreement'`);
+    await Promise.all(sockets.splice(0).map((s) => s.close()));
+
+    // A best-of-3 series from an opening: unrated too, every game of it
+    const series = await challengeAccepted({ color: "white", openingId: "evans-gambit", bestOf: 3 });
+    assert.equal(series.received.data.rated, false);
+    const seriesId = (await gameRow(series.gameId)).seriesId;
+    assert.equal((await app.pg.query(`SELECT rated FROM series WHERE id = $1`, [seriesId])).rows[0].rated, false);
+    assert.equal(await rated(series.gameId), false);
+    await app.pg.query(`UPDATE games SET status = 'finished', result = 'draw', "endReason" = 'draw_agreement'`);
+    await app.pg.query(`UPDATE series SET status = 'finished', "endReason" = 'resignation'`);
+    await Promise.all(sockets.splice(0).map((s) => s.close()));
+
+    // A mirror match is rated, as is each of its games
+    const mirror = await challengeAccepted({ color: "white", openingId: "evans-gambit", bestOf: 2 });
+    assert.equal(mirror.received.data.rated, true);
+    assert.equal(await rated(mirror.gameId), true);
+    // Once the match is over, a rematch is a single game from the opening: unrated
+    const ga = await open(`/game/${mirror.gameId}`, alice.clerkId);
+    const gb = await open(`/game/${mirror.gameId}`, bob.clerkId);
+    await ga.next("initial_game_state");
+    await gb.next("initial_game_state");
+    gb.send({ type: "resign" });
+    await ga.next("game_ended");
+    await app.pg.query(`UPDATE series SET status = 'finished', "endReason" = 'resignation'`);
+    ga.send({ type: "rematch_request" });
+    await gb.next("rematch_request");
+    gb.send({ type: "rematch_response", data: { accepted: true } });
+    const rematch = await ga.next("match_found");
+    assert.equal(rematch.data.rated, false);
+    assert.equal((await gameRow(rematch.data.gameId)).openingId, "evans-gambit");
+  });
+
+  test("an opening's challenge reads the same rated or not: its version doesn't change", async () => {
+    const na = await open("/notifications", alice.clerkId);
+    const nb = await open("/notifications", bob.clerkId);
+    const data = { challengedId: bob.id, color: "white", time: 180, increment: 0, openingId: "french" };
+    na.send({ type: "challenge_sent", data: { ...data, rated: true } });
+    const first = await nb.next("challenge_received");
+    na.send({ type: "challenge_sent", data: { ...data, rated: false } });
+    const second = await nb.next("challenge_received");
+    assert.deepEqual([first.data.rated, second.data.rated], [false, false]);
+    assert.equal(second.data.version, first.data.version);
+    assert.equal((await get("/api/challenges", bob.clerkId)).challenges[0].rated, false);
+  });
+
   test("changing the opening changes the challenge's version, and an unknown one is refused", async () => {
     const na = await open("/notifications", alice.clerkId);
     const nb = await open("/notifications", bob.clerkId);
