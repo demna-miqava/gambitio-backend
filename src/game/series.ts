@@ -12,9 +12,11 @@ export type SeriesLength = (typeof SERIES_LENGTHS)[number];
 export type SeriesStatus = "active" | "finished";
 /**
  * "played_out": decided by the games; "resignation": a player gave it up;
- * "expired": nobody played on for SERIES_IDLE_EXPIRY_MS (decided on points)
+ * "expired": nobody played on for SERIES_IDLE_EXPIRY_MS (decided on points).
+ * Timed matches (src/game/timedMatch.ts): "time_up", decided on points when
+ * the time ran out; "abandoned", on points after players kept not showing up
  */
-export type SeriesEndReason = "played_out" | "resignation" | "expired";
+export type SeriesEndReason = "played_out" | "resignation" | "expired" | "time_up" | "abandoned";
 
 /** How long a series may go without a game before it expires */
 export const SERIES_IDLE_EXPIRY_MS = 7 * 24 * 60 * 60_000;
@@ -65,10 +67,10 @@ export function seriesOdds(
  * The score after one game. An aborted game changes nothing (it is replayed
  * with the same colours, since the game number is gamesPlayed + 1).
  */
-export function scoreGame(
-  series: SeriesScore,
+export function scoreGame<S extends SeriesScore>(
+  series: S,
   game: { whiteId: number; blackId: number; result: GameResult }
-): SeriesScore {
+): S {
   if (game.result === "aborted") return series;
   let one = 0;
   let two = 0;

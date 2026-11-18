@@ -16,6 +16,12 @@ const CHALLENGE_SWEEP_MS = 30_000;
  * 5 minutes, as before, kept the database awake for one idle tab.
  */
 const SERIES_SWEEP_MS = 30 * 60_000;
+/**
+ * Backstop for the timers that start a timed match's next game
+ * (SeriesService.scheduleNextGame), and ends matches whose time ran out
+ * between games
+ */
+const TIMED_MATCH_SWEEP_MS = 10_000;
 /** Chat messages go an hour after their game ends: an hourly pass is close enough */
 const CHAT_SWEEP_MS = 60 * 60_000;
 
@@ -119,6 +125,17 @@ export function createJobs(app: FastifyInstance) {
         () => app.hub.attachedCount > 0,
         () => app.series.expireStale()
       );
+      // Timed matches: only while this instance knows of one that is on
+      // (SeriesService.needsTimedSweep)
+      app.series
+        .loadTimedMatches()
+        .catch((err) => app.log.error({ err }, "Reading the active timed matches failed"));
+      every(
+        TIMED_MATCH_SWEEP_MS,
+        "Timed match sweep",
+        () => app.series.needsTimedSweep,
+        () => app.series.sweepTimedMatches()
+      );
       // Tournaments: start the ones that are due, pair the waiting players
       // of the running ones, close the ones whose time is up. Only while
       // this instance knows of one that is running or about to start
@@ -143,6 +160,7 @@ export function createJobs(app: FastifyInstance) {
       for (const timer of timers) clearInterval(timer);
       timers.length = 0;
       app.liveGames.stop();
+      app.series.stop();
     },
   };
 }

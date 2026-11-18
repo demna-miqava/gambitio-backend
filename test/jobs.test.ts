@@ -10,7 +10,7 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 /** Just what createJobs touches, with a counter for every database pass. */
 function fakeApp() {
-  const calls = { clockSweep: 0, challenges: 0, series: 0, chat: 0, matchmaking: 0, tournaments: 0 };
+  const calls = { clockSweep: 0, challenges: 0, series: 0, chat: 0, matchmaking: 0, tournaments: 0, timed: 0 };
   const state = {
     needsClockSweep: false,
     liveDeadlinesPending: false,
@@ -18,6 +18,7 @@ function fakeApp() {
     attachedCount: 0,
     searching: 0,
     tournamentDue: false,
+    timedMatchOn: false,
   };
   const app = {
     log: { error: () => {} },
@@ -52,7 +53,15 @@ function fakeApp() {
     },
     matchmaking: { sweep: async () => void calls.matchmaking++, removeLeftovers: async () => {} },
     challenges: { expireStale: async () => void calls.challenges++ },
-    series: { expireStale: async () => void calls.series++ },
+    series: {
+      expireStale: async () => void calls.series++,
+      loadTimedMatches: async () => {},
+      get needsTimedSweep() {
+        return state.timedMatchOn;
+      },
+      sweepTimedMatches: async () => void calls.timed++,
+      stop: () => {},
+    },
     gameChat: { sweep: async () => void calls.chat++ },
     tournaments: {
       loadOpen: async () => {},
@@ -82,6 +91,7 @@ test("one idle tab doesn't make the sweeps query the database", async (t) => {
     assert.equal(calls.challenges, settled.challenges, "no challenge sweep");
     assert.equal(calls.matchmaking, 0);
     assert.equal(calls.tournaments, 0, "no tournament tick");
+    assert.equal(calls.timed, 0, "no timed match sweep");
     // 37 minutes in: once, at the half hour
     assert.equal(calls.series, 1, "the series sweep runs only every half hour");
 
@@ -105,6 +115,16 @@ test("one idle tab doesn't make the sweeps query the database", async (t) => {
     t.mock.timers.tick(10 * TOURNAMENT_TICK_MS);
     await flush();
     assert.equal(calls.tournaments, 1);
+
+    // A timed match on: its sweep runs, and stops with it
+    state.timedMatchOn = true;
+    t.mock.timers.tick(10_000);
+    await flush();
+    assert.equal(calls.timed, 1);
+    state.timedMatchOn = false;
+    t.mock.timers.tick(60_000);
+    await flush();
+    assert.equal(calls.timed, 1);
 
     // A challenge stored here: the challenge sweep runs until it can have expired
     jobs.noteChallenge();

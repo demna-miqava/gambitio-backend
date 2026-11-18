@@ -6,7 +6,8 @@ import type { LiveGame } from "../models/Game.js";
 import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
 import { getTimeControl, ratingColumns, type PlayerColor } from "../models/common.js";
 import { MIRROR_MATCH_LENGTH, seriesColors, seriesOdds } from "../game/series.js";
-import { seriesRepository, type SeriesRow } from "./seriesService.js";
+import { isTimedMatch, seriesRepository, timedMatchError, type SeriesRow } from "./seriesService.js";
+import { gameFitsMatch } from "../game/timedMatch.js";
 import type { AllowedFrom } from "../models/Settings.js";
 import { withinLimit } from "../utils/rateLimit.js";
 import { clockLabel, timeControlLabel } from "./pushService.js";
@@ -46,6 +47,11 @@ export interface Challenge {
    * (src/game/openings.ts, migration 036); null for the initial position
    */
   openingId: string | null;
+  /**
+   * A timed match of this many minutes (migration 039): as many games as
+   * fit, arena scoring. Null for a single game or a best-of series.
+   */
+  matchMinutes: number | null;
   /**
    * Changes whenever the terms above do (re-sending with other settings),
    * never repeats (migration 030). Accepting can name the version the player
@@ -131,6 +137,7 @@ function challengeReceivedMessage(challenge: ReceivedChallenge) {
       ...(challenge.seriesId !== null && { seriesId: challenge.seriesId, seriesGame: challenge.seriesGame }),
       rated: challenge.rated,
       opening: openingSummary(challenge.openingId),
+      matchMinutes: challenge.matchMinutes,
       version: challenge.version,
       createdAt: new Date(challenge.createdAt).toISOString(),
     },
@@ -240,6 +247,8 @@ export class ChallengeService {
       openingId?: string | undefined;
       /** Continue this series: its settings replace the ones sent */
       seriesId?: number | undefined;
+      /** A timed match of this many minutes (src/game/timedMatch.ts) instead of one game */
+      matchMinutes?: number | undefined;
     }
   ): Promise<void> {
     if (data.challengedId === challenger.id) {
@@ -272,6 +281,7 @@ export class ChallengeService {
         bestOf: series.bestOf,
         rated: series.rated,
         openingId: series.openingId ?? undefined,
+        matchMinutes: undefined,
         color: colors.whiteId === challenger.id ? "white" : "black",
       };
     }
@@ -296,6 +306,19 @@ export class ChallengeService {
     if (data.openingId !== undefined && !opening) {
       throw new AppError("Unknown opening", "UNKNOWN_OPENING", 400);
     }
+    const matchMinutes = data.matchMinutes ?? null;
+    if (matchMinutes !== null) {
+      if ((data.bestOf ?? 1) !== 1) {
+        throw new AppError("A timed match can't also be a best-of series", "BAD_MATCH_FORMAT", 400);
+      }
+      if (!gameFitsMatch(time, data.increment, matchMinutes)) {
+        throw new AppError(
+          `That time control is too long for a ${matchMinutes}-minute match`,
+          "MATCH_TOO_SHORT",
+          400
+        );
+      }
+    }
 
     // Sending again to the same player replaces the open challenge (new
     // settings, fresh expiry), so a client that lost track of it isn't
@@ -305,18 +328,18 @@ export class ChallengeService {
       `INSERT INTO challenges (
          "challengerId", "challengedId", "challengerUsername", "challengedUsername",
          "challengerAvatarUrl", "challengedAvatarUrl", time, increment, "challengerColor", "bestOf", "seriesId",
-         "challengerTime", "challengedTime", rated, "openingId")
-       SELECT $1, u.id, $2, u.username, $3, u."avatarUrl", $4, $5, $6, $8, $9, $10, $11, $12, $13
+         "challengerTime", "challengedTime", rated, "openingId", "matchMinutes")
+       SELECT $1, u.id, $2, u.username, $3, u."avatarUrl", $4, $5, $6, $8, $9, $10, $11, $12, $13, $14
        FROM users u WHERE u.id = $7
        ON CONFLICT ("challengerId", "challengedId") DO UPDATE SET
          version = CASE
            WHEN (challenges.time, challenges.increment, challenges."challengerColor", challenges."bestOf",
                  challenges."seriesId", challenges."challengerTime", challenges."challengedTime", challenges.rated,
-                 challenges."openingId")
+                 challenges."openingId", challenges."matchMinutes")
              IS NOT DISTINCT FROM
                 (EXCLUDED.time, EXCLUDED.increment, EXCLUDED."challengerColor", EXCLUDED."bestOf",
                  EXCLUDED."seriesId", EXCLUDED."challengerTime", EXCLUDED."challengedTime", EXCLUDED.rated,
-                 EXCLUDED."openingId")
+                 EXCLUDED."openingId", EXCLUDED."matchMinutes")
            THEN challenges.version
            ELSE nextval('challenges_version_seq')
          END,
@@ -324,6 +347,7 @@ export class ChallengeService {
          "challengerColor" = EXCLUDED."challengerColor", "bestOf" = EXCLUDED."bestOf",
          "seriesId" = EXCLUDED."seriesId", "challengerTime" = EXCLUDED."challengerTime",
          "challengedTime" = EXCLUDED."challengedTime", rated = EXCLUDED.rated, "openingId" = EXCLUDED."openingId",
+         "matchMinutes" = EXCLUDED."matchMinutes",
          "challengerUsername" = EXCLUDED."challengerUsername",
          "challengerAvatarUrl" = EXCLUDED."challengerAvatarUrl", "createdAt" = now()
        RETURNING *, (SELECT "${ratingColumn}" FROM users WHERE id = $1) AS "challengerRating"`,
@@ -341,6 +365,7 @@ export class ChallengeService {
         hasOdds ? data.opponentTime : null,
         rated,
         opening?.id ?? null,
+        matchMinutes,
       ]
     );
     const challenge = rows[0];
@@ -365,7 +390,9 @@ export class ChallengeService {
               `${clockLabel(challenge.challengerTime)}` +
               (challenge.increment ? `, +${challenge.increment}s a move` : "")
             : `${timeControlLabel(challenge.time, challenge.increment)}`) +
-          (challenge.bestOf === MIRROR_MATCH_LENGTH
+          (challenge.matchMinutes !== null
+            ? `, ${challenge.matchMinutes}-minute timed match`
+            : challenge.bestOf === MIRROR_MATCH_LENGTH
             ? ", mirror match"
             : challenge.bestOf > 1
               ? `, best of ${challenge.bestOf}`
@@ -463,6 +490,7 @@ export class ChallengeService {
       throw new AppError("You are not playing in this series", "NOT_IN_SERIES", 403);
     }
     if (series.status !== "active") throw new AppError("The series is over", "SERIES_OVER", 409);
+    if (isTimedMatch(series)) throw timedMatchError();
     if (await seriesRepository.hasGameInProgress(this.fastify.pg, seriesId)) {
       throw new AppError("A game of this series is being played", "SERIES_GAME_IN_PROGRESS", 409);
     }
@@ -635,6 +663,7 @@ export class ChallengeService {
         if (continuing) {
           // The next game of an existing series; its colours and clock apply
           if (continuing.status !== "active") throw new AppError("The series is over", "SERIES_OVER", 409);
+          if (isTimedMatch(continuing)) throw timedMatchError();
           if (seriesBusy) {
             throw new AppError("A game of this series is being played", "SERIES_GAME_IN_PROGRESS", 409);
           }
@@ -667,12 +696,12 @@ export class ChallengeService {
           challenge.challengerTime !== null && challenge.challengedTime !== null
             ? { challengerTime: challenge.challengerTime, challengedTime: challenge.challengedTime }
             : null;
-        // A best-of challenge starts a series; this is its first game. The
-        // series row's foreign keys share-lock both players, which is why
-        // they were locked (for update) above, before anything else could
-        // take a share lock on them
+        // A best-of challenge (or a timed match) starts a series; this is
+        // its first game. The series row's foreign keys share-lock both
+        // players, which is why they were locked (for update) above, before
+        // anything else could take a share lock on them
         const series =
-          challenge.bestOf > 1
+          challenge.bestOf > 1 || challenge.matchMinutes !== null
             ? await seriesRepository.create(tx, {
                 challengerId,
                 challengedId,
@@ -683,8 +712,10 @@ export class ChallengeService {
                 odds,
                 rated: challenge.rated,
                 openingId: challenge.openingId,
+                matchMinutes: challenge.matchMinutes,
               })
             : null;
+        if (series?.endsAt) this.fastify.series.noteTimedMatch(series.endsAt);
         return createGame(
           tx,
           {

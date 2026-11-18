@@ -2,6 +2,7 @@ import { z } from "zod";
 import { TIME_LIMITS } from "../models/common.js";
 import { CHAT_MAX_RAW_LENGTH } from "../game/chatText.js";
 import { OPENING_IDS } from "../game/openings.js";
+import { MATCH_MINUTES } from "../game/timedMatch.js";
 
 const square = z.string().regex(/^[a-h][1-8]$/);
 // Ids are Postgres integers: a larger number would fail the query instead of finding nothing
@@ -80,6 +81,13 @@ export const notificationClientMessageSchema = z.discriminatedUnion("type", [
       // Continues this series instead: its time control, length and colours
       // apply, and the challenged player must be the opponent in it
       seriesId: userId.optional(),
+      // A timed match of this many minutes instead (migration 039): as many
+      // games as fit, scored like an arena. Only with bestOf 1
+      matchMinutes: z
+        .number()
+        .int()
+        .refine((m) => (MATCH_MINUTES as readonly number[]).includes(m), "Unknown match length")
+        .optional(),
     }),
   }),
   z.object({ type: z.literal("challenge_declined"), data: z.object({ challengerId: userId }) }),

@@ -126,6 +126,17 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
   transaction that ends it, and the next game is the rematch (the series
   picks the colours). Head-to-head records live here too. `bestOf: 2` is a
   mirror match: one game with each colour, scored as a pair (1-1 is drawn)
+- `src/game/timedMatch.ts`, `SeriesService.continueTimedMatch` – timed
+  matches (migration 039): a friend challenge with `matchMinutes` starts a
+  series with `bestOf` 0 whose clock runs from the accept (`endsAt`). Each
+  next game starts by itself `NEXT_GAME_DELAY_MS` after the last one ended
+  (a timer on the instance that ended it, with a sweep in `src/jobs.ts` as
+  the backstop), colours swapping. Scoring is the arena's (2 / 1 / 0,
+  doubled after two wins in a row); no game starts within `lastPairingMs` of
+  the end, and one still going then is played out and counts. No abort or
+  rematch while it runs; a player who never makes their first move loses
+  the game (unrated), and two such games in a row end the match
+  ("abandoned"). The time control must fit the match (`gameFitsMatch`)
 - `src/game/openings.ts`, `GET /api/openings` – openings a friend challenge
   (or every game of its series) can start from, sent as `openingId`
   (migration 036). The opening's moves are written into the new game's PGN,

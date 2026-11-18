@@ -32,6 +32,8 @@ export async function challengeRoutes(fastify: FastifyInstance) {
         rated: challenge.rated,
         // The opening the game starts from; null for the initial position
         opening: openingSummary(challenge.openingId),
+        // A timed match of this many minutes; null otherwise
+        matchMinutes: challenge.matchMinutes,
         // Changes whenever the terms do; sent back when accepting
         version: challenge.version,
       })),
@@ -62,6 +64,7 @@ export async function challengeRoutes(fastify: FastifyInstance) {
         seriesGame: challenge.seriesGame,
         rated: challenge.rated,
         opening: openingSummary(challenge.openingId),
+        matchMinutes: challenge.matchMinutes,
         version: challenge.version,
       },
     };
