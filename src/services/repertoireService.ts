@@ -168,6 +168,8 @@ export class RepertoireService {
       FROM games
       WHERE "${column}" = $1 ${extra} AND status = 'finished' AND result IS DISTINCT FROM 'aborted'
         AND "numMoves" > 0
+        -- A game from a set opening (migration 036) says nothing of the player's repertoire
+        AND "startPly" = 0
       ORDER BY "createdAt" DESC, id DESC LIMIT $2)`;
     const { rows } = await this.fastify.pg.query<{
       id: number;

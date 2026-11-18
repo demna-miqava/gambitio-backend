@@ -12,6 +12,7 @@ const GAME_COLUMNS = `
   "drawOfferedBy", "rematchRequestedBy", "rematchGameId",
   "takebackRequestedBy", "takebackDeclinedFor",
   "whiteRatingChange", "blackRatingChange", "botId", rated, "seriesId", "seriesGame", "tournamentId",
+  "openingId", "startPly",
   "whiteLagBudgetMs", "blackLagBudgetMs", "pausedAt", "drawDeclinedFor",
   "whiteRematchAsked", "blackRematchAsked"`;
 
@@ -55,6 +56,8 @@ export interface NewGame {
   tournamentId?: number | null;
   /** False makes an even game unrated too (an unrated tournament). Default: rated unless it has odds */
   rated?: boolean;
+  /** The opening the game starts from, already played (src/game/openings.ts) */
+  opening?: { id: string; pgn: string; fen: string; ply: number } | null;
 }
 
 /** A finished game against a computer bot; one side is the bot (no user id). */
@@ -204,9 +207,10 @@ export const gameRepository = {
         "whiteRating", "blackRating", "whiteAvatarUrl", "blackAvatarUrl",
         time, increment, status, "numMoves",
         "whiteTimeLeftMs", "blackTimeLeftMs", "lastMoveAt", "deadlineAt", "seriesId", "seriesGame",
-        "whiteTime", "blackTime", rated, "whiteProvisional", "blackProvisional", "tournamentId"
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'in_progress', 0, $11, $12, $13, $14, $15, $16,
-        $17, $18, $19, $20, $21, $22)
+        "whiteTime", "blackTime", rated, "whiteProvisional", "blackProvisional", "tournamentId",
+        "openingId", "startPly", pgn, fen
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'in_progress', $26, $11, $12, $13, $14, $15, $16,
+        $17, $18, $19, $20, $21, $22, $23, $27, $24, $25)
       RETURNING ${GAME_COLUMNS}`,
       [
         game.whiteId,
@@ -231,6 +235,12 @@ export const gameRepository = {
         game.whiteProvisional,
         game.blackProvisional,
         game.tournamentId ?? null,
+        game.opening?.id ?? null,
+        game.opening?.pgn ?? null,
+        game.opening?.fen ?? null,
+        game.opening?.ply ?? 0,
+        // Again, for "startPly" (a smallint, where "numMoves" is an integer)
+        game.opening?.ply ?? 0,
       ]
     );
     return rows[0]!;

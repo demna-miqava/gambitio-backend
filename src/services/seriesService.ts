@@ -17,6 +17,7 @@ import { AppError } from "../errors/AppError.js";
 import { topics, type RealtimeHub } from "../realtime/hub.js";
 import { toGameListItem } from "./gameService.js";
 import { GAME_LIST_COLUMNS, type GameListRow } from "../repositories/gameRepository.js";
+import { openingSummary } from "../game/openings.js";
 
 /** A row of the series table. */
 export interface SeriesRow extends SeriesScore {
@@ -33,6 +34,8 @@ export interface SeriesRow extends SeriesScore {
   playerTwoTime: number | null;
   /** False for a casual series (migration 035). One with time odds is unrated either way */
   rated: boolean;
+  /** The opening every game starts from (migration 036); null for the initial position */
+  openingId: string | null;
   status: SeriesStatus;
   winnerId: number | null;
   endReason: SeriesEndReason | null;
@@ -58,6 +61,8 @@ export interface SeriesSummary {
   increment: number;
   /** Whether its games change ratings: false for a casual series or one with time odds */
   rated: boolean;
+  /** The opening every game starts from; null for the initial position */
+  opening: ReturnType<typeof openingSummary>;
   status: SeriesStatus;
   endReason: SeriesEndReason | null;
   endedAt: Date | null;
@@ -71,7 +76,7 @@ export interface SeriesSummary {
 }
 
 const SERIES_COLUMNS = `s.id, s."createdAt", s."playerOneId", s."playerTwoId", s."playerOneStartsWhite",
-  s."bestOf", s.time, s.increment, s."playerOneTime", s."playerTwoTime", s.rated, s.status, s."playerOneHalfPoints", s."playerTwoHalfPoints",
+  s."bestOf", s.time, s.increment, s."playerOneTime", s."playerTwoTime", s.rated, s."openingId", s.status, s."playerOneHalfPoints", s."playerTwoHalfPoints",
   s."gamesPlayed", s."winnerId", s."endReason", s."endedAt"`;
 
 const SUMMARY_SELECT = `SELECT ${SERIES_COLUMNS},
@@ -100,6 +105,7 @@ export function toSeriesSummary(row: SummaryRow): SeriesSummary {
     time: row.time,
     increment: row.increment,
     rated: row.rated && (row.playerOneTime === null || row.playerTwoTime === null),
+    opening: openingSummary(row.openingId),
     status: row.status,
     endReason: row.endReason,
     endedAt: row.endedAt,
@@ -140,12 +146,14 @@ export const seriesRepository = {
       odds?: { challengerTime: number; challengedTime: number } | null;
       /** False for a casual series. Default: rated (unless it has time odds) */
       rated?: boolean;
+      /** The opening every game starts from (src/game/openings.ts) */
+      openingId?: string | null;
     }
   ): Promise<SeriesRow> {
     const { rows } = await tx.query<SeriesRow>(
       `INSERT INTO series ("playerOneId", "playerTwoId", "playerOneStartsWhite", "bestOf", time, increment,
-         "playerOneTime", "playerTwoTime", rated)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         "playerOneTime", "playerTwoTime", rated, "openingId")
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING ${SERIES_COLUMNS.replace(/s\./g, "")}`,
       [
         params.challengerId,
@@ -157,6 +165,7 @@ export const seriesRepository = {
         params.odds?.challengerTime ?? null,
         params.odds?.challengedTime ?? null,
         params.rated !== false,
+        params.openingId ?? null,
       ]
     );
     return rows[0]!;

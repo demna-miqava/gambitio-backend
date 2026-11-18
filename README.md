@@ -124,7 +124,22 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
 - `src/game/series.ts`, `src/services/seriesService.ts` – best-of-3/5 friend
   series: a challenge with `bestOf` starts one; each game is scored in the
   transaction that ends it, and the next game is the rematch (the series
-  picks the colours). Head-to-head records live here too
+  picks the colours). Head-to-head records live here too. `bestOf: 2` is a
+  mirror match: one game with each colour, scored as a pair (1-1 is drawn)
+- `src/game/openings.ts`, `GET /api/openings` – openings a friend challenge
+  (or every game of its series) can start from, sent as `openingId`
+  (migration 036). The opening's moves are written into the new game's PGN,
+  and `startPly` counts them: clocks, abort, the first-move timeout and
+  takebacks count from there, so the opening is never taken back. Such games
+  are left out of repertoire checks
+- `src/game/conversion.ts`, `src/services/conversionDrillService.ts`,
+  `src/routes/conversionDrills.ts` – conversion drills (migration 037):
+  positions from a player's own draws and losses where they were clearly
+  winning. The browser scans the games with Stockfish
+  (`GET /api/conversion-drills/candidates`, then `POST .../scans` per game,
+  with the position found or none) and plays the drills against the engine;
+  the server recomputes each position from the game, refuses games the player
+  won, and schedules reviews like repertoire lines
 - `src/game/repertoire.ts`, `src/services/repertoireService.ts` – opening
   repertoire lines, spaced-repetition practice, and where recent games left
   the preparation (`GET /api/repertoire/check`)
@@ -148,6 +163,18 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
   challenges to non-friends are rate-limited. A challenge has a `version`
   that changes with its terms; accepting can name it, and a stale one is
   refused with `CHALLENGE_CHANGED` (migration 030)
+- Time odds (migration 027) – a friend challenge or series where the two
+  players start with different clocks (`challengerTime` / `challengedTime`;
+  `time` is the longer of the two, so the time control still reads right).
+  The increment is shared, and a game with time odds is never rated
+- `src/services/moderationService.ts`, `src/routes/moderation.ts` – blocking
+  and reports (migration 028). A block is the blocker's choice but cuts
+  contact both ways: no challenges, friend requests, game chat, rematch
+  offers or matchmaking pairings between the two, and it ends a friendship
+  and withdraws open requests and challenges. The blocked player is never
+  told. A report keeps the reported game's chat as it stood (chat is deleted
+  an hour after a game); `npm run reports` lists them, with player text
+  escaped so it is safe to print in a terminal
 - `src/services/pushService.ts`, `src/routes/push.ts` – web push: browsers
   register a subscription, and challenges, friend requests and game starts
   are also sent as notifications, throttled per recipient and deduplicated

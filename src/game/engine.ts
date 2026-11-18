@@ -127,9 +127,10 @@ export function applyMoveTo(chess: Chess, pgn: string, ply: number, input: MoveI
 }
 
 /**
- * Least ply a takeback may go back to: both players have moved, so the clock
+ * Least ply a takeback may go back to, counted from the game's `startPly`
+ * (the moves an opening played): both players have moved, so the clock
  * keeps running and the first-move window (abort, FIRST_MOVE_TIMEOUT_MS)
- * never opens again.
+ * never opens again. The opening's own moves can never be taken back.
  */
 export const MIN_TAKEBACK_PLY = 2;
 
@@ -139,10 +140,10 @@ export const MIN_TAKEBACK_PLY = 2;
  * requester's turn). Null when that would go back before MIN_TAKEBACK_PLY,
  * which also covers a requester who hasn't moved yet.
  */
-export function takebackPlies(ply: number, requester: PlayerColor): number | null {
+export function takebackPlies(ply: number, requester: PlayerColor, startPly = 0): number | null {
   const toMove: PlayerColor = ply % 2 === 0 ? "white" : "black";
   const plies = toMove === requester ? 2 : 1;
-  return ply - plies >= MIN_TAKEBACK_PLY ? plies : null;
+  return ply - plies >= startPly + MIN_TAKEBACK_PLY ? plies : null;
 }
 
 /**

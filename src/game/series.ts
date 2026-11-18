@@ -1,7 +1,12 @@
 import type { GameResult } from "./engine.js";
 
-/** Allowed series lengths; 1 is a plain single game. */
-export const SERIES_LENGTHS = [3, 5] as const;
+/**
+ * Allowed series lengths; 1 is a plain single game. 2 is a mirror match: one
+ * game with each colour (usually from a chosen opening, src/game/openings.ts),
+ * scored as a pair, so it can end 1-1.
+ */
+export const SERIES_LENGTHS = [2, 3, 5] as const;
+export const MIRROR_MATCH_LENGTH = 2;
 export type SeriesLength = (typeof SERIES_LENGTHS)[number];
 
 export type SeriesStatus = "active" | "finished";
@@ -94,6 +99,8 @@ export function expiredSeriesDecision(series: SeriesScore): { winnerId: number |
  * Whether the series is over, and who won it (null winner: drawn series).
  * A player with more than half the points on offer has clinched it, since
  * the other can no longer catch up; otherwise it ends after `bestOf` games.
+ * (A mirror match is never clinched after its first game: one win is
+ * exactly half the points on offer, not more.)
  */
 export function seriesDecision(
   series: SeriesScore

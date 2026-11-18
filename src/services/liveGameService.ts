@@ -28,7 +28,8 @@ import {
   type MoveTiming,
 } from "../game/clock.js";
 import { STARTING_FEN } from "../game/engine.js";
-import { colorOf, createGame, finishGame, matchFoundData, opponentOf } from "./gameService.js";
+import { bothPlayersMoved, colorOf, createGame, finishGame, matchFoundData, opponentOf } from "./gameService.js";
+import { openingSummary } from "../game/openings.js";
 import { AppError } from "../errors/AppError.js";
 import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
 import { blocksBetween } from "../repositories/blockRepository.js";
@@ -116,6 +117,7 @@ function clockOf(game: LiveGame): ClockState {
     blackMs: game.blackTimeLeftMs ?? (game.blackTime ?? game.time) * 1000,
     lastMoveAt: (game.lastMoveAt ?? game.createdAt).getTime(),
     ply: game.numMoves,
+    startPly: game.startPly,
     whiteLagBudgetMs: game.whiteLagBudgetMs,
     blackLagBudgetMs: game.blackLagBudgetMs,
   };
@@ -512,7 +514,10 @@ export class LiveGameService {
         status: game.status,
         numMoves: game.numMoves,
         isFinished: game.status === "finished",
-        clockRunning: isClockRunning(game.numMoves),
+        clockRunning: bothPlayersMoved(game),
+        // A game from an opening: its first startPly moves were played for the players
+        opening: openingSummary(game.openingId),
+        startPly: game.startPly,
         whiteTimeLeft: clock?.whiteMs ?? game.whiteTimeLeftMs,
         blackTimeLeft: clock?.blackMs ?? game.blackTimeLeftMs,
         drawOfferedBy: isPlayer ? game.drawOfferedBy : null,
@@ -607,7 +612,7 @@ export class LiveGameService {
     // or a resignation on move one) still counts in the tournament, but it
     // wasn't a game of chess: it changes no ratings
     const played =
-      game.tournamentId !== null && game.rated && game.numMoves < 2 && game.status === "in_progress"
+      game.tournamentId !== null && game.rated && !bothPlayersMoved(game) && game.status === "in_progress"
         ? await gameRepository.makeUnrated(tx, game)
         : game;
     const finished = await finishGame(tx, played, outcome, clock);
@@ -671,7 +676,7 @@ export class LiveGameService {
       // late player loses it and is paused, so a move sent in the moment
       // before the timer fires can't turn a no-show into a game that scores
       // nothing)
-      if (!isClockRunning(state.ply) && game.deadlineAt && game.deadlineAt.getTime() <= now) {
+      if (!isClockRunning(state.ply, state.startPly) && game.deadlineAt && game.deadlineAt.getTime() <= now) {
         await this.endAtDeadline(tx, game, now, fx);
         return;
       }
@@ -725,7 +730,7 @@ export class LiveGameService {
           fen: result.fen,
           userId,
           moveNumber: result.ply,
-          clockRunning: isClockRunning(clock.ply),
+          clockRunning: isClockRunning(clock.ply, clock.startPly),
           whiteTimeLeft: clock.whiteMs,
           blackTimeLeft: clock.blackMs,
         },
@@ -807,7 +812,7 @@ export class LiveGameService {
       if (game.status !== "in_progress") throw gameOver();
       if (!colorOf(game, userId)) throw notAPlayer();
       if (game.tournamentId !== null) throw tournamentGame("Aborting");
-      if (game.numMoves >= 2) {
+      if (bothPlayersMoved(game)) {
         throw new AppError("The game can no longer be aborted", "ABORT_NOT_ALLOWED", 409);
       }
       await this.end(tx, game, { result: "aborted", reason: "aborted" }, null, fx);
@@ -898,7 +903,7 @@ export class LiveGameService {
           409
         );
       }
-      if (takebackPlies(game.numMoves, color) === null) throw takebackNotAllowed();
+      if (takebackPlies(game.numMoves, color, game.startPly) === null) throw takebackNotAllowed();
 
       await gameRepository.setTakebackRequest(tx, gameId, userId);
       fx.out.push({ topic: topics.gameUser(gameId, opponentId), message: { type: "takeback_request" } });
@@ -949,7 +954,7 @@ export class LiveGameService {
     }
     // Checked again: the request was valid when made, but is now applied to
     // whatever position the game is in
-    const plies = takebackPlies(game.numMoves, colorOf(game, requesterId)!);
+    const plies = takebackPlies(game.numMoves, colorOf(game, requesterId)!, game.startPly);
     if (plies === null) throw takebackNotAllowed();
 
     const chess = this.position(game);
@@ -981,7 +986,7 @@ export class LiveGameService {
         fen: position.fen,
         pgn: position.pgn,
         moveNumber: position.ply,
-        clockRunning: isClockRunning(clock.ply),
+        clockRunning: isClockRunning(clock.ply, clock.startPly),
         whiteTimeLeft: clock.whiteMs,
         blackTimeLeft: clock.blackMs,
       },
@@ -1023,7 +1028,7 @@ export class LiveGameService {
   /** Ends a game whose deadline has passed: an abort, or a flag fall. */
   private async endAtDeadline(tx: TxClient, game: LiveGame, now: number, fx: TxEffects) {
     const state = clockOf(game);
-    if (!isClockRunning(state.ply)) {
+    if (!isClockRunning(state.ply, state.startPly)) {
       // A tournament game isn't aborted: whoever didn't show up loses it
       // (unrated, see end) and is paused, so the opponent gets the points
       // and the absent player isn't paired again
@@ -1183,6 +1188,8 @@ export class LiveGameService {
       // A casual game's rematch is casual too, as is every game of a casual
       // series. (Tournament games have no rematch.)
       rated: game.rated,
+      // From the same opening (in a series, the series' opening is the game's)
+      openingId: game.openingId,
       ...(next && { series: { id: next.seriesId, game: next.number } }),
     });
     await gameRepository.setRematchGame(tx, game.id, rematch.id);

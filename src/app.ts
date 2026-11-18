@@ -40,6 +40,8 @@ import { endgameRoutes } from "./routes/endgames.js";
 import { pushRoutes } from "./routes/push.js";
 import { moderationRoutes } from "./routes/moderation.js";
 import { tournamentRoutes } from "./routes/tournaments.js";
+import { openingRoutes } from "./routes/openings.js";
+import { conversionDrillRoutes } from "./routes/conversionDrills.js";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -344,6 +346,8 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   await app.register(pushRoutes, { prefix: "/api" });
   await app.register(moderationRoutes, { prefix: "/api" });
   await app.register(tournamentRoutes, { prefix: "/api" });
+  await app.register(openingRoutes, { prefix: "/api" });
+  await app.register(conversionDrillRoutes, { prefix: "/api" });
 
   return app;
 }

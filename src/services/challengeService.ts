@@ -5,12 +5,13 @@ import { AlreadyInGameError, createGame, lockPlayers, matchFoundData } from "./g
 import type { LiveGame } from "../models/Game.js";
 import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
 import { getTimeControl, ratingColumns, type PlayerColor } from "../models/common.js";
-import { seriesColors, seriesOdds } from "../game/series.js";
+import { MIRROR_MATCH_LENGTH, seriesColors, seriesOdds } from "../game/series.js";
 import { seriesRepository, type SeriesRow } from "./seriesService.js";
 import type { AllowedFrom } from "../models/Settings.js";
 import { withinLimit } from "../utils/rateLimit.js";
 import { clockLabel, timeControlLabel } from "./pushService.js";
 import { blocksBetween } from "../repositories/blockRepository.js";
+import { openingSummary } from "../game/openings.js";
 
 export interface Challenge {
   id: number;
@@ -31,7 +32,7 @@ export interface Challenge {
   challengerTime: number | null;
   challengedTime: number | null;
   challengerColor: PlayerColor;
-  /** 1 for a single game; 3 or 5 for a series */
+  /** 1 for a single game; 3 or 5 for a series; 2 for a mirror match */
   bestOf: number;
   /** Set when accepting plays the next game of an existing series */
   seriesId: number | null;
@@ -40,6 +41,11 @@ export interface Challenge {
    * its series, changes no ratings. Always false with time odds.
    */
   rated: boolean;
+  /**
+   * The opening its game (or every game of its series) starts from
+   * (src/game/openings.ts, migration 036); null for the initial position
+   */
+  openingId: string | null;
   /**
    * Changes whenever the terms above do (re-sending with other settings),
    * never repeats (migration 030). Accepting can name the version the player
@@ -124,6 +130,7 @@ function challengeReceivedMessage(challenge: ReceivedChallenge) {
       bestOf: challenge.bestOf,
       ...(challenge.seriesId !== null && { seriesId: challenge.seriesId, seriesGame: challenge.seriesGame }),
       rated: challenge.rated,
+      opening: openingSummary(challenge.openingId),
       version: challenge.version,
       createdAt: new Date(challenge.createdAt).toISOString(),
     },
@@ -229,6 +236,8 @@ export class ChallengeService {
       bestOf?: number | undefined;
       /** False for a casual game (or series). Default: rated */
       rated?: boolean | undefined;
+      /** Start from this opening (src/game/openings.ts) instead of the initial position */
+      openingId?: string | undefined;
       /** Continue this series: its settings replace the ones sent */
       seriesId?: number | undefined;
     }
@@ -262,6 +271,7 @@ export class ChallengeService {
         increment: series.increment,
         bestOf: series.bestOf,
         rated: series.rated,
+        openingId: series.openingId ?? undefined,
         color: colors.whiteId === challenger.id ? "white" : "black",
       };
     }
@@ -281,6 +291,11 @@ export class ChallengeService {
     // Time odds always make the game unrated
     const rated = !hasOdds && data.rated !== false;
     const ratingColumn = ratingColumns(getTimeControl(time)).rating;
+    // The schema only lets known ids through; this keeps a bad one out of the table anyway
+    const opening = openingSummary(data.openingId);
+    if (data.openingId !== undefined && !opening) {
+      throw new AppError("Unknown opening", "UNKNOWN_OPENING", 400);
+    }
 
     // Sending again to the same player replaces the open challenge (new
     // settings, fresh expiry), so a client that lost track of it isn't
@@ -290,23 +305,25 @@ export class ChallengeService {
       `INSERT INTO challenges (
          "challengerId", "challengedId", "challengerUsername", "challengedUsername",
          "challengerAvatarUrl", "challengedAvatarUrl", time, increment, "challengerColor", "bestOf", "seriesId",
-         "challengerTime", "challengedTime", rated)
-       SELECT $1, u.id, $2, u.username, $3, u."avatarUrl", $4, $5, $6, $8, $9, $10, $11, $12
+         "challengerTime", "challengedTime", rated, "openingId")
+       SELECT $1, u.id, $2, u.username, $3, u."avatarUrl", $4, $5, $6, $8, $9, $10, $11, $12, $13
        FROM users u WHERE u.id = $7
        ON CONFLICT ("challengerId", "challengedId") DO UPDATE SET
          version = CASE
            WHEN (challenges.time, challenges.increment, challenges."challengerColor", challenges."bestOf",
-                 challenges."seriesId", challenges."challengerTime", challenges."challengedTime", challenges.rated)
+                 challenges."seriesId", challenges."challengerTime", challenges."challengedTime", challenges.rated,
+                 challenges."openingId")
              IS NOT DISTINCT FROM
                 (EXCLUDED.time, EXCLUDED.increment, EXCLUDED."challengerColor", EXCLUDED."bestOf",
-                 EXCLUDED."seriesId", EXCLUDED."challengerTime", EXCLUDED."challengedTime", EXCLUDED.rated)
+                 EXCLUDED."seriesId", EXCLUDED."challengerTime", EXCLUDED."challengedTime", EXCLUDED.rated,
+                 EXCLUDED."openingId")
            THEN challenges.version
            ELSE nextval('challenges_version_seq')
          END,
          time = EXCLUDED.time, increment = EXCLUDED.increment,
          "challengerColor" = EXCLUDED."challengerColor", "bestOf" = EXCLUDED."bestOf",
          "seriesId" = EXCLUDED."seriesId", "challengerTime" = EXCLUDED."challengerTime",
-         "challengedTime" = EXCLUDED."challengedTime", rated = EXCLUDED.rated,
+         "challengedTime" = EXCLUDED."challengedTime", rated = EXCLUDED.rated, "openingId" = EXCLUDED."openingId",
          "challengerUsername" = EXCLUDED."challengerUsername",
          "challengerAvatarUrl" = EXCLUDED."challengerAvatarUrl", "createdAt" = now()
        RETURNING *, (SELECT "${ratingColumn}" FROM users WHERE id = $1) AS "challengerRating"`,
@@ -323,6 +340,7 @@ export class ChallengeService {
         hasOdds ? data.time : null,
         hasOdds ? data.opponentTime : null,
         rated,
+        opening?.id ?? null,
       ]
     );
     const challenge = rows[0];
@@ -347,7 +365,12 @@ export class ChallengeService {
               `${clockLabel(challenge.challengerTime)}` +
               (challenge.increment ? `, +${challenge.increment}s a move` : "")
             : `${timeControlLabel(challenge.time, challenge.increment)}`) +
-          (challenge.bestOf > 1 ? `, best of ${challenge.bestOf}` : "") +
+          (challenge.bestOf === MIRROR_MATCH_LENGTH
+            ? ", mirror match"
+            : challenge.bestOf > 1
+              ? `, best of ${challenge.bestOf}`
+              : "") +
+          (opening ? `, from the ${opening.name}` : "") +
           // Time odds already say so above
           (!challenge.rated && challenge.challengedTime === null ? ", unrated" : "") +
           `. You play ${challengerColor === "white" ? "Black" : "White"}.`,
@@ -632,6 +655,7 @@ export class ChallengeService {
               increment: continuing.increment,
               odds: seriesOdds(continuing, colors),
               rated: continuing.rated,
+              openingId: continuing.openingId,
               series: { id: continuing.id, game: number },
             },
             locked
@@ -658,6 +682,7 @@ export class ChallengeService {
                 increment: challenge.increment,
                 odds,
                 rated: challenge.rated,
+                openingId: challenge.openingId,
               })
             : null;
         return createGame(
@@ -672,6 +697,7 @@ export class ChallengeService {
               blackTime: challengerIsWhite ? odds.challengedTime : odds.challengerTime,
             },
             rated: challenge.rated,
+            openingId: challenge.openingId,
             ...(series && { series: { id: series.id, game: 1 } }),
           },
           locked

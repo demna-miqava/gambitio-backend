@@ -59,6 +59,13 @@ export interface Game {
   seriesGame: number | null;
   /** Set when the game was paired by an arena tournament (migration 034) */
   tournamentId: number | null;
+  /**
+   * The opening the game started from (src/game/openings.ts, migration 036),
+   * null for the initial position, and how many half-moves of the PGN it
+   * played before the players took over (0 without one)
+   */
+  openingId: string | null;
+  startPly: number;
   /** What is left of each player's lag allowance (src/game/clock.ts, migration 029) */
   whiteLagBudgetMs: number;
   blackLagBudgetMs: number;
@@ -119,6 +126,10 @@ export interface GameResponse {
   seriesGame: number | null;
   /** Set when the game was played in a tournament */
   tournamentId: number | null;
+  /** The opening the game started from, null for the initial position */
+  opening: { id: string; eco: string; name: string } | null;
+  /** Half-moves the opening played before the players took over (0 without one) */
+  startPly: number;
   whitePlayer: PlayerResponse;
   blackPlayer: PlayerResponse;
 }

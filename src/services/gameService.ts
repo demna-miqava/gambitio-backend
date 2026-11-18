@@ -13,13 +13,14 @@ import { gameRepository } from "../repositories/gameRepository.js";
 import { getTimeControl, ratingColumns, type PlayerColor } from "../models/common.js";
 import { rateGame, type PlayerRating } from "../utils/ratingHelpers.js";
 import { PROVISIONAL_COLUMNS } from "../repositories/userRepository.js";
-import { FIRST_MOVE_TIMEOUT_MS } from "../game/clock.js";
+import { FIRST_MOVE_TIMEOUT_MS, isClockRunning } from "../game/clock.js";
 import type { Outcome } from "../game/engine.js";
 import { replayBotGame } from "../game/botGame.js";
 import { getBotById } from "../game/bots.js";
 import { AppError } from "../errors/AppError.js";
 import { withinLimit } from "../utils/rateLimit.js";
 import { newShareToken } from "../utils/shareToken.js";
+import { openingPosition, openingSummary } from "../game/openings.js";
 
 /**
  * Bot games one user can save a day. A bot game takes a few minutes, so 200
@@ -52,6 +53,8 @@ export function toGameListItem(game: Omit<Game, "pgn" | "fen">): GameListItem {
     seriesId: game.seriesId,
     seriesGame: game.seriesGame,
     tournamentId: game.tournamentId,
+    opening: openingSummary(game.openingId),
+    startPly: game.startPly,
     whitePlayer: {
       id: game.whiteId,
       username: game.whiteUsername,
@@ -100,6 +103,15 @@ export function toLiveGameSummary(game: Omit<LiveGame, "pgn">): LiveGameSummary 
   };
 }
 
+/**
+ * Whether both players have made a move of their own: the opening's moves
+ * (startPly) don't count. Until then the game can be aborted and its clocks
+ * don't run.
+ */
+export function bothPlayersMoved(game: Pick<Game, "numMoves" | "startPly">): boolean {
+  return isClockRunning(game.numMoves, game.startPly);
+}
+
 export function colorOf(game: LiveGame, userId: number): PlayerColor | null {
   if (userId === game.whiteId) return "white";
   if (userId === game.blackId) return "black";
@@ -136,6 +148,8 @@ export function matchFoundData(game: LiveGame, userId: number) {
     rated: game.rated,
     // Set for a game an arena tournament paired
     tournamentId: game.tournamentId,
+    // The opening the game starts from, already on the board
+    opening: openingSummary(game.openingId),
   };
 }
 
@@ -387,6 +401,8 @@ export async function createGame(
     tournament?: { id: number; rated: boolean };
     /** False for a casual game (a friend challenge or series). Default: rated unless it has odds */
     rated?: boolean;
+    /** Start from this opening (src/game/openings.ts): its moves are played already */
+    openingId?: string | null;
   },
   options: {
     /**
@@ -405,6 +421,10 @@ export async function createGame(
   if (!white || !black) throw new AppError("Player not found", "USER_NOT_FOUND", 404);
 
   const { rating: col, provisional } = ratingColumns(getTimeControl(time));
+  const position = params.openingId ? openingPosition(params.openingId) : null;
+  // Ids are checked when a challenge is sent; one dropped from the list since
+  // (an old open challenge or series) must not quietly become the initial position
+  if (params.openingId && !position) throw new AppError("Unknown opening", "UNKNOWN_OPENING", 400);
   const now = Date.now();
   return gameRepository.insert(tx, {
     whiteId,
@@ -426,6 +446,7 @@ export async function createGame(
     seriesGame: series?.game ?? null,
     tournamentId: params.tournament?.id ?? null,
     rated: (params.tournament?.rated ?? true) && params.rated !== false,
+    opening: position && { id: params.openingId!, ...position },
   });
 }
 

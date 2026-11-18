@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { TIME_LIMITS } from "../models/common.js";
 import { CHAT_MAX_RAW_LENGTH } from "../game/chatText.js";
+import { OPENING_IDS } from "../game/openings.js";
 
 const square = z.string().regex(/^[a-h][1-8]$/);
 // Ids are Postgres integers: a larger number would fail the query instead of finding nothing
@@ -67,8 +68,12 @@ export const notificationClientMessageSchema = z.discriminatedUnion("type", [
       // challenger's (`time`). Such a game is unrated (migration 027)
       opponentTime: z.number().int().min(TIME_LIMITS.minTime).max(TIME_LIMITS.maxTime).optional(),
       color: z.enum(["white", "black", "random"]),
-      // 3 or 5 plays a series (see migration 016)
-      bestOf: z.union([z.literal(1), z.literal(3), z.literal(5)]).default(1),
+      // 3 or 5 plays a series (see migration 016); 2 a mirror match, one game
+      // with each colour (migration 036)
+      bestOf: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(5)]).default(1),
+      // Start from this opening (src/game/openings.ts) instead of the initial
+      // position; every game of a series does. Ignored for a series' next game
+      openingId: z.enum(OPENING_IDS).optional(),
       // False plays a casual game (or series): no rating changes. Ignored for
       // a series' next game, which keeps the series' setting
       rated: z.boolean().default(true),

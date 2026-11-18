@@ -5,6 +5,7 @@ import { getRatingsBySkill } from "../utils/ratingHelpers.js";
 import { AppError } from "../errors/AppError.js";
 import { isUniqueViolation, type TxClient } from "../db.js";
 import { gameRepository } from "../repositories/gameRepository.js";
+import { bothPlayersMoved } from "./gameService.js";
 
 /**
  * `batchSize`: games rewritten per statement when an account is deleted,
@@ -107,7 +108,7 @@ export class UserService {
       if (gameId !== null) {
         const game = await gameRepository.findById(this.fastify.pg, gameId);
         // A tournament game can't be aborted: it is resigned whatever the move
-        await (game && game.numMoves < 2 && game.tournamentId === null
+        await (game && !bothPlayersMoved(game) && game.tournamentId === null
           ? this.fastify.liveGames.abort(gameId, user.id)
           : this.fastify.liveGames.resign(gameId, user.id)
         ).catch((error) => {
@@ -184,6 +185,8 @@ export class UserService {
     await tx.query(`DELETE FROM puzzle_attempts WHERE "userId" = $1`, id);
     await tx.query(`DELETE FROM repertoire_lines WHERE "userId" = $1`, id);
     await tx.query(`DELETE FROM endgame_progress WHERE "userId" = $1`, id);
+    await tx.query(`DELETE FROM conversion_drills WHERE "userId" = $1`, id);
+    await tx.query(`DELETE FROM conversion_scans WHERE "userId" = $1`, id);
     await tx.query(`DELETE FROM game_chat_messages WHERE "senderId" = $1`, id);
     await tx.query(`DELETE FROM push_subscriptions WHERE "userId" = $1`, id);
     // Rooms they own go (with everyone's membership); they leave the others

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { authMiddleware } from "../middleware/auth.js";
+import { openingSummary } from "../game/openings.js";
 
 export async function challengeRoutes(fastify: FastifyInstance) {
   /**
@@ -29,6 +30,8 @@ export async function challengeRoutes(fastify: FastifyInstance) {
         seriesGame: challenge.seriesGame,
         // False for a casual game (or series); always false with time odds
         rated: challenge.rated,
+        // The opening the game starts from; null for the initial position
+        opening: openingSummary(challenge.openingId),
         // Changes whenever the terms do; sent back when accepting
         version: challenge.version,
       })),
@@ -58,6 +61,7 @@ export async function challengeRoutes(fastify: FastifyInstance) {
         seriesId: challenge.seriesId,
         seriesGame: challenge.seriesGame,
         rated: challenge.rated,
+        opening: openingSummary(challenge.openingId),
         version: challenge.version,
       },
     };

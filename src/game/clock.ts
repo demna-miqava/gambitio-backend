@@ -6,7 +6,9 @@ import type { PlayerColor } from "../models/common.js";
  *
  * Like Lichess, clocks start after each side's first move: plies 0 and 1 cost
  * no time, but a player who doesn't make their first move within
- * FIRST_MOVE_TIMEOUT_MS gets the game aborted.
+ * FIRST_MOVE_TIMEOUT_MS gets the game aborted. A game from an opening
+ * (src/game/openings.ts) counts those plies from its `startPly`, the moves
+ * the opening played: the players' own first moves are what matter.
  */
 
 export const FIRST_MOVE_TIMEOUT_MS = 30_000;
@@ -68,6 +70,8 @@ export interface ClockState {
   blackMs: number;
   lastMoveAt: number; // epoch ms
   ply: number; // half-moves played so far
+  /** Half-moves an opening played before the players took over; 0 when left out */
+  startPly?: number;
   /** Each player's lag budget (see MAX_LAG_COMPENSATION_MS); INITIAL_LAG_BUDGET_MS when left out */
   whiteLagBudgetMs?: number;
   blackLagBudgetMs?: number;
@@ -99,13 +103,16 @@ export function activeColor(ply: number): PlayerColor {
   return ply % 2 === 0 ? "white" : "black";
 }
 
-export function isClockRunning(ply: number): boolean {
-  return ply >= 2;
+/** Whether both players have made their first move (counted from `startPly`). */
+export function isClockRunning(ply: number, startPly = 0): boolean {
+  return ply - startPly >= 2;
 }
+
+const clockRunning = (state: ClockState) => isClockRunning(state.ply, state.startPly);
 
 /** Time left for both players at `now`. */
 export function remainingAt(state: ClockState, now: number): { whiteMs: number; blackMs: number } {
-  if (!isClockRunning(state.ply)) {
+  if (!clockRunning(state)) {
     return { whiteMs: state.whiteMs, blackMs: state.blackMs };
   }
   const elapsed = Math.max(0, now - state.lastMoveAt);
@@ -139,9 +146,9 @@ export function chargeMove(state: ClockState, now: number, timing: MoveTiming = 
   const budget = moverBudget(state);
   const elapsed = Math.max(0, now - state.lastMoveAt);
   const { thinkMs } = timing;
-  if (!isClockRunning(state.ply) || thinkMs === undefined || !Number.isFinite(thinkMs)) {
+  if (!clockRunning(state) || thinkMs === undefined || !Number.isFinite(thinkMs)) {
     return {
-      chargedMs: isClockRunning(state.ply) ? elapsed : 0,
+      chargedMs: clockRunning(state) ? elapsed : 0,
       claimedLagMs: 0,
       freeMs: 0,
       forgivenMs: 0,
@@ -172,7 +179,7 @@ export function chargedTime(state: ClockState, now: number, timing?: MoveTiming)
  * `now` with this timing (see chargeMove).
  */
 export function isFlagged(state: ClockState, now: number, timing?: MoveTiming): boolean {
-  if (!isClockRunning(state.ply)) return false;
+  if (!clockRunning(state)) return false;
   return chargedTime(state, now, timing) >= moverMs(state);
 }
 
@@ -188,7 +195,7 @@ export function afterMove(
   timing?: MoveTiming
 ): ClockState {
   const mover = activeColor(state.ply);
-  const running = isClockRunning(state.ply);
+  const running = clockRunning(state);
   const charge = chargeMove(state, now, timing);
   const left = Math.max(0, moverMs(state) - charge.chargedMs) + (running ? incrementMs : 0);
   return {
@@ -220,7 +227,7 @@ export function addTime(state: ClockState, color: PlayerColor, ms: number): Cloc
  * flag fall plus MAX_LAG_COMPENSATION_MS for a move still in transit.
  */
 export function deadline(state: ClockState): number {
-  if (!isClockRunning(state.ply)) return state.lastMoveAt + FIRST_MOVE_TIMEOUT_MS;
+  if (!clockRunning(state)) return state.lastMoveAt + FIRST_MOVE_TIMEOUT_MS;
   return state.lastMoveAt + moverMs(state) + MAX_LAG_COMPENSATION_MS;
 }
 
