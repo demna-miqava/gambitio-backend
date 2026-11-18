@@ -69,6 +69,9 @@ export const notificationClientMessageSchema = z.discriminatedUnion("type", [
       color: z.enum(["white", "black", "random"]),
       // 3 or 5 plays a series (see migration 016)
       bestOf: z.union([z.literal(1), z.literal(3), z.literal(5)]).default(1),
+      // False plays a casual game (or series): no rating changes. Ignored for
+      // a series' next game, which keeps the series' setting
+      rated: z.boolean().default(true),
       // Continues this series instead: its time control, length and colours
       // apply, and the challenged player must be the opponent in it
       seriesId: userId.optional(),

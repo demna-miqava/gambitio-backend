@@ -31,6 +31,8 @@ export interface SeriesRow extends SeriesScore {
    */
   playerOneTime: number | null;
   playerTwoTime: number | null;
+  /** False for a casual series (migration 035). One with time odds is unrated either way */
+  rated: boolean;
   status: SeriesStatus;
   winnerId: number | null;
   endReason: SeriesEndReason | null;
@@ -54,6 +56,8 @@ export interface SeriesSummary {
   bestOf: number;
   time: number;
   increment: number;
+  /** Whether its games change ratings: false for a casual series or one with time odds */
+  rated: boolean;
   status: SeriesStatus;
   endReason: SeriesEndReason | null;
   endedAt: Date | null;
@@ -67,7 +71,7 @@ export interface SeriesSummary {
 }
 
 const SERIES_COLUMNS = `s.id, s."createdAt", s."playerOneId", s."playerTwoId", s."playerOneStartsWhite",
-  s."bestOf", s.time, s.increment, s."playerOneTime", s."playerTwoTime", s.status, s."playerOneHalfPoints", s."playerTwoHalfPoints",
+  s."bestOf", s.time, s.increment, s."playerOneTime", s."playerTwoTime", s.rated, s.status, s."playerOneHalfPoints", s."playerTwoHalfPoints",
   s."gamesPlayed", s."winnerId", s."endReason", s."endedAt"`;
 
 const SUMMARY_SELECT = `SELECT ${SERIES_COLUMNS},
@@ -95,6 +99,7 @@ export function toSeriesSummary(row: SummaryRow): SeriesSummary {
     bestOf: row.bestOf,
     time: row.time,
     increment: row.increment,
+    rated: row.rated && (row.playerOneTime === null || row.playerTwoTime === null),
     status: row.status,
     endReason: row.endReason,
     endedAt: row.endedAt,
@@ -133,12 +138,14 @@ export const seriesRepository = {
       increment: number;
       /** Time odds: the challenger's and the challenged player's clocks */
       odds?: { challengerTime: number; challengedTime: number } | null;
+      /** False for a casual series. Default: rated (unless it has time odds) */
+      rated?: boolean;
     }
   ): Promise<SeriesRow> {
     const { rows } = await tx.query<SeriesRow>(
       `INSERT INTO series ("playerOneId", "playerTwoId", "playerOneStartsWhite", "bestOf", time, increment,
-         "playerOneTime", "playerTwoTime")
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         "playerOneTime", "playerTwoTime", rated)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING ${SERIES_COLUMNS.replace(/s\./g, "")}`,
       [
         params.challengerId,
@@ -149,6 +156,7 @@ export const seriesRepository = {
         params.increment,
         params.odds?.challengerTime ?? null,
         params.odds?.challengedTime ?? null,
+        params.rated !== false,
       ]
     );
     return rows[0]!;

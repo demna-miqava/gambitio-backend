@@ -1180,6 +1180,9 @@ export class LiveGameService {
       time: game.time,
       increment: game.increment,
       odds: whiteTime !== null && blackTime !== null ? { whiteTime, blackTime } : null,
+      // A casual game's rematch is casual too, as is every game of a casual
+      // series. (Tournament games have no rematch.)
+      rated: game.rated,
       ...(next && { series: { id: next.seriesId, game: next.number } }),
     });
     await gameRepository.setRematchGame(tx, game.id, rematch.id);

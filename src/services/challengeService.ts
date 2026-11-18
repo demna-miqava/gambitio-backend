@@ -36,6 +36,11 @@ export interface Challenge {
   /** Set when accepting plays the next game of an existing series */
   seriesId: number | null;
   /**
+   * False for a casual challenge (migration 035): its game, or every game of
+   * its series, changes no ratings. Always false with time odds.
+   */
+  rated: boolean;
+  /**
    * Changes whenever the terms above do (re-sending with other settings),
    * never repeats (migration 030). Accepting can name the version the player
    * saw; a different one is refused with CHALLENGE_CHANGED.
@@ -118,6 +123,7 @@ function challengeReceivedMessage(challenge: ReceivedChallenge) {
       color: challenge.challengerColor === "white" ? "black" : "white",
       bestOf: challenge.bestOf,
       ...(challenge.seriesId !== null && { seriesId: challenge.seriesId, seriesGame: challenge.seriesGame }),
+      rated: challenge.rated,
       version: challenge.version,
       createdAt: new Date(challenge.createdAt).toISOString(),
     },
@@ -221,6 +227,8 @@ export class ChallengeService {
       /** The challenged player's clock, when it differs (time odds) */
       opponentTime?: number | undefined;
       bestOf?: number | undefined;
+      /** False for a casual game (or series). Default: rated */
+      rated?: boolean | undefined;
       /** Continue this series: its settings replace the ones sent */
       seriesId?: number | undefined;
     }
@@ -253,6 +261,7 @@ export class ChallengeService {
         opponentTime: (challengerIsOne ? series.playerTwoTime : series.playerOneTime) ?? undefined,
         increment: series.increment,
         bestOf: series.bestOf,
+        rated: series.rated,
         color: colors.whiteId === challenger.id ? "white" : "black",
       };
     }
@@ -269,6 +278,8 @@ export class ChallengeService {
       data.color === "random" ? (Math.random() < 0.5 ? "white" : "black") : data.color;
     const hasOdds = data.opponentTime !== undefined && data.opponentTime !== data.time;
     const time = hasOdds ? Math.max(data.time, data.opponentTime!) : data.time;
+    // Time odds always make the game unrated
+    const rated = !hasOdds && data.rated !== false;
     const ratingColumn = ratingColumns(getTimeControl(time)).rating;
 
     // Sending again to the same player replaces the open challenge (new
@@ -279,23 +290,23 @@ export class ChallengeService {
       `INSERT INTO challenges (
          "challengerId", "challengedId", "challengerUsername", "challengedUsername",
          "challengerAvatarUrl", "challengedAvatarUrl", time, increment, "challengerColor", "bestOf", "seriesId",
-         "challengerTime", "challengedTime")
-       SELECT $1, u.id, $2, u.username, $3, u."avatarUrl", $4, $5, $6, $8, $9, $10, $11
+         "challengerTime", "challengedTime", rated)
+       SELECT $1, u.id, $2, u.username, $3, u."avatarUrl", $4, $5, $6, $8, $9, $10, $11, $12
        FROM users u WHERE u.id = $7
        ON CONFLICT ("challengerId", "challengedId") DO UPDATE SET
          version = CASE
            WHEN (challenges.time, challenges.increment, challenges."challengerColor", challenges."bestOf",
-                 challenges."seriesId", challenges."challengerTime", challenges."challengedTime")
+                 challenges."seriesId", challenges."challengerTime", challenges."challengedTime", challenges.rated)
              IS NOT DISTINCT FROM
                 (EXCLUDED.time, EXCLUDED.increment, EXCLUDED."challengerColor", EXCLUDED."bestOf",
-                 EXCLUDED."seriesId", EXCLUDED."challengerTime", EXCLUDED."challengedTime")
+                 EXCLUDED."seriesId", EXCLUDED."challengerTime", EXCLUDED."challengedTime", EXCLUDED.rated)
            THEN challenges.version
            ELSE nextval('challenges_version_seq')
          END,
          time = EXCLUDED.time, increment = EXCLUDED.increment,
          "challengerColor" = EXCLUDED."challengerColor", "bestOf" = EXCLUDED."bestOf",
          "seriesId" = EXCLUDED."seriesId", "challengerTime" = EXCLUDED."challengerTime",
-         "challengedTime" = EXCLUDED."challengedTime",
+         "challengedTime" = EXCLUDED."challengedTime", rated = EXCLUDED.rated,
          "challengerUsername" = EXCLUDED."challengerUsername",
          "challengerAvatarUrl" = EXCLUDED."challengerAvatarUrl", "createdAt" = now()
        RETURNING *, (SELECT "${ratingColumn}" FROM users WHERE id = $1) AS "challengerRating"`,
@@ -311,6 +322,7 @@ export class ChallengeService {
         series?.id ?? null,
         hasOdds ? data.time : null,
         hasOdds ? data.opponentTime : null,
+        rated,
       ]
     );
     const challenge = rows[0];
@@ -336,6 +348,8 @@ export class ChallengeService {
               (challenge.increment ? `, +${challenge.increment}s a move` : "")
             : `${timeControlLabel(challenge.time, challenge.increment)}`) +
           (challenge.bestOf > 1 ? `, best of ${challenge.bestOf}` : "") +
+          // Time odds already say so above
+          (!challenge.rated && challenge.challengedTime === null ? ", unrated" : "") +
           `. You play ${challengerColor === "white" ? "Black" : "White"}.`,
         url: "/home",
         tag: `challenge-${challenger.id}`,
@@ -617,6 +631,7 @@ export class ChallengeService {
               time: continuing.time,
               increment: continuing.increment,
               odds: seriesOdds(continuing, colors),
+              rated: continuing.rated,
               series: { id: continuing.id, game: number },
             },
             locked
@@ -642,6 +657,7 @@ export class ChallengeService {
                 time: challenge.time,
                 increment: challenge.increment,
                 odds,
+                rated: challenge.rated,
               })
             : null;
         return createGame(
@@ -655,6 +671,7 @@ export class ChallengeService {
               whiteTime: challengerIsWhite ? odds.challengerTime : odds.challengedTime,
               blackTime: challengerIsWhite ? odds.challengedTime : odds.challengerTime,
             },
+            rated: challenge.rated,
             ...(series && { series: { id: series.id, game: 1 } }),
           },
           locked

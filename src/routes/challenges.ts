@@ -27,6 +27,8 @@ export async function challengeRoutes(fastify: FastifyInstance) {
         bestOf: challenge.bestOf,
         seriesId: challenge.seriesId,
         seriesGame: challenge.seriesGame,
+        // False for a casual game (or series); always false with time odds
+        rated: challenge.rated,
         // Changes whenever the terms do; sent back when accepting
         version: challenge.version,
       })),
@@ -55,6 +57,7 @@ export async function challengeRoutes(fastify: FastifyInstance) {
         bestOf: challenge.bestOf,
         seriesId: challenge.seriesId,
         seriesGame: challenge.seriesGame,
+        rated: challenge.rated,
         version: challenge.version,
       },
     };

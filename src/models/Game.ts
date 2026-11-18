@@ -162,6 +162,8 @@ export interface LiveGameSummary {
   whiteTime: number | null;
   blackTime: number | null;
   type: TimeControl;
+  /** False for a casual game, one with time odds or one of an unrated tournament */
+  rated: boolean;
   numMoves: number;
   fen: string | null;
   whitePlayer: LivePlayerResponse;

@@ -80,6 +80,7 @@ export function toLiveGameSummary(game: Omit<LiveGame, "pgn">): LiveGameSummary 
     whiteTime: game.whiteTime,
     blackTime: game.blackTime,
     type: getTimeControl(game.time),
+    rated: game.rated,
     numMoves: game.numMoves,
     fen: game.fen,
     whitePlayer: {
@@ -384,6 +385,8 @@ export async function createGame(
     series?: { id: number; game: number };
     /** The arena tournament pairing this game, and whether its games are rated */
     tournament?: { id: number; rated: boolean };
+    /** False for a casual game (a friend challenge or series). Default: rated unless it has odds */
+    rated?: boolean;
   },
   options: {
     /**
@@ -422,7 +425,7 @@ export async function createGame(
     seriesId: series?.id ?? null,
     seriesGame: series?.game ?? null,
     tournamentId: params.tournament?.id ?? null,
-    ...(params.tournament && { rated: params.tournament.rated }),
+    rated: (params.tournament?.rated ?? true) && params.rated !== false,
   });
 }
 
