@@ -38,7 +38,8 @@ export const gameChatRepository = {
        FROM games g
        LEFT JOIN user_settings ws ON ws."userId" = g."whiteId"
        LEFT JOIN user_settings bs ON bs."userId" = g."blackId"
-       WHERE g.id = $1 AND g."botId" IS NULL AND g."whiteId" IS NOT NULL AND g."blackId" IS NOT NULL`,
+       WHERE g.id = $1 AND g."botId" IS NULL AND NOT g."tableGame"
+         AND g."whiteId" IS NOT NULL AND g."blackId" IS NOT NULL`,
       [gameId]
     );
     return rows[0] ?? null;
@@ -55,7 +56,7 @@ export const gameChatRepository = {
       `INSERT INTO game_chat_messages ("gameId", "senderId", body)
        SELECT g.id, $2::int, $3
        FROM games g
-       WHERE g.id = $1 AND g."botId" IS NULL
+       WHERE g.id = $1 AND g."botId" IS NULL AND NOT g."tableGame"
          AND $2::int IN (g."whiteId", g."blackId")
          AND (g.status = 'in_progress' OR g."endedAt" > now() - ($4::int * interval '1 millisecond'))
          AND (SELECT count(*) FROM game_chat_messages m

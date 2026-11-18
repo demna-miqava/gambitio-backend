@@ -13,8 +13,13 @@ const createRoomSchema = z
     // Start from a position (FEN) and/or a line of moves (SAN), e.g. a game
     fen: z.string().max(100).optional(),
     moves: z.array(z.string().min(2).max(10)).max(MAX_START_MOVES).optional(),
+    // Or watch a live game (Watch together): the room follows its moves
+    gameId: z.number().int().positive().max(2_147_483_647).optional(),
   })
-  .strict();
+  .strict()
+  .refine((body) => body.gameId === undefined || (body.fen === undefined && body.moves === undefined), {
+    message: "A room watching a game starts from the game's moves",
+  });
 
 export async function studyRoutes(fastify: FastifyInstance) {
   const { study } = fastify;
@@ -24,7 +29,7 @@ export async function studyRoutes(fastify: FastifyInstance) {
     return { rooms: await study.list(request.user!.id) };
   });
 
-  /** POST /study - Create a room (the creator owns it) */
+  /** POST /study - Create a room (the creator owns it), or one watching a live game ({ gameId }) */
   fastify.post(
     "/study",
     { preHandler: authMiddleware, config: { rateLimit: { max: 20, timeWindow: "1 minute" } } },

@@ -16,6 +16,7 @@ import { ChallengeService } from "./services/challengeService.js";
 import { SeriesService } from "./services/seriesService.js";
 import { StudyService } from "./services/studyService.js";
 import { GameChatService } from "./services/gameChatService.js";
+import { TableGameService } from "./services/tableGameService.js";
 import { ModerationService } from "./services/moderationService.js";
 import { TournamentService } from "./services/tournamentService.js";
 import { PushService, webPushSender, type PushSender } from "./services/pushService.js";
@@ -53,6 +54,7 @@ declare module "fastify" {
     series: SeriesService;
     study: StudyService;
     gameChat: GameChatService;
+    tableGames: TableGameService;
     moderation: ModerationService;
     tournaments: TournamentService;
     push: PushService;
@@ -301,6 +303,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   app.decorate("series", new SeriesService(app, hub));
   app.decorate("study", new StudyService(app, hub));
   app.decorate("gameChat", new GameChatService(app, hub));
+  app.decorate("tableGames", new TableGameService(app, hub));
   app.decorate("moderation", new ModerationService(app, hub));
   app.decorate("tournaments", new TournamentService(app, hub));
   const vapid = vapidKeys(config);

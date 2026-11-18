@@ -144,6 +144,14 @@ export class ModerationService {
          RETURNING "challengerId", "challengedId"`,
         [blockerId, blockedId]
       );
+      // Table games waiting for one of them to confirm: declined, so the
+      // game stays the recorder's alone (src/services/tableGameService.ts)
+      await tx.query(
+        `UPDATE table_game_requests SET status = 'declined'
+         WHERE status = 'pending'
+           AND (("recorderId" = $1 AND "friendId" = $2) OR ("recorderId" = $2 AND "friendId" = $1))`,
+        [blockerId, blockedId]
+      );
       return { wereFriends: (friendships ?? 0) > 0, requests, challenges };
     });
 
@@ -216,7 +224,9 @@ export class ModerationService {
     if (gameId !== undefined) {
       const { rows: game } = await this.fastify.pg.query(
         `SELECT 1 FROM games
-         WHERE id = $1 AND (("whiteId" = $2 AND "blackId" = $3) OR ("whiteId" = $3 AND "blackId" = $2))`,
+         WHERE id = $1 AND (("whiteId" = $2 AND "blackId" = $3) OR ("whiteId" = $3 AND "blackId" = $2))
+           -- Table games (migration 040) have no chat or play online to report
+           AND NOT "tableGame"`,
         [gameId, reporterId, reportedId]
       );
       if (game.length === 0) {

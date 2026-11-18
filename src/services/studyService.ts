@@ -8,16 +8,48 @@ import {
   nodeCount,
   ROOT_ID,
   storedStudyDocument,
+  syncGameLine,
   type StudyChange,
   type StudyOp,
   type StudyState,
 } from "../game/studyState.js";
 import { withinLimit } from "../utils/rateLimit.js";
+import { loadGame } from "../game/engine.js";
+import { CHAT_MAX_LENGTH, CHAT_OPEN_AFTER_END_MS, cleanChatText } from "../game/chatText.js";
 
 /** Rooms one player may own. */
 export const MAX_ROOMS_PER_OWNER = 30;
 /** People in one room, the owner included. */
 export const MAX_ROOM_MEMBERS = 20;
+
+/** Room chat (rooms linked to a game): messages one member may write in one room */
+export const STUDY_CHAT_MAX_PER_MEMBER = 200;
+/** One member, one room: this many messages per window, on every socket and instance together */
+export const STUDY_CHAT_BURST = { max: 5, windowSeconds: 10 };
+/** Room chat history sent with the room */
+const CHAT_HISTORY_LIMIT = 50;
+
+/**
+ * Fair play for rooms linked to a game: true (in SQL) unless `user` is one
+ * of the players of the room's game while it is in progress. Such a player
+ * can't create, join, be invited to, read or open the room; for them it
+ * doesn't exist. `room` is an alias of study_rooms, `user` a parameter.
+ */
+const notLivePlayer = (room: string, user: string) =>
+  `NOT EXISTS (SELECT 1 FROM games lg WHERE lg.id = ${room}."gameId" AND lg.status = 'in_progress'
+     AND ${user}::int IN (lg."whiteId", lg."blackId"))`;
+/** A member who isn't kept out by notLivePlayer */
+const memberSql = (room: string, user: string) =>
+  `EXISTS (SELECT 1 FROM study_room_members mm WHERE mm."roomId" = ${room}.id AND mm."userId" = ${user}::int)
+   AND ${notLivePlayer(room, user)}`;
+
+export interface StudyChatMessage {
+  id: string;
+  userId: number;
+  text: string;
+  /** When it was written, in ms since the epoch */
+  at: number;
+}
 
 /** Redis set of the sockets open on a room; see RealtimeHub.addMembership. */
 export const studyPresenceKey = (roomId: number) => `presence:study:${roomId}`;
@@ -56,6 +88,8 @@ export interface StudyRoomMeta {
   id: number;
   name: string;
   ownerId: number;
+  /** The game the room watches (migration 038), null for an ordinary room */
+  gameId: number | null;
   createdAt: Date;
   updatedAt: Date;
   version: number;
@@ -67,11 +101,20 @@ export interface StudyRoomListItem extends Omit<StudyRoomMeta, "version"> {
   moveCount: number;
 }
 
+const toChatMessage = (row: { id: string; senderId: number; body: string; createdAt: Date }): StudyChatMessage => ({
+  id: row.id,
+  userId: row.senderId,
+  text: row.body,
+  at: row.createdAt.getTime(),
+});
+
 const roomNotFound = () => new AppError("Study room not found", "STUDY_NOT_FOUND", 404);
 const positionGone = () => new AppError("That position is no longer in the study", "INVALID_STUDY_ACTION", 400);
 // Same code as the socket's own limit, which the client already handles
 const tooFast = () => new AppError("Too many changes at once. Wait a moment.", "RATE_LIMITED", 429);
 const notOwner = () => new AppError("Only the room's owner can do that", "NOT_STUDY_OWNER", 403);
+const notLinked = () => new AppError("This room isn't linked to a game", "STUDY_NOT_LINKED", 400);
+const META = `id, name, "ownerId", "gameId", "createdAt", "updatedAt", version`;
 
 /**
  * Shared study rooms. Every change to a room's analysis (the cursor
@@ -84,11 +127,12 @@ export class StudyService {
     private hub: RealtimeHub
   ) {}
 
+  /** A member, and not a player of the room's game while it is being played (see notLivePlayer). */
   private async isMember(db: Queryable, roomId: number, userId: number) {
-    const { rows } = await db.query(
-      `SELECT 1 FROM study_room_members WHERE "roomId" = $1 AND "userId" = $2`,
-      [roomId, userId]
-    );
+    const { rows } = await db.query(`SELECT 1 FROM study_rooms r WHERE r.id = $1 AND ${memberSql("r", "$2")}`, [
+      roomId,
+      userId,
+    ]);
     return rows.length > 0;
   }
 
@@ -111,13 +155,13 @@ export class StudyService {
     const { rows } = await this.fastify.pg.query<
       Omit<StudyRoomListItem, "moveCount" | "memberCount"> & { memberCount: string; nodeCount: number }
     >(
-      `SELECT r.id, r.name, r."ownerId", r."createdAt", r."updatedAt", o.username AS "ownerUsername",
+      `SELECT r.id, r.name, r."ownerId", r."gameId", r."createdAt", r."updatedAt", o.username AS "ownerUsername",
          (SELECT COUNT(*) FROM study_room_members c WHERE c."roomId" = r.id) AS "memberCount",
          r."nodeCount"
        FROM study_room_members m
        JOIN study_rooms r ON r.id = m."roomId"
        JOIN users o ON o.id = r."ownerId"
-       WHERE m."userId" = $1
+       WHERE m."userId" = $1 AND ${notLivePlayer("r", "$1")}
        ORDER BY r."updatedAt" DESC
        LIMIT 100`,
       [userId]
@@ -129,14 +173,41 @@ export class StudyService {
     }));
   }
 
+  /**
+   * A new room. With `gameId` it watches that live game (Watch together):
+   * it starts from the game's moves as they stand, and its main line
+   * follows the game (sync_game). Only someone who isn't playing in the
+   * game can open one; it counts toward the owner's room limit like any
+   * other.
+   */
   async create(
     ownerId: number,
-    input: { name: string; fen?: string | undefined; moves?: string[] | undefined }
+    input: { name: string; fen?: string | undefined; moves?: string[] | undefined; gameId?: number | undefined }
   ): Promise<StudyRoomMeta> {
-    const state = createStudyState({ fen: input.fen, moves: input.moves });
+    const linked = input.gameId !== undefined;
+    let state = createStudyState(linked ? {} : { fen: input.fen, moves: input.moves });
     return this.fastify.pg.transact(async (tx) => {
       // Serialises room creation per owner, so the limit holds
       await tx.query(`SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, [ownerId]);
+      if (linked) {
+        const { rows: games } = await tx.query<{
+          status: string;
+          whiteId: number | null;
+          blackId: number | null;
+          pgn: string | null;
+        }>(`SELECT status, "whiteId", "blackId", pgn FROM games WHERE id = $1 AND "botId" IS NULL`, [input.gameId]);
+        const game = games[0];
+        if (!game || game.whiteId === null || game.blackId === null) {
+          throw new AppError("Game not found", "GAME_NOT_FOUND", 404);
+        }
+        if (game.status !== "in_progress") {
+          throw new AppError("That game has ended. Open it in a study room from its review instead.", "GAME_NOT_LIVE", 409);
+        }
+        if (ownerId === game.whiteId || ownerId === game.blackId) {
+          throw new AppError("You can't watch your own game while it is being played", "GAME_PLAYER", 403);
+        }
+        state = syncGameLine(state, loadGame(game.pgn).history(), false).state;
+      }
       const { rows: count } = await tx.query<{ n: string }>(
         `SELECT COUNT(*) AS n FROM study_rooms WHERE "ownerId" = $1`,
         [ownerId]
@@ -149,9 +220,10 @@ export class StudyService {
         );
       }
       const { rows } = await tx.query<StudyRoomMeta>(
-        `INSERT INTO study_rooms ("ownerId", name, state, cursor, "nodeCount") VALUES ($1, $2, $3::jsonb, $4, $5)
-         RETURNING id, name, "ownerId", "createdAt", "updatedAt", version`,
-        [ownerId, input.name.trim(), storedStudyDocument(state), state.cursor, nodeCount(state)]
+        `INSERT INTO study_rooms ("ownerId", name, state, cursor, "nodeCount", "gameId")
+         VALUES ($1, $2, $3::jsonb, $4, $5, $6)
+         RETURNING ${META}`,
+        [ownerId, input.name.trim(), storedStudyDocument(state), state.cursor, nodeCount(state), input.gameId ?? null]
       );
       const room = rows[0]!;
       await tx.query(`INSERT INTO study_room_members ("roomId", "userId") VALUES ($1, $2)`, [room.id, ownerId]);
@@ -163,21 +235,27 @@ export class StudyService {
   async get(roomId: number, userId: number) {
     await this.assertMember(roomId, userId);
     const { rows } = await this.fastify.pg.query<StudyRoomMeta & { state: StudyState; cursor: string }>(
-      `SELECT id, name, "ownerId", "createdAt", "updatedAt", version, state, cursor FROM study_rooms WHERE id = $1`,
+      `SELECT ${META}, state, cursor FROM study_rooms WHERE id = $1`,
       [roomId]
     );
     const row = rows[0];
     if (!row) throw roomNotFound();
     const { state, cursor, ...room } = row;
+    const chat = room.gameId === null ? null : await this.chatState(roomId, room.gameId, userId);
     // Sent as one document, as before the cursor had its own column
-    return { room, state: { ...state, cursor: cursorIn(state, cursor) }, members: await this.members(roomId) };
+    return {
+      room,
+      state: { ...state, cursor: cursorIn(state, cursor) },
+      members: await this.members(roomId),
+      ...(chat && { chat }),
+    };
   }
 
   async rename(roomId: number, userId: number, name: string): Promise<StudyRoomMeta> {
     const { rows } = await this.fastify.pg.query<StudyRoomMeta>(
       `UPDATE study_rooms SET name = $3, "updatedAt" = now()
        WHERE id = $1 AND "ownerId" = $2
-       RETURNING id, name, "ownerId", "createdAt", "updatedAt", version`,
+       RETURNING ${META}`,
       [roomId, userId, name.trim()]
     );
     if (!rows[0]) {
@@ -218,11 +296,16 @@ export class StudyService {
         [inviteeId]
       );
       if (invitee.length === 0) throw new AppError("You can only invite friends", "NOT_FRIENDS", 403);
-      const { rows: room } = await tx.query<{ name: string }>(
-        `SELECT name FROM study_rooms WHERE id = $1 FOR UPDATE`,
-        [roomId]
+      const { rows: room } = await tx.query<{ name: string; livePlayer: boolean }>(
+        `SELECT r.name, NOT ${notLivePlayer("r", "$2")} AS "livePlayer" FROM study_rooms r WHERE r.id = $1 FOR UPDATE`,
+        [roomId, inviteeId]
       );
       if (!room[0] || !(await this.isMember(tx, roomId, inviter.id))) throw roomNotFound();
+      // Fair play: nothing about a room watching their game reaches a player
+      // until it is over (not even the invitation)
+      if (room[0].livePlayer) {
+        throw new AppError("Players of the game can join once it has ended", "GAME_IN_PROGRESS", 409);
+      }
       const { rows: friendship } = await tx.query(
         `SELECT 1 FROM friends
          WHERE LEAST("userOneId", "userTwoId") = LEAST($1::int, $2::int)
@@ -265,6 +348,7 @@ export class StudyService {
       `SELECT "ownerId" FROM study_rooms WHERE id = $1`,
       [roomId]
     );
+    // isMember also keeps a live game's players out
     const room = rows[0];
     if (!room || !(await this.isMember(this.fastify.pg, roomId, actorId))) throw roomNotFound();
     if (actorId !== userId && actorId !== room.ownerId) throw notOwner();
@@ -301,7 +385,9 @@ export class StudyService {
     // Only ops that end up rewriting the document count against
     // STUDY_WRITE_LIMIT; moving the cursor isn't counted in Redis at all
     let outcome: { change: StudyChange; version: number } | null;
-    if (op.type === "goto") {
+    if (op.type === "sync_game") {
+      outcome = await this.syncGame(roomId, userId);
+    } else if (op.type === "goto") {
       outcome = await this.gotoNode(roomId, userId, op.nodeId);
     } else {
       outcome = op.type === "move" ? await this.replayMove(roomId, userId, op.nodeId, op.uci) : null;
@@ -334,6 +420,194 @@ export class StudyService {
         });
       case "children":
         return this.publish(roomId, { type: "children", parentId: change.parentId, children: change.children, version, by });
+      case "game":
+        return this.publish(roomId, {
+          type: "game_line",
+          nodes: change.nodes,
+          game: change.game,
+          cursor: change.cursor,
+          version,
+          by,
+        });
+    }
+  }
+
+  /**
+   * sync_game: makes the linked game's stored moves the room's main line
+   * (syncGameLine). Clients send it on connect and whenever the game socket
+   * delivers a move, so every member of a room sends it for the same move:
+   * the first does the work, the others find nothing to do in one read
+   * that takes no lock (the room already has as many moves as the game,
+   * ending in the same position, and knows whether it is over). The live
+   * game's own tables are only read, never locked.
+   */
+  private async syncGame(roomId: number, userId: number) {
+    const { rows } = await this.fastify.pg.query<{
+      gameId: number | null;
+      member: boolean;
+      synced: boolean;
+    }>(
+      `SELECT r."gameId", ${memberSql("r", "$2")} AS member,
+         COALESCE(jsonb_array_length(r.state->'game'->'line'), -1) = g."numMoves"
+           AND COALESCE((r.state->'game'->>'over')::boolean, false) = (g.status <> 'in_progress')
+           AND (g."numMoves" = 0 OR g.fen = r.state->'nodes'->(r.state->'game'->'line'->>-1)->>'fen') AS synced
+       FROM study_rooms r LEFT JOIN games g ON g.id = r."gameId"
+       WHERE r.id = $1`,
+      [roomId, userId]
+    );
+    const found = rows[0];
+    if (!found || !found.member) throw roomNotFound();
+    if (found.gameId === null) throw notLinked();
+    if (found.synced) return null;
+
+    return this.fastify.pg.transact(async (tx) => {
+      const { rows: locked } = await tx.query<{ state: StudyState; cursor: string; version: number }>(
+        `SELECT state, cursor, version FROM study_rooms WHERE id = $1 FOR UPDATE`,
+        [roomId]
+      );
+      const room = locked[0];
+      if (!room) throw roomNotFound();
+      const { rows: games } = await tx.query<{ pgn: string | null; status: string }>(
+        `SELECT pgn, status FROM games WHERE id = $1`,
+        [found.gameId]
+      );
+      const game = games[0];
+      if (!game) throw notLinked();
+      const { state, change } = syncGameLine(
+        { ...room.state, cursor: cursorIn(room.state, room.cursor) },
+        loadGame(game.pgn).history(),
+        game.status !== "in_progress"
+      );
+      if (change.kind === "none") return null;
+      const version = room.version + 1;
+      await tx.query(
+        `UPDATE study_rooms SET state = $2::jsonb, cursor = $3, "nodeCount" = $4, version = $5, "updatedAt" = now()
+         WHERE id = $1`,
+        [roomId, storedStudyDocument(state), state.cursor, nodeCount(state), version]
+      );
+      return { change, version };
+    });
+  }
+
+  /**
+   * Room chat for a member, in a room linked to a game: whether they can
+   * write, and the latest messages. Null when the room has no chat for them:
+   * the game's own players never get the room's chat, even once they are
+   * invited after the game. Messages from someone the viewer blocked, or
+   * who blocked them, are left out.
+   */
+  private async chatState(roomId: number, gameId: number, viewerId: number) {
+    const { rows: games } = await this.fastify.pg.query<{ whiteId: number; blackId: number; open: boolean }>(
+      `SELECT "whiteId", "blackId",
+         (status = 'in_progress' OR "endedAt" > now() - ($2::int * interval '1 millisecond')) AS open
+       FROM games WHERE id = $1`,
+      [gameId, CHAT_OPEN_AFTER_END_MS]
+    );
+    const game = games[0];
+    if (!game || viewerId === game.whiteId || viewerId === game.blackId) return null;
+    const { rows } = await this.fastify.pg.query<{ id: string; senderId: number; body: string; createdAt: Date }>(
+      `SELECT c.id::text AS id, c."senderId", c.body, c."createdAt" FROM study_chat_messages c
+       WHERE c."roomId" = $1
+         AND NOT EXISTS (SELECT 1 FROM user_blocks b
+           WHERE (b."blockerId" = $2 AND b."blockedId" = c."senderId") OR (b."blockerId" = c."senderId" AND b."blockedId" = $2))
+       ORDER BY c.id DESC LIMIT $3`,
+      [roomId, viewerId, CHAT_HISTORY_LIMIT]
+    );
+    return { enabled: game.open, messages: rows.reverse().map(toChatMessage) };
+  }
+
+  /**
+   * A chat message to the room (linked rooms only). Who writes always comes
+   * from the authenticated socket. It goes to each member's own topic for
+   * the room, except the game's players and anyone with a block either way
+   * with the sender.
+   */
+  async sendChat(roomId: number, userId: number, rawText: string): Promise<void> {
+    const cleaned = cleanChatText(rawText);
+    if (!cleaned.ok) {
+      throw cleaned.reason === "empty"
+        ? new AppError("Write a message first", "CHAT_EMPTY", 400)
+        : new AppError(`Messages can be up to ${CHAT_MAX_LENGTH} characters`, "CHAT_TOO_LONG", 400);
+    }
+    const allowed = await withinLimit(
+      this.fastify.redis,
+      `study:chat:${roomId}:${userId}`,
+      STUDY_CHAT_BURST.max,
+      STUDY_CHAT_BURST.windowSeconds
+    );
+    if (!allowed) throw new AppError("You're sending messages too fast. Wait a moment.", "CHAT_RATE_LIMITED", 429);
+
+    // Membership, the chat being open, the sender not playing in the game
+    // and their message count are checked in the insert itself
+    const { rows } = await this.fastify.pg.query<{ id: string; senderId: number; body: string; createdAt: Date }>(
+      `INSERT INTO study_chat_messages ("roomId", "senderId", body)
+       SELECT r.id, $2::int, $3
+       FROM study_rooms r JOIN games g ON g.id = r."gameId"
+       WHERE r.id = $1 AND ${memberSql("r", "$2")}
+         AND $2::int NOT IN (g."whiteId", g."blackId")
+         AND (g.status = 'in_progress' OR g."endedAt" > now() - ($4::int * interval '1 millisecond'))
+         AND (SELECT count(*) FROM study_chat_messages c WHERE c."roomId" = r.id AND c."senderId" = $2::int) < $5::int
+       RETURNING id::text AS id, "senderId", body, "createdAt"`,
+      [roomId, userId, cleaned.text, CHAT_OPEN_AFTER_END_MS, STUDY_CHAT_MAX_PER_MEMBER]
+    );
+    const row = rows[0];
+    if (!row) throw await this.chatRefusal(roomId, userId);
+
+    const { rows: recipients } = await this.fastify.pg.query<{ userId: number }>(
+      `SELECT m."userId" FROM study_room_members m
+       JOIN study_rooms r ON r.id = m."roomId"
+       JOIN games g ON g.id = r."gameId"
+       WHERE m."roomId" = $1 AND m."userId" NOT IN (g."whiteId", g."blackId")
+         AND NOT EXISTS (SELECT 1 FROM user_blocks b
+           WHERE (b."blockerId" = m."userId" AND b."blockedId" = $2) OR (b."blockerId" = $2 AND b."blockedId" = m."userId"))`,
+      [roomId, userId]
+    );
+    const message = { type: "chat", data: toChatMessage(row) };
+    await Promise.all(
+      recipients.map(({ userId: recipient }) =>
+        this.hub
+          .publish(topics.studyUser(roomId, recipient), message)
+          .catch((err) => this.fastify.log.error({ err, roomId }, "Failed to publish study chat"))
+      )
+    );
+  }
+
+  /** Why a chat message wasn't stored (rare, so the insert doesn't pay for it). */
+  private async chatRefusal(roomId: number, userId: number): Promise<AppError> {
+    const { rows } = await this.fastify.pg.query<{ member: boolean; linked: boolean; player: boolean; open: boolean }>(
+      `SELECT ${memberSql("r", "$2")} AS member, g.id IS NOT NULL AS linked,
+         COALESCE($2::int IN (g."whiteId", g."blackId"), false) AS player,
+         COALESCE(g.status = 'in_progress' OR g."endedAt" > now() - ($3::int * interval '1 millisecond'), false) AS open
+       FROM study_rooms r LEFT JOIN games g ON g.id = r."gameId" WHERE r.id = $1`,
+      [roomId, userId, CHAT_OPEN_AFTER_END_MS]
+    );
+    const room = rows[0];
+    if (!room || !room.member) return roomNotFound();
+    if (!room.linked || room.player) return new AppError("This room has no chat", "CHAT_UNAVAILABLE", 400);
+    if (!room.open) return new AppError("This chat has closed", "CHAT_CLOSED", 403);
+    return new AppError(
+      `You can send up to ${STUDY_CHAT_MAX_PER_MEMBER} messages in one room`,
+      "CHAT_LIMIT_REACHED",
+      429
+    );
+  }
+
+  /**
+   * Deletes room chat on game chat's schedule: messages of rooms whose game
+   * ended before `before` (or is gone), a batch at a time.
+   */
+  async sweepChat(before: Date, batch = 1_000): Promise<void> {
+    for (;;) {
+      const { rowCount } = await this.fastify.pg.query(
+        `DELETE FROM study_chat_messages WHERE id IN (
+           SELECT c.id FROM study_chat_messages c
+           JOIN study_rooms r ON r.id = c."roomId"
+           LEFT JOIN games g ON g.id = r."gameId"
+           WHERE g.id IS NULL OR g."endedAt" < $1
+           LIMIT $2)`,
+        [before, batch]
+      );
+      if ((rowCount ?? 0) < batch) return;
     }
   }
 
@@ -361,7 +635,7 @@ export class StudyService {
     const { rows } = await this.fastify.pg.query<{ version: number }>(
       `UPDATE study_rooms r SET cursor = $2, version = r.version + 1, "updatedAt" = now()
        WHERE r.id = $1 AND r.cursor <> $2 AND r.state->'nodes' ? $2
-         AND EXISTS (SELECT 1 FROM study_room_members m WHERE m."roomId" = r.id AND m."userId" = $3)
+         AND ${memberSql("r", "$3")}
        RETURNING r.version`,
       [roomId, nodeId, userId]
     );
@@ -370,7 +644,7 @@ export class StudyService {
     // Nothing changed: find out why (rare, so the UPDATE doesn't pay for it)
     const { rows: found } = await this.fastify.pg.query<{ atNode: boolean; hasNode: boolean; member: boolean }>(
       `SELECT r.cursor = $2 AS "atNode", r.state->'nodes' ? $2 AS "hasNode",
-         EXISTS (SELECT 1 FROM study_room_members m WHERE m."roomId" = r.id AND m."userId" = $3) AS member
+         ${memberSql("r", "$3")} AS member
        FROM study_rooms r WHERE r.id = $1`,
       [roomId, nodeId, userId]
     );
@@ -394,7 +668,7 @@ export class StudyService {
                   jsonb_build_object('p', $2::text, 'u', $3::text)) #>> '{}' AS child
          FROM study_rooms r
          WHERE r.id = $1
-           AND EXISTS (SELECT 1 FROM study_room_members m WHERE m."roomId" = r.id AND m."userId" = $4)
+           AND ${memberSql("r", "$4")}
          FOR UPDATE OF r
        )
        UPDATE study_rooms r SET cursor = target.child, version = r.version + 1, "updatedAt" = now()

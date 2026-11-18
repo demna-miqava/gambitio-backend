@@ -4,7 +4,7 @@ import { GameService } from "../services/gameService.js";
 import { AppError } from "../errors/AppError.js";
 import { authMiddleware } from "../middleware/auth.js";
 import { gameRepository } from "../repositories/gameRepository.js";
-import { saveBotGameSchema } from "../schemas/gameSchemas.js";
+import { saveBotGameSchema, saveTableGameSchema } from "../schemas/gameSchemas.js";
 import { SHARE_TOKEN_PATTERN } from "../utils/shareToken.js";
 
 const gameIdParams = z.object({ id: z.coerce.number().int().positive().max(2_147_483_647) });
@@ -38,6 +38,41 @@ export async function gameRoutes(fastify: FastifyInstance) {
       return reply.status(201).send(game);
     }
   );
+
+  // POST /games/table - Store a finished table-mode game (unrated; played at
+  // a real board with the app as the clock). At most TABLE_GAMES_PER_DAY a
+  // day per user (TableGameService.save)
+  fastify.post(
+    "/games/table",
+    {
+      preHandler: authMiddleware,
+      // As for bot games: the PGN as JSON, with room for escapes
+      bodyLimit: 16 * 1024,
+      config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+    },
+    async (request, reply) => {
+      const body = saveTableGameSchema.parse(request.body);
+      return reply.status(201).send(await fastify.tableGames.save(request.user!.id, body));
+    }
+  );
+
+  // GET /games/table/requests - Friends' table games waiting for this player to confirm
+  fastify.get("/games/table/requests", { preHandler: authMiddleware }, async (request) => {
+    return { requests: await fastify.tableGames.requests(request.user!.id) };
+  });
+
+  // POST /games/table/requests/:id/confirm | decline - Answer one
+  for (const action of ["confirm", "decline"] as const) {
+    fastify.post(
+      `/games/table/requests/:id/${action}`,
+      { preHandler: authMiddleware, config: { rateLimit: { max: 60, timeWindow: "1 minute" } } },
+      async (request, reply) => {
+        const { id } = gameIdParams.parse(request.params);
+        await fastify.tableGames[action](request.user!.id, id);
+        return reply.status(204).send();
+      }
+    );
+  }
 
   // GET /games/:id
   fastify.get("/games/:id", { preHandler: authMiddleware }, async (request) => {

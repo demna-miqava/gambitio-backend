@@ -44,9 +44,12 @@ export async function studyWebSocketRoute(fastify: FastifyInstance) {
 
       onValidatedMessage(socket, studyClientMessageSchema, request.log, async (message) => {
         if (message.type === "sync") return sendState();
+        if (message.type === "chat") return study.sendChat(roomId, user.id, message.text);
         await study.apply(roomId, user.id, message);
       });
 
+      // Also keeps out the players of a linked game while it is being
+      // played (StudyService.isMember): the room doesn't exist for them
       try {
         await study.assertMember(roomId, user.id);
       } catch (error) {

@@ -76,17 +76,25 @@ export interface Game {
   /** Whether each player has used their one rematch request */
   whiteRematchAsked: boolean;
   blackRematchAsked: boolean;
+  /**
+   * Played at a real board with the app as the clock (table mode, migration
+   * 040): finished, unrated, and shown only in history and review
+   */
+  tableGame: boolean;
 }
 
 /**
- * A game between two players on the clock: everything that isn't a bot game.
+ * A game between two players on the clock: everything that isn't a bot game
+ * or a table game (which are only ever stored finished).
  * Live-game code (moves, clocks, results, rematches) only handles these; the
  * database guarantees in-progress games are never bot games (migration 012).
  */
 export type LiveGame = Game & { time: number; whiteId: number; blackId: number; botId: null };
 
 export function isLiveGame(game: Game): game is LiveGame {
-  return game.botId === null && game.time !== null && game.whiteId !== null && game.blackId !== null;
+  return (
+    game.botId === null && !game.tableGame && game.time !== null && game.whiteId !== null && game.blackId !== null
+  );
 }
 
 export interface PlayerResponse {
@@ -126,6 +134,8 @@ export interface GameResponse {
   seriesGame: number | null;
   /** Set when the game was played in a tournament */
   tournamentId: number | null;
+  /** Played at a real board (table mode): unrated; a guest has no id */
+  tableGame: boolean;
   /** The opening the game started from, null for the initial position */
   opening: { id: string; eco: string; name: string } | null;
   /** Half-moves the opening played before the players took over (0 without one) */

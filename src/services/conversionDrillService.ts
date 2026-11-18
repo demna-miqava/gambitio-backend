@@ -148,6 +148,8 @@ export class ConversionDrillService {
       FROM games g
       WHERE g."${column}" = $1 AND g.status = 'finished' AND g.result IS NOT NULL
         AND g.result IN ('draw', '${loss}') AND g."numMoves" >= ${CONVERSION_MIN_PLIES} AND g.pgn IS NOT NULL
+        -- Table games (migration 040) show in history and review only
+        AND NOT g."tableGame"
         AND NOT EXISTS (SELECT 1 FROM conversion_scans s WHERE s."userId" = $1 AND s."gameId" = g.id)
       ORDER BY g."createdAt" DESC, g.id DESC LIMIT $2)`;
     const { rows } = await this.db.query<ScanCandidate>(
@@ -175,7 +177,7 @@ export class ConversionDrillService {
       blackId: number | null;
       status: string;
       result: GameResult | null;
-    }>(`SELECT pgn, "whiteId", "blackId", status, result FROM games WHERE id = $1`, [gameId]);
+    }>(`SELECT pgn, "whiteId", "blackId", status, result FROM games WHERE id = $1 AND NOT "tableGame"`, [gameId]);
     const game = games[0];
     const color: PlayerColor | null =
       game?.whiteId === userId ? "white" : game?.blackId === userId ? "black" : null;

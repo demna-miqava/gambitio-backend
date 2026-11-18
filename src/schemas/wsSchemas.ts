@@ -130,6 +130,12 @@ export const studyClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("promote"), nodeId }),
   // The client missed an update: send the whole room again
   z.object({ type: z.literal("sync") }),
+  // A room linked to a game: bring its main line up to the game's moves
+  // (sent on connect and whenever the game socket delivers a move)
+  z.object({ type: z.literal("sync_game") }),
+  // Room chat (rooms linked to a game). Only bounded here: the text is
+  // cleaned by the server (src/game/chatText.ts)
+  z.object({ type: z.literal("chat"), text: z.string().min(1).max(CHAT_MAX_RAW_LENGTH) }),
 ]);
 export type StudyClientMessage = z.infer<typeof studyClientMessageSchema>;
 

@@ -188,6 +188,17 @@ export class UserService {
     await tx.query(`DELETE FROM conversion_drills WHERE "userId" = $1`, id);
     await tx.query(`DELETE FROM conversion_scans WHERE "userId" = $1`, id);
     await tx.query(`DELETE FROM game_chat_messages WHERE "senderId" = $1`, id);
+    await tx.query(`DELETE FROM study_chat_messages WHERE "senderId" = $1`, id);
+    // Table games they were named in but never confirmed carry their name as
+    // text: it goes the way their profile name does
+    await tx.query(
+      `UPDATE games g SET
+         "whiteUsername" = CASE WHEN r.color = 'white' THEN 'deleted-' || $1::text ELSE g."whiteUsername" END,
+         "blackUsername" = CASE WHEN r.color = 'black' THEN 'deleted-' || $1::text ELSE g."blackUsername" END
+       FROM table_game_requests r WHERE r."gameId" = g.id AND r."friendId" = $1`,
+      id
+    );
+    await tx.query(`DELETE FROM table_game_requests WHERE "friendId" = $1 OR "recorderId" = $1`, id);
     await tx.query(`DELETE FROM push_subscriptions WHERE "userId" = $1`, id);
     // Rooms they own go (with everyone's membership); they leave the others
     const { rows: rooms } = await tx.query<{ id: number }>(

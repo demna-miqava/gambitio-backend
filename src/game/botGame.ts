@@ -119,8 +119,34 @@ export function replayBotGame(
   claimedReason: string
 ): ReplayedBotGame {
   if (pgn.length > MAX_BOT_GAME_PGN_LENGTH) throw invalid("Game is too long");
+  const { chess, pgn: stored, numMoves } = playBrowserPgn(pgn, invalid);
 
-  const { headers, sans } = readPgn(pgn);
+  const fromPosition = detectOutcome(chess);
+  let outcome: Outcome;
+  if (fromPosition) {
+    outcome = fromPosition;
+  } else if (claimedReason === "resignation") {
+    outcome = { result: winFor(playerColor === "white" ? "black" : "white"), reason: "resignation" };
+  } else {
+    throw invalid("The game isn't over");
+  }
+
+  return { pgn: stored, fen: chess.fen(), numMoves, outcome };
+}
+
+/**
+ * Plays a game the browser sends (bot and table games): every move must be
+ * legal from the standard starting position, and none may follow the end
+ * of the game. Returns the final position and the PGN to store, written
+ * from the moves as played in exactly chess.js's pgn() format, without
+ * replaying them again. `invalid` makes the error (its code names the kind
+ * of game).
+ */
+export function playBrowserPgn(
+  pgn: string,
+  invalid: (message: string) => AppError
+): { chess: Chess; pgn: string; numMoves: number } {
+  const { headers, sans } = readPgnAs(pgn, invalid);
   if (headers.has("FEN") || headers.get("SetUp") === "1") {
     throw invalid("Games must start from the standard position");
   }
@@ -134,28 +160,21 @@ export function replayBotGame(
     try {
       san = chess.move(sans[i]!).san;
     } catch {
-      throw notLegal();
+      throw invalid("The PGN isn't a legal game");
     }
     movetext.push(i % 2 === 0 ? `${i / 2 + 1}. ${san}` : san);
     if (i < sans.length - 1 && detectOutcome(chess)) {
       throw invalid("Moves were played after the game was over");
     }
   }
+  return { chess, pgn: `${PGN_HEADER}\n\n${movetext.join(" ")} *`, numMoves: sans.length };
+}
 
-  const fromPosition = detectOutcome(chess);
-  let outcome: Outcome;
-  if (fromPosition) {
-    outcome = fromPosition;
-  } else if (claimedReason === "resignation") {
-    outcome = { result: winFor(playerColor === "white" ? "black" : "white"), reason: "resignation" };
-  } else {
-    throw invalid("The game isn't over");
+/** readPgn, with its errors in `invalid`'s code */
+function readPgnAs(pgn: string, invalid: (message: string) => AppError) {
+  try {
+    return readPgn(pgn);
+  } catch (error) {
+    throw error instanceof AppError ? invalid(error.message) : error;
   }
-
-  return {
-    pgn: `${PGN_HEADER}\n\n${movetext.join(" ")} *`,
-    fen: chess.fen(),
-    numMoves: sans.length,
-    outcome,
-  };
 }

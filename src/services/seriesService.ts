@@ -663,7 +663,9 @@ export class SeriesService {
     // could never match anyway.
     const pair = `LEAST("whiteId", "blackId") = LEAST($1::int, $2::int)
       AND GREATEST("whiteId", "blackId") = GREATEST($1::int, $2::int)
-      AND status = 'finished' AND result IS DISTINCT FROM 'aborted' AND "botId" IS NULL`;
+      AND status = 'finished' AND result IS DISTINCT FROM 'aborted' AND "botId" IS NULL
+      -- Table games (migration 040) aren't part of head-to-head
+      AND NOT "tableGame"`;
     const { rows: totals } = await this.fastify.pg.query<{ wins: string; draws: string; losses: string }>(
       `SELECT
          COUNT(*) FILTER (WHERE "winnerId" = $1) AS wins,

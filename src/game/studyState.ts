@@ -35,11 +35,27 @@ export interface StudyNode {
   shapes: StudyShape[];
 }
 
+/**
+ * A room linked to a game (migration 038): the game's moves in the tree,
+ * kept as the main line by syncGameLine.
+ */
+export interface StudyGameLine {
+  /** Ids of the nodes of the game's moves, in order; the last is the latest move ("Live") */
+  line: string[];
+  /**
+   * The game has ended: the room is an ordinary study room. Until then the
+   * game's moves can't be deleted or pushed out of the main line.
+   */
+  over: boolean;
+}
+
 export interface StudyState {
   nodes: Record<string, StudyNode>;
   /** The node everyone is looking at */
   cursor: string;
   nextId: number;
+  /** Only in a room linked to a game */
+  game?: StudyGameLine;
 }
 
 export const ROOT_ID = "root";
@@ -61,7 +77,9 @@ export type StudyOp =
   | { type: "comment"; nodeId: string; text: string }
   | { type: "shapes"; nodeId: string; shapes: StudyShape[] }
   | { type: "delete"; nodeId: string }
-  | { type: "promote"; nodeId: string };
+  | { type: "promote"; nodeId: string }
+  /** Extends the main line from the linked game's stored moves (StudyService.syncGame) */
+  | { type: "sync_game" };
 
 /** What an op changed, so only that is sent to the room. */
 export type StudyChange =
@@ -73,6 +91,8 @@ export type StudyChange =
   | { kind: "deleted"; nodeId: string; parentId: string; cursor: string }
   /** A node's children were reordered (a variation promoted) */
   | { kind: "children"; parentId: string; children: string[] }
+  /** The linked game's line changed: new and reordered nodes, the line, and the cursor */
+  | { kind: "game"; nodes: StudyNode[]; game: StudyGameLine; cursor: string }
   | { kind: "none" };
 
 const invalid = (message: string) => new AppError(message, "INVALID_STUDY_ACTION", 400);
@@ -175,7 +195,12 @@ const UCI = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
  */
 export function applyStudyOp(current: StudyState, op: StudyOp): { state: StudyState; change: StudyChange } {
   const state: StudyState = { ...current, nodes: { ...current.nodes } };
+  /** The live game's moves, while it is being played */
+  const protectedLine = state.game && !state.game.over ? state.game.line : [];
   switch (op.type) {
+    // Needs the game's moves: see syncGameLine
+    case "sync_game":
+      return { state, change: { kind: "none" } };
     case "goto": {
       nodeOf(state, op.nodeId);
       if (state.cursor === op.nodeId) return { state, change: { kind: "none" } };
@@ -239,6 +264,7 @@ export function applyStudyOp(current: StudyState, op: StudyOp): { state: StudySt
     case "delete": {
       const node = nodeOf(state, op.nodeId);
       if (node.parentId === null) throw invalid("The starting position can't be deleted");
+      if (protectedLine.includes(node.id)) throw invalid("The game's moves can't be deleted while it is being played");
       const removed = subtree(state, node.id);
       const parent = state.nodes[node.parentId]!;
       state.nodes[parent.id] = { ...parent, children: parent.children.filter((id) => id !== node.id) };
@@ -254,6 +280,9 @@ export function applyStudyOp(current: StudyState, op: StudyOp): { state: StudySt
       while (child.parentId !== null) {
         const parent = state.nodes[child.parentId]!;
         if (parent.children[0] !== child.id) {
+          if (protectedLine.includes(parent.children[0]!)) {
+            throw invalid("The game stays the main line while it is being played");
+          }
           const children = [child.id, ...parent.children.filter((id) => id !== child.id)];
           state.nodes[parent.id] = { ...parent, children };
           return { state, change: { kind: "children", parentId: parent.id, children } };
@@ -263,6 +292,69 @@ export function applyStudyOp(current: StudyState, op: StudyOp): { state: StudySt
       return { state, change: { kind: "none" } };
     }
   }
+}
+
+/**
+ * Makes the linked game's moves (SAN, from the starting position) the main
+ * line: moves the tree already has are put first among their siblings, new
+ * ones are added. Moves the tree has past the game (a takeback) stay, as a
+ * continuation after the latest move. Anyone looking at the latest move
+ * ("Live") moves on to the new latest move; anyone elsewhere stays there.
+ * Idempotent: the same moves again change nothing.
+ */
+export function syncGameLine(current: StudyState, sans: readonly string[], over: boolean): {
+  state: StudyState;
+  change: StudyChange;
+} {
+  const state: StudyState = { ...current, nodes: { ...current.nodes } };
+  const chess = new Chess(state.nodes[ROOT_ID]!.fen);
+  const changed = new Set<string>();
+  const line: string[] = [];
+  let parentId = ROOT_ID;
+  for (const san of sans) {
+    let move;
+    try {
+      move = chess.move(san);
+    } catch {
+      throw invalid("The game's moves don't follow from this study's start");
+    }
+    const uci = move.from + move.to + (move.promotion ?? "");
+    let childId = existingChild(state, state.nodes[parentId]!, uci);
+    if (!childId) {
+      if (Object.keys(state.nodes).length >= MAX_STUDY_NODES) {
+        throw invalid(`A study can hold up to ${MAX_STUDY_NODES} moves. Delete a variation first.`);
+      }
+      childId = addChild(state, parentId, move.san, uci, chess.fen());
+      changed.add(childId);
+      changed.add(parentId);
+    }
+    const parent = state.nodes[parentId]!;
+    if (parent.children[0] !== childId) {
+      state.nodes[parentId] = { ...parent, children: [childId, ...parent.children.filter((id) => id !== childId)] };
+      changed.add(parentId);
+    }
+    line.push(childId);
+    parentId = childId;
+  }
+
+  const before = current.game;
+  const sameLine = before && before.over === over && before.line.length === line.length && before.line.every((id, i) => id === line[i]);
+  if (changed.size === 0 && sameLine) return { state: current, change: { kind: "none" } };
+
+  const game: StudyGameLine = { line, over };
+  state.game = game;
+  const liveBefore = before?.line.at(-1) ?? ROOT_ID;
+  if (state.cursor === liveBefore) state.cursor = line.at(-1) ?? ROOT_ID;
+  if (changed.size > 0) assertSize(state);
+  return {
+    state,
+    change: { kind: "game", nodes: [...changed].map((id) => state.nodes[id]!), game, cursor: state.cursor },
+  };
+}
+
+/** The node of the linked game's latest move (the root before the first move). */
+export function liveNodeId(state: StudyState): string {
+  return state.game?.line.at(-1) ?? ROOT_ID;
 }
 
 /** The child of `parent` reached by the move `uci`, if the tree has it. */

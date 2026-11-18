@@ -14,7 +14,7 @@ const GAME_COLUMNS = `
   "whiteRatingChange", "blackRatingChange", "botId", rated, "seriesId", "seriesGame", "tournamentId",
   "openingId", "startPly",
   "whiteLagBudgetMs", "blackLagBudgetMs", "pausedAt", "drawDeclinedFor",
-  "whiteRematchAsked", "blackRematchAsked"`;
+  "whiteRematchAsked", "blackRematchAsked", "tableGame"`;
 
 /** GAME_COLUMNS without the move list and position, for lists. */
 export const GAME_LIST_COLUMNS = GAME_COLUMNS.replace(/\bpgn, fen, /, "");
@@ -61,6 +61,27 @@ export interface NewGame {
 }
 
 /** A finished game against a computer bot; one side is the bot (no user id). */
+export interface NewTableGame {
+  whiteId: number | null;
+  blackId: number | null;
+  whiteUsername: string;
+  blackUsername: string;
+  whiteRating: number;
+  blackRating: number;
+  whiteAvatarUrl: string | null;
+  blackAvatarUrl: string | null;
+  time: number;
+  increment: number;
+  whiteTime: number | null;
+  blackTime: number | null;
+  pgn: string;
+  fen: string;
+  numMoves: number;
+  result: GameResult;
+  endReason: EndReason;
+  winnerId: number | null;
+}
+
 export interface NewBotGame {
   botId: string;
   whiteId: number | null;
@@ -161,6 +182,8 @@ export const gameRepository = {
       `UPDATE games SET "shareToken" = COALESCE("shareToken", $3)
        WHERE id = $1 AND ("whiteId" = $2 OR "blackId" = $2)
          AND status = 'finished' AND result <> 'aborted'
+         -- Table games show in history and review only (migration 040)
+         AND NOT "tableGame"
        RETURNING "shareToken"`,
       [gameId, userId, token]
     );
@@ -268,6 +291,44 @@ export const gameRepository = {
         game.blackRating,
         game.whiteAvatarUrl,
         game.blackAvatarUrl,
+        game.pgn,
+        game.fen,
+        game.numMoves,
+        game.result,
+        game.endReason,
+        game.winnerId,
+      ]
+    );
+    return rows[0]!;
+  },
+
+  /**
+   * Stores a table game (migration 040): finished, unrated, timed. A guest's
+   * side, or a friend's until they confirm, has no user id.
+   */
+  async insertFinishedTableGame(db: Queryable, game: NewTableGame): Promise<Game> {
+    const { rows } = await db.query<Game>(
+      `INSERT INTO games (
+        "tableGame", rated, "whiteId", "blackId", "whiteUsername", "blackUsername",
+        "whiteRating", "blackRating", "whiteAvatarUrl", "blackAvatarUrl",
+        time, increment, "whiteTime", "blackTime", status, pgn, fen, "numMoves", result, "endReason", "winnerId",
+        "endedAt"
+      ) VALUES (true, false, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'finished', $13, $14, $15, $16, $17,
+        $18, now())
+      RETURNING ${GAME_COLUMNS}`,
+      [
+        game.whiteId,
+        game.blackId,
+        game.whiteUsername,
+        game.blackUsername,
+        game.whiteRating,
+        game.blackRating,
+        game.whiteAvatarUrl,
+        game.blackAvatarUrl,
+        game.time,
+        game.increment,
+        game.whiteTime,
+        game.blackTime,
         game.pgn,
         game.fen,
         game.numMoves,

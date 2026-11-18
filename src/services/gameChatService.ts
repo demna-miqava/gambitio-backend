@@ -17,7 +17,7 @@ const BURST = { max: 5, windowSeconds: 10 };
  * game's end rather than when they were written, so a long game never loses
  * its messages while it is being played.
  */
-const RETENTION_AFTER_END_MS = 60 * 60_000;
+export const RETENTION_AFTER_END_MS = 60 * 60_000;
 const SWEEP_BATCH = 1_000;
 
 const OFF_MESSAGES: Record<ChatOffReason, string> = {
@@ -135,11 +135,15 @@ export class GameChatService {
     }
   }
 
-  /** Deletes messages past their retention, a batch at a time. */
+  /**
+   * Deletes messages past their retention, a batch at a time: game chat and
+   * the chat of study rooms watching a game (same schedule).
+   */
   async sweep(now = new Date()): Promise<void> {
     const before = new Date(now.getTime() - RETENTION_AFTER_END_MS);
     while (
       (await gameChatRepository.deleteForGamesEndedBefore(this.fastify.pg, before, SWEEP_BATCH)) === SWEEP_BATCH
     );
+    await this.fastify.study.sweepChat(before, SWEEP_BATCH);
   }
 }

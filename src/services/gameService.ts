@@ -53,6 +53,7 @@ export function toGameListItem(game: Omit<Game, "pgn" | "fen">): GameListItem {
     seriesId: game.seriesId,
     seriesGame: game.seriesGame,
     tournamentId: game.tournamentId,
+    tableGame: game.tableGame,
     opening: openingSummary(game.openingId),
     startPly: game.startPly,
     whitePlayer: {

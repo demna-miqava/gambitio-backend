@@ -170,6 +170,8 @@ export class RepertoireService {
         AND "numMoves" > 0
         -- A game from a set opening (migration 036) says nothing of the player's repertoire
         AND "startPly" = 0
+        -- Nor is a table game (migration 040) checked against it
+        AND NOT "tableGame"
       ORDER BY "createdAt" DESC, id DESC LIMIT $2)`;
     const { rows } = await this.fastify.pg.query<{
       id: number;

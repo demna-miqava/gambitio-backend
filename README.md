@@ -42,8 +42,10 @@ Vite proxies `/api` to the backend.
 
 Puzzles are split in two halves by id: rated (Infinite) mode serves one,
 never sends its solutions and checks every move on the server
-(`POST /api/puzzles/:id/check`); Rush and Survival serve the other half with
-solutions, to play locally. See `RATED_POOL_SQL` in
+(`POST /api/puzzles/:id/check`); Rush, Survival and Calculate first serve the
+other half with solutions, to play locally (Calculate first is all in the
+browser: the player enters the whole line, which is then judged against the
+solution). See `RATED_POOL_SQL` in
 `src/services/puzzleService.ts`.
 
 Migration 005 seeds a handful of verified puzzles. Load the full Lichess set
@@ -157,7 +159,24 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
 - `src/game/studyState.ts`, `src/services/studyService.ts`,
   `src/routes/ws/study.ts` – shared study rooms: one JSON move tree per room,
   changed under the room's row lock with a version number; the socket sends
-  small updates (cursor, node, tree) and clients resync on a version gap
+  small updates (cursor, node, tree) and clients resync on a version gap.
+  Watch together (migration 038): a room can be linked to a live game
+  (`POST /api/study` with `gameId`, by someone who isn't playing in it). Its
+  main line is the game: the `sync_game` op (`syncGameLine`) extends it
+  from the game's stored moves, idempotently, and clients send it on
+  connect and whenever the game socket delivers a move; the live-game move
+  transaction never touches the room. While the game is in progress its
+  two players can't create, join, be invited to, list, read or open the
+  room (`notLivePlayer` in every membership check), and the game's moves
+  can't be deleted or pushed out of the main line; once it ends the room is
+  an ordinary study room. A linked room has chat for its members over the
+  study socket (`{ type: "chat" }`, `study_chat_messages`): cleaned with
+  `src/game/chatText.ts`, 5 messages per 10 s and 200 per member, sent to
+  each member's own topic except the game's players and anyone with a
+  block either way, and deleted with game chat an hour after the game ends.
+  Before this, only the frontend (`FairPlayGate`) kept a player in a live
+  game out of study rooms; the server still doesn't for rooms not linked
+  to their game
 - `src/routes/endgames.ts` – endgame lab progress (the exercises run in the
   browser)
 - `src/game/chatText.ts`, `src/services/gameChatService.ts` – chat between
@@ -178,6 +197,21 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
   players start with different clocks (`challengerTime` / `challengedTime`;
   `time` is the longer of the two, so the time control still reads right).
   The increment is shared, and a game with time odds is never rated
+- `src/game/tableGame.ts`, `src/services/tableGameService.ts` – table mode
+  (migration 040): two people at a real board use one phone as the clock
+  and move recorder. Like a bot game it is played in the browser and stored
+  once finished (`POST /api/games/table`, 8,000-character PGN, 100 a day):
+  the server replays the PGN and checks the claimed result against it (a
+  flag falls for the side to move, under the live-game rule for
+  insufficient material). A table game (`games."tableGame"`) is finished
+  and unrated, and shows only in history and review: head-to-head, stats,
+  leaderboard counters, series, game chat, rematches, share links, reports,
+  conversion drills and the repertoire check all leave it out, and
+  `isLiveGame` refuses it. The other player is a guest (a name only) or a
+  friend (no block either way), whose id goes on the game only when they
+  confirm it from their inbox (`table_game_requests`; at most 5 waiting per
+  pair; `GET /api/games/table/requests`, `POST .../:id/confirm|decline`); a
+  decline or a block leaves the game the recorder's alone
 - `src/services/moderationService.ts`, `src/routes/moderation.ts` – blocking
   and reports (migration 028). A block is the blocker's choice but cuts
   contact both ways: no challenges, friend requests, game chat, rematch
