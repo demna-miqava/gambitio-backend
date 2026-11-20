@@ -63,6 +63,24 @@ describe("puzzles", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_RED
     assert.equal((await solve(user.clerkId, "nope")).statusCode, 404);
   });
 
+  // seed06 is rated (Infinite): marking it solved would take it out of the
+  // rated feed without the attempt, and its rating loss, ever counting
+  test("a rated puzzle can only be marked solved after the rated attempt at it", async () => {
+    const refused = await solve(user.clerkId, "seed06");
+    assert.equal(refused.statusCode, 403);
+    assert.equal(refused.json().code, "PUZZLE_NOT_ATTEMPTED");
+    assert.equal((await solve(user.clerkId, "nope0")).statusCode, 403, "nothing is said about which rated ids exist");
+
+    const revealed = await app.inject({
+      method: "POST",
+      url: "/api/puzzles/seed06/reveal",
+      headers: { authorization: `Bearer ${user.clerkId}` },
+    });
+    assert.equal(revealed.statusCode, 200);
+    // A solve on retry, after the miss was rated
+    assert.equal((await solve(user.clerkId, "seed06")).statusCode, 204);
+  });
+
   // Seed puzzles (migration 005): seed01..seed06 rated 600, 650, 700, 750, 900, 1300.
   // Rated mode uses the even ids (seed02, seed04, seed06), Rush / Survival the odd ones.
   // seed06 is a mate in 2: b3g8 f8g8 h6f7

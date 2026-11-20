@@ -4,8 +4,29 @@ import type { z } from "zod";
 import { AppError } from "../errors/AppError.js";
 import { gameClientMessageSchema } from "../schemas/wsSchemas.js";
 
+/**
+ * Most that may wait to be written to one socket. A client that stops
+ * reading (or reads slower than it makes the server answer) would otherwise
+ * have everything sent to it pile up in this process's memory until the
+ * heartbeat notices, half a minute later. The largest single message is a
+ * study room (MAX_STUDY_BYTES, 400 kB), so a slow phone still gets several
+ * of those in a row; past the limit the socket is dropped and the client
+ * reconnects, which sends it the whole state again.
+ */
+export const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+
+/** Sends an already serialized message, unless the socket is closed or too far behind (MAX_BUFFERED_BYTES). */
+export function sendText(socket: WebSocket, payload: string): void {
+  if (socket.readyState !== socket.OPEN) return;
+  if (socket.bufferedAmount > MAX_BUFFERED_BYTES) {
+    socket.terminate();
+    return;
+  }
+  socket.send(payload);
+}
+
 export function sendJson(socket: WebSocket, message: object): void {
-  if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(message));
+  if (socket.readyState === socket.OPEN) sendText(socket, JSON.stringify(message));
 }
 
 /**
@@ -41,9 +62,22 @@ const USER_BUCKET_SIZE = 60;
 const USER_REFILL_PER_SECOND = 30;
 const USER_GAME_RESERVE = 20;
 
+/**
+ * Whole-state answers ("sync": the full game, tournament or study room, read
+ * again from the database) come out of a much smaller allowance, shared by
+ * the user's sockets like the bucket above. The app only asks after it
+ * missed an update, so it never gets near this; a client that asks in a
+ * loop gets one answer every 1 / SYNC_REFILL_PER_SECOND seconds instead of
+ * up to 30 database reads (and 400 kB study rooms) a second.
+ */
+const SYNC_BUCKET_SIZE = 5;
+const SYNC_REFILL_PER_SECOND = 0.5;
+
 interface UserBucket {
   tokens: number;
   lastRefill: number;
+  syncTokens: number;
+  lastSyncRefill: number;
   /** Sockets sharing this bucket; it is dropped when the last one closes */
   sockets: number;
 }
@@ -63,6 +97,17 @@ function takeUserToken(bucket: UserBucket, now: number, reserved: boolean): bool
   bucket.lastRefill = now;
   if (bucket.tokens < (reserved ? 1 : USER_GAME_RESERVE + 1)) return false;
   bucket.tokens -= 1;
+  return true;
+}
+
+function takeSyncToken(bucket: UserBucket, now: number): boolean {
+  bucket.syncTokens = Math.min(
+    SYNC_BUCKET_SIZE,
+    bucket.syncTokens + ((now - bucket.lastSyncRefill) / 1000) * SYNC_REFILL_PER_SECOND
+  );
+  bucket.lastSyncRefill = now;
+  if (bucket.syncTokens < 1) return false;
+  bucket.syncTokens -= 1;
   return true;
 }
 
@@ -107,7 +152,14 @@ function joinUserBucket(socket: WebSocket, channel: SocketChannel, userKey: stri
   if (channel.userBucket) return;
   let bucket = userBuckets.get(userKey);
   if (!bucket) {
-    bucket = { tokens: USER_BUCKET_SIZE, lastRefill: Date.now(), sockets: 0 };
+    const now = Date.now();
+    bucket = {
+      tokens: USER_BUCKET_SIZE,
+      lastRefill: now,
+      syncTokens: SYNC_BUCKET_SIZE,
+      lastSyncRefill: now,
+      sockets: 0,
+    };
     userBuckets.set(userKey, bucket);
   }
   bucket.sockets += 1;
@@ -117,6 +169,45 @@ function joinUserBucket(socket: WebSocket, channel: SocketChannel, userKey: stri
     joined.sockets -= 1;
     if (joined.sockets <= 0 && userBuckets.get(userKey) === joined) userBuckets.delete(userKey);
   });
+}
+
+/**
+ * Wraps a socket's "send the whole state" function for answering "sync"
+ * requests (see SYNC_BUCKET_SIZE). Within the allowance the state goes out
+ * at once and a failure is thrown to the caller, as before. Beyond it the
+ * request isn't dropped (the client is waiting for its answer) but answered
+ * once, when the allowance next has room; further requests in the meantime
+ * are covered by that one answer.
+ */
+export function limitedSync(
+  socket: WebSocket,
+  log: FastifyBaseLogger,
+  send: () => Promise<unknown>
+): () => Promise<void> {
+  let waiting: NodeJS.Timeout | null = null;
+  socket.once("close", () => {
+    if (waiting) clearTimeout(waiting);
+    waiting = null;
+  });
+  const answer = async (): Promise<void> => {
+    const bucket = channels.get(socket)?.userBucket;
+    if (!bucket || takeSyncToken(bucket, Date.now())) {
+      await send();
+      return;
+    }
+    if (waiting) return;
+    waiting = setTimeout(() => {
+      waiting = null;
+      if (socket.readyState !== socket.OPEN) return;
+      answer().catch((error) => {
+        if (error instanceof AppError) return sendError(socket, error.message, error.code, { type: "sync" });
+        log.error({ err: error }, "WebSocket sync failed");
+        sendError(socket, "Something went wrong", "INTERNAL_ERROR", { type: "sync" });
+      });
+    }, 1000 / SYNC_REFILL_PER_SECOND);
+    waiting.unref();
+  };
+  return answer;
 }
 
 /** The `type` of a dropped message (not the whole thing: it wasn't validated). */

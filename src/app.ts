@@ -295,6 +295,12 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
       return reply.status(429).send({ error: "Too many requests", code: "RATE_LIMITED" });
     }
   });
+  // Every answer here is JSON for the site's own code, never a page: a
+  // browser must not guess another type from the content. (The site's files
+  // get this from public/_headers; /api doesn't pass through those rules.)
+  app.addHook("onSend", async (_request, reply) => {
+    reply.header("x-content-type-options", "nosniff");
+  });
   await app.register(websocket, {
     options: { maxPayload: 16 * 1024, handleProtocols: selectWsProtocol },
   });

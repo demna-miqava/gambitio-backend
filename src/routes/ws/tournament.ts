@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { wsAuthHook } from "../../middleware/wsAuth.js";
 import { topics } from "../../realtime/hub.js";
-import { keepAuthenticated, onValidatedMessage, sendError, sendJson } from "../../realtime/socket.js";
+import { keepAuthenticated, limitedSync, onValidatedMessage, sendError, sendJson } from "../../realtime/socket.js";
 import { tournamentClientMessageSchema } from "../../schemas/wsSchemas.js";
 import { AppError } from "../../errors/AppError.js";
 import { tournamentPresenceKey } from "../../services/tournamentService.js";
@@ -55,7 +55,7 @@ export async function tournamentWebSocketRoute(fastify: FastifyInstance) {
       const sendState = async () =>
         sendJson(socket, { type: "state", data: await tournaments.getState(tournamentId, user.id) });
 
-      onValidatedMessage(socket, tournamentClientMessageSchema, request.log, async () => sendState());
+      onValidatedMessage(socket, tournamentClientMessageSchema, request.log, limitedSync(socket, request.log, sendState));
 
       await hub.attach(socket, { userId: user.id, topics: [topics.tournament(tournamentId)] });
       await hub.addMembership(socket, tournamentPresenceKey(tournamentId)).catch((err) => {

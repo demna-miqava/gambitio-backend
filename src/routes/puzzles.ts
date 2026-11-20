@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { authMiddleware } from "../middleware/auth.js";
-import { PuzzleService } from "../services/puzzleService.js";
+import { isRatedPool, PuzzleService } from "../services/puzzleService.js";
 
 /** Keyset cursor "<rating>:<id>" of the last puzzle on the previous page. */
 const cursorSchema = z
@@ -102,10 +102,22 @@ export async function puzzleRoutes(fastify: FastifyInstance) {
   /**
    * POST /api/puzzles/:id/solve
    * Unrated modes (Rush / Survival): marks a puzzle solved for the user so it
-   * isn't served again. Idempotent.
+   * isn't served again. Idempotent. A rated puzzle (Infinite) only once the
+   * user's rated attempt at it is on record, which is when the app marks a
+   * solve on retry: otherwise marking a hard puzzle solved would take it out
+   * of the rated feed without the attempt ever counting.
    */
   fastify.post("/puzzles/:id/solve", { preHandler: authMiddleware }, async (request, reply) => {
     const { id } = solveParams.parse(request.params);
+    if (isRatedPool(id)) {
+      const attempted = await fastify.pg.query(
+        `SELECT 1 FROM puzzle_attempts WHERE "userId" = $1 AND "puzzleId" = $2`,
+        [request.user!.id, id]
+      );
+      if (attempted.rowCount === 0) {
+        return reply.status(403).send({ error: "Attempt the puzzle first", code: "PUZZLE_NOT_ATTEMPTED" });
+      }
+    }
     const { rowCount } = await fastify.pg.query(
       `INSERT INTO solved_puzzles ("userId", "puzzleId")
        SELECT $1, id FROM puzzles WHERE id = $2

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
 import type { createClient } from "redis";
+import { sendText } from "./socket.js";
 
 type RedisClient = ReturnType<typeof createClient>;
 
@@ -523,9 +524,8 @@ export class RealtimeHub {
   private deliverLocal(topic: string, payload: string): void {
     const sockets = this.local.get(topic);
     if (!sockets) return;
-    for (const socket of sockets) {
-      if (socket.readyState === socket.OPEN) socket.send(payload);
-    }
+    // Not socket.send: a socket too far behind is dropped (MAX_BUFFERED_BYTES)
+    for (const socket of sockets) sendText(socket, payload);
   }
 
   private closeTopicLocal(topic: string, code: number, reason: string): void {

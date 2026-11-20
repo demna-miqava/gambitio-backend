@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { wsAuthHook } from "../../middleware/wsAuth.js";
 import { topics } from "../../realtime/hub.js";
-import { keepAuthenticated, onValidatedMessage, sendError, sendJson } from "../../realtime/socket.js";
+import { keepAuthenticated, limitedSync, onValidatedMessage, sendError, sendJson } from "../../realtime/socket.js";
 import { studyClientMessageSchema } from "../../schemas/wsSchemas.js";
 import { AppError } from "../../errors/AppError.js";
 import { studyPresenceKey } from "../../services/studyService.js";
@@ -42,8 +42,12 @@ export async function studyWebSocketRoute(fastify: FastifyInstance) {
         });
       };
 
+      // A room can be 400 kB: a client asking for it in a loop gets it at a
+      // trickle (see limitedSync)
+      const syncState = limitedSync(socket, request.log, sendState);
+
       onValidatedMessage(socket, studyClientMessageSchema, request.log, async (message) => {
-        if (message.type === "sync") return sendState();
+        if (message.type === "sync") return syncState();
         if (message.type === "chat") return study.sendChat(roomId, user.id, message.text);
         await study.apply(roomId, user.id, message);
       });

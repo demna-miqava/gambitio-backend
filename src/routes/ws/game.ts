@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { wsAuthHook } from "../../middleware/wsAuth.js";
 import { topics } from "../../realtime/hub.js";
-import { keepAuthenticated, onValidatedMessage, sendError, sendJson } from "../../realtime/socket.js";
+import { keepAuthenticated, limitedSync, onValidatedMessage, sendError, sendJson } from "../../realtime/socket.js";
 import { gameClientMessageSchema } from "../../schemas/wsSchemas.js";
 import { AppError } from "../../errors/AppError.js";
 import { spectatorsKey } from "../../services/liveGameService.js";
@@ -38,10 +38,29 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
         detachPlayer?.();
       });
 
+      // Whether this socket's user is one of the game's two players, known
+      // once the state has been read on connect (a game's players never
+      // change). False if that read fails: the socket is closed then.
+      let knownPlayer!: (isPlayer: boolean) => void;
+      const isPlayerSocket = new Promise<boolean>((resolve) => {
+        knownPlayer = resolve;
+      });
+      // Whatever happens on the way, a closed socket's messages don't wait
+      socket.once("close", () => knownPlayer(false));
+      const syncState = limitedSync(socket, request.log, () => sendState());
+
       // Register before anything async so no message is missed. Anyone may
-      // watch; only the two players can act (checked by LiveGameService).
+      // watch; only the two players can act. LiveGameService checks that
+      // too, but only after it has locked the game's row: a spectator
+      // sending actions in a loop would hold that lock over and over, which
+      // delays the players' moves and ties up database connections. So
+      // everything but "sync" is refused here for a socket that isn't a
+      // player's, before the database is touched.
       onValidatedMessage(socket, gameClientMessageSchema, request.log, async (message, { receivedAt }) => {
         const userId = user.id;
+        if (message.type !== "sync" && !(await isPlayerSocket)) {
+          throw new AppError("You are not a player in this game", "NOT_A_PLAYER", 403);
+        }
         switch (message.type) {
           case "move":
             // Timed from arrival: queueing and database work don't cost the
@@ -77,8 +96,7 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
           case "cancel_rematch":
             return liveGames.cancelRematch(gameId, userId);
           case "sync":
-            await sendState();
-            return;
+            return syncState();
           case "chat":
             return gameChat.send(gameId, userId, message.text);
         }
@@ -104,6 +122,7 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
         const state = await liveGames.getState(gameId, user.id);
         const { data } = state;
         const isPlayer = user.id === data.whitePlayer.id || user.id === data.blackPlayer.id;
+        knownPlayer(isPlayer);
         const live = data.status === "in_progress";
         // Only live games are counted; a finished game is just a replay
         if (onConnect && !isPlayer && live) {
@@ -139,6 +158,7 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
         const spectators = await sendState(true);
         if (spectating) await liveGames.publishSpectatorCount(gameId, spectators);
       } catch (error) {
+        knownPlayer(false);
         sendError(socket, error instanceof AppError ? error.message : "Failed to load game");
         socket.close();
       }

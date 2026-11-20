@@ -14,7 +14,8 @@ export type SyncUserSchemaType = z.infer<typeof syncUserSchema>;
 
 // Schema for checking username availability
 export const checkUsernameSchema = z.object({
-  username: z.string().min(1, "Username is required"),
+  // Longer than a username can be (syncUserSchema) is never taken, and never worth a query
+  username: z.string().min(1, "Username is required").max(30, "Username must be at most 30 characters"),
 });
 
 export type CheckUsernameSchemaType = z.infer<typeof checkUsernameSchema>;

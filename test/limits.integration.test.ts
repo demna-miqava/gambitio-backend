@@ -41,6 +41,29 @@ describe("limits", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_REDI
   const errorsOf = (s: TestSocket, code: string) =>
     s.messages.filter((m) => m.type === "error" && m.data.code === code).length;
 
+  test("API answers tell the browser not to guess their type, errors included", async () => {
+    const ok = await app.inject({ method: "GET", url: "/api/push/key" });
+    assert.equal(ok.headers["x-content-type-options"], "nosniff");
+    const refused = await app.inject({ method: "GET", url: "/api/users/status" });
+    assert.equal(refused.statusCode, 401);
+    assert.equal(refused.headers["x-content-type-options"], "nosniff");
+    const missing = await app.inject({ method: "GET", url: "/api/nothing-here" });
+    assert.equal(missing.statusCode, 404);
+    assert.equal(missing.headers["x-content-type-options"], "nosniff");
+  });
+
+  test("a username longer than any username can be isn't looked up", async () => {
+    const user = await createUser(app, "checker");
+    const check = (username: string) =>
+      app.inject({
+        method: "GET",
+        url: `/api/users/check-username?username=${username}`,
+        headers: { authorization: `Bearer ${user.clerkId}` },
+      });
+    assert.equal((await check("a".repeat(30))).statusCode, 200);
+    assert.equal((await check("a".repeat(31))).statusCode, 400);
+  });
+
   test("one user's sockets share a message budget, and game sockets keep a reserve", async () => {
     const user = await createUser(app, "flooder");
     const other = await createUser(app, "partner");

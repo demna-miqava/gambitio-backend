@@ -10,15 +10,19 @@ export async function friendRequestsRoutes(fastify: FastifyInstance) {
    * POST /api/friend-requests
    * 400 for self-request / already friends / request exists, 404 if receiver not found
    */
-  fastify.post("/friend-requests", { preHandler: authMiddleware }, async (request, reply) => {
-    const { receiverId } = sendFriendRequestSchema.parse(request.body);
-    const friendRequest = await friendService.sendFriendRequest(
-      request.user!.id,
-      request.user!.username,
-      receiverId
-    );
-    return reply.status(201).send({ data: friendRequest });
-  });
+  fastify.post(
+    "/friend-requests",
+    { preHandler: authMiddleware, config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      const { receiverId } = sendFriendRequestSchema.parse(request.body);
+      const friendRequest = await friendService.sendFriendRequest(
+        request.user!.id,
+        request.user!.username,
+        receiverId
+      );
+      return reply.status(201).send({ data: friendRequest });
+    }
+  );
 
   /**
    * GET /api/friend-requests/pending
