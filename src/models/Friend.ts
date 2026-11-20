@@ -97,6 +97,16 @@ export interface FriendStatus {
 }
 
 /**
+ * A friend as someone to play, for the signed-in user: a friends list item
+ * plus whether they're online or playing now (null: neither) and when the
+ * two last played (null: not recently, or never).
+ */
+export interface FriendOpponent extends Omit<FriendStatus, "status"> {
+  status: FriendStatus["status"] | null;
+  lastPlayedAt: Date | null;
+}
+
+/**
  * Pagination metadata
  */
 export interface PaginationMeta {

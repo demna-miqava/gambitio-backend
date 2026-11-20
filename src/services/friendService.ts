@@ -10,6 +10,7 @@ import type {
   Friend,
   FriendSuggestion,
   FriendStatus,
+  FriendOpponent,
 } from "../models/Friend.js";
 import { getTimeControl } from "../models/common.js";
 import {
@@ -142,6 +143,41 @@ export class FriendService {
     }
     // Stable: keeps the username order within each group
     return statuses.sort((a, b) => Number(a.status === "playing") - Number(b.status === "playing"));
+  }
+
+  /**
+   * A page of the user's friends as opponents (FriendOpponent), in the
+   * order you'd pick one: online and free first, then those in a game, then
+   * whoever the user played most recently, then by username. Who is online
+   * comes from getFriendStatuses, so it is known for the same first
+   * FRIEND_STATUS_LIMIT friends; the rest are still listed, as offline.
+   */
+  async getOpponents(
+    userId: number,
+    { page, limit, searchQuery }: { page: number; limit: number; searchQuery?: string | undefined }
+  ): Promise<{ friends: FriendOpponent[]; total: number }> {
+    const statuses = new Map((await this.getFriendStatuses(userId)).map((s) => [s.id, s]));
+    const idsWith = (status: FriendStatus["status"]) =>
+      [...statuses.values()].filter((s) => s.status === status).map((s) => s.id);
+    const { friends, total } = await this.friendRepository.getOpponents(userId, {
+      firstIds: idsWith("online"),
+      nextIds: idsWith("playing"),
+      limit,
+      offset: (page - 1) * limit,
+      searchQuery,
+    });
+    return {
+      total,
+      friends: friends.map((friend) => {
+        const now = statuses.get(friend.id);
+        return {
+          ...friend,
+          status: now?.status ?? null,
+          gameId: now?.gameId ?? null,
+          gameType: now?.gameType ?? null,
+        };
+      }),
+    };
   }
 
   /**

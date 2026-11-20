@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { paginationSchema } from "./pagination.js";
 
 /**
  * Search query schema with pagination and search term validation
@@ -9,6 +10,19 @@ export const suggestionsQuerySchema = z.object({
     .min(2, "Search query must be at least 2 characters")
     .max(100, "Search query cannot exceed 100 characters")
     .optional(),
+});
+
+/**
+ * Friends as opponents: a page, optionally filtered by username. An empty
+ * `q` is no filter.
+ */
+export const opponentsQuerySchema = paginationSchema.extend({
+  q: z
+    .string()
+    .trim()
+    .max(100, "Search query cannot exceed 100 characters")
+    .optional()
+    .transform((q) => q || undefined),
 });
 
 /**

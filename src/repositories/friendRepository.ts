@@ -434,6 +434,80 @@ export class FriendRepository {
     );
     return rows;
   }
+
+  /**
+   * A page of the user's friends in the order you'd pick an opponent:
+   * `firstIds` (friends who are online and free) first, then `nextIds`
+   * (friends in a game), then whoever the user played most recently, then
+   * by username. Optionally only those whose username contains
+   * `searchQuery`.
+   *
+   * "Played recently" looks at the user's last RECENT_GAMES_PER_COLOR games
+   * with each colour, read from the per-player indexes, so the lookup costs
+   * the same however many games or friends the user has. A friend last
+   * played before those sorts by username with the rest.
+   */
+  async getOpponents(
+    userId: number,
+    { firstIds, nextIds, limit, offset, searchQuery }: {
+      firstIds: number[];
+      nextIds: number[];
+      limit: number;
+      offset: number;
+      searchQuery?: string | undefined;
+    }
+  ): Promise<{ friends: FriendOpponentRow[]; total: number }> {
+    const params: (number | string | number[])[] = [userId, RECENT_GAMES_PER_COLOR, firstIds, nextIds, limit, offset];
+    let search = "";
+    if (searchQuery) {
+      params.push(`%${escapeLike(searchQuery)}%`);
+      search = `AND u.username ILIKE $${params.length} ESCAPE '\\'`;
+    }
+    const { rows } = await this.fastify.pg.query<FriendOpponentRow & { total_count: string }>(
+      `WITH recent AS (
+         SELECT opponent, max("createdAt") AS "lastPlayedAt"
+         FROM (
+           (SELECT "blackId" AS opponent, "createdAt" FROM games
+            WHERE "whiteId" = $1 ORDER BY "createdAt" DESC LIMIT $2)
+           UNION ALL
+           (SELECT "whiteId" AS opponent, "createdAt" FROM games
+            WHERE "blackId" = $1 ORDER BY "createdAt" DESC LIMIT $2)
+         ) played
+         WHERE opponent IS NOT NULL -- games against the computer
+         GROUP BY opponent
+       )
+       SELECT u.id, u.username, u."avatarUrl", f."createdAt" AS "friendsSince",
+              u."blitzRating", u."bulletRating", u."rapidRating",
+              r."lastPlayedAt", COUNT(*) OVER() AS total_count
+       FROM friends f
+       INNER JOIN users u ON (${this.buildFriendJoinCondition()})
+       LEFT JOIN recent r ON r.opponent = u.id
+       WHERE (f."userOneId" = $1 OR f."userTwoId" = $1) ${search}
+       ORDER BY CASE WHEN u.id = ANY($3::int[]) THEN 0 WHEN u.id = ANY($4::int[]) THEN 1 ELSE 2 END,
+                r."lastPlayedAt" DESC NULLS LAST, u.username, u.id
+       LIMIT $5 OFFSET $6`,
+      params
+    );
+    return {
+      total: rows[0] ? parseInt(rows[0].total_count, 10) : 0,
+      friends: rows.map(({ total_count: _, ...friend }) => friend),
+    };
+  }
+}
+
+/** How far back "played recently" looks: this many of the user's games with each colour */
+const RECENT_GAMES_PER_COLOR = 100;
+
+/** A friends list item, with when the user last played them (null: not recently, or never) */
+export interface FriendOpponentRow {
+  id: number;
+  username: string;
+  avatarUrl: string | null;
+  friendsSince: Date;
+  blitzRating: number | null;
+  bulletRating: number | null;
+  rapidRating: number | null;
+  lastPlayedAt: Date | null;
 }
 
 export interface FriendWithLiveGame {

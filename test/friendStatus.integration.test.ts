@@ -130,6 +130,117 @@ describe("friends online and in game", { skip: !integrationEnabled && "TEST_POST
     assert.equal(res.statusCode, 401);
   });
 
+  describe("friends as opponents", () => {
+    type Opponent = {
+      id: number;
+      username: string;
+      status: string | null;
+      gameId: number | null;
+      gameType: string | null;
+      lastPlayedAt: string | null;
+    };
+    const opponents = async (clerkId: string, query = "") => {
+      const res = await app.inject({
+        method: "GET",
+        url: `/api/friends/opponents${query}`,
+        headers: { authorization: `Bearer ${clerkId}` },
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      return res.json() as { data: Opponent[]; pagination: { page: number; limit: number; total: number; totalPages: number } };
+    };
+    /** A finished game between the two, started at `playedAt` */
+    const played = async (whiteId: number, blackId: number, playedAt: string) => {
+      const game = await app.pg.transact((tx) => createGame(tx, { whiteId, blackId, time: 300, increment: 0 }));
+      await app.pg.query(
+        `UPDATE games SET status = 'finished', result = 'draw', "createdAt" = $2::timestamptz WHERE id = $1`,
+        [game.id, playedAt]
+      );
+    };
+
+    test("online first, then playing, then most recently played, then by name", async () => {
+      const me = await createUser(app, "myself");
+      const abe = await createUser(app, "abe"); // never played, offline
+      const bea = await createUser(app, "bea"); // played long ago
+      const cal = await createUser(app, "cal"); // played last
+      const dee = await createUser(app, "dee"); // in a game
+      const eve = await createUser(app, "eve"); // online
+      const zoe = await createUser(app, "zoe"); // never played, offline
+      const stranger = await createUser(app, "stranger"); // played yesterday, not a friend
+      for (const friend of [abe, bea, cal, dee, eve, zoe]) await befriend(me.id, friend.id);
+
+      await played(me.id, bea.id, "2026-01-01T12:00:00Z");
+      await played(bea.id, me.id, "2026-02-01T12:00:00Z");
+      await played(cal.id, me.id, "2026-03-01T12:00:00Z");
+      await played(me.id, stranger.id, "2026-04-01T12:00:00Z");
+      await online(eve.clerkId);
+      const live = await app.pg.transact((tx) =>
+        createGame(tx, { whiteId: dee.id, blackId: stranger.id, time: 60, increment: 0 })
+      );
+
+      const { data, pagination } = await opponents(me.clerkId);
+      assert.deepEqual(
+        data.map((f) => [f.username, f.status, f.gameId, f.gameType, f.lastPlayedAt]),
+        [
+          ["eve", "online", null, null, null],
+          ["dee", "playing", live.id, "bullet", null],
+          ["cal", null, null, null, "2026-03-01T12:00:00.000Z"],
+          // The later of the two games, whichever colour
+          ["bea", null, null, null, "2026-02-01T12:00:00.000Z"],
+          ["abe", null, null, null, null],
+          ["zoe", null, null, null, null],
+        ]
+      );
+      assert.deepEqual(pagination, { page: 1, limit: 10, total: 6, totalPages: 1 });
+      // A friends list item, plus the status fields and when they last played
+      assert.deepEqual(
+        Object.keys(data[0]!).sort(),
+        ["avatarUrl", "blitzRating", "bulletRating", "friendsSince", "gameId", "gameType", "id", "lastPlayedAt", "rapidRating", "status", "username"]
+      );
+    });
+
+    test("pages and searches in the same order", async () => {
+      const me = await createUser(app, "myself");
+      const anna = await createUser(app, "anna");
+      const hanna = await createUser(app, "hanna");
+      const bob = await createUser(app, "bob_");
+      const bobby = await createUser(app, "bobby");
+      for (const friend of [anna, hanna, bob, bobby]) await befriend(friend.id, me.id);
+      await played(me.id, hanna.id, "2026-03-01T12:00:00Z");
+      await online(bobby.clerkId);
+
+      const names = async (query: string) => (await opponents(me.clerkId, query)).data.map((f) => f.username);
+      assert.deepEqual(await names("?limit=3"), ["bobby", "hanna", "anna"]);
+      const second = await opponents(me.clerkId, "?limit=3&page=2");
+      assert.deepEqual(second.data.map((f) => f.username), ["bob_"]);
+      assert.deepEqual(second.pagination, { page: 2, limit: 3, total: 4, totalPages: 2 });
+
+      assert.deepEqual(await names("?q=ANN"), ["hanna", "anna"]);
+      // "_" is the character, not a wildcard
+      assert.deepEqual(await names("?q=b_"), ["bob_"]);
+      // An empty search is no search
+      assert.equal((await names("?q=")).length, 4);
+      assert.deepEqual(await names("?q=nobody"), []);
+    });
+
+    test("only your own friends, and only signed in", async () => {
+      const me = await createUser(app, "myself");
+      const friend = await createUser(app, "friend");
+      const other = await createUser(app, "other");
+      await befriend(friend.id, other.id);
+      assert.deepEqual((await opponents(me.clerkId)).data, []);
+      assert.deepEqual((await opponents(me.clerkId)).pagination, { page: 1, limit: 10, total: 0, totalPages: 0 });
+
+      const res = await app.inject({ method: "GET", url: "/api/friends/opponents" });
+      assert.equal(res.statusCode, 401);
+      const bad = await app.inject({
+        method: "GET",
+        url: "/api/friends/opponents?limit=1000",
+        headers: { authorization: `Bearer ${me.clerkId}` },
+      });
+      assert.equal(bad.statusCode, 400, bad.body);
+    });
+  });
+
   test("presentUserIds sees other instances' sockets, and not a dead instance's", async () => {
     class FakeSocket extends EventEmitter {
       readonly OPEN = 1;
