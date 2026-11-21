@@ -3,7 +3,16 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
-import { keepAuthenticated, limitedSync, MAX_BUFFERED_BYTES, sendJson, sendText } from "../src/realtime/socket.js";
+import { z } from "zod";
+import {
+  keepAuthenticated,
+  limitedSync,
+  MAX_BUFFERED_BYTES,
+  MAX_PENDING_MESSAGES,
+  onValidatedMessage,
+  sendJson,
+  sendText,
+} from "../src/realtime/socket.js";
 
 /** As much of a ws socket as the senders and limiters use */
 class FakeSocket extends EventEmitter {
@@ -118,6 +127,35 @@ describe("whole-state answers (sync)", () => {
       throw new Error("no such room");
     });
     await assert.rejects(sync(), /no such room/);
+    socket.close();
+  });
+});
+
+describe("messages behind a slow handler", () => {
+  test("pile up only so far, and session refreshes don't use up the allowance", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval", "Date"] });
+    const { socket, ws } = fake();
+    signedIn(ws, "clerk_slow");
+    let started = 0;
+    // A handler that never finishes (a database that stopped answering)
+    onValidatedMessage(ws, z.object({ type: z.literal("ping") }), log, () => {
+      started += 1;
+      return new Promise<void>(() => {});
+    });
+    const send = (message: object) => socket.emit("message", Buffer.from(JSON.stringify(message)));
+    const refused = () => socket.sent.filter((m) => m.includes("RATE_LIMITED")).length;
+    // Within the rate limit (a message every 200 ms), for longer than the cap
+    for (let i = 0; i < MAX_PENDING_MESSAGES + 5; i++) {
+      t.mock.timers.tick(200);
+      send({ type: "ping" });
+    }
+    assert.equal(refused(), 5);
+    // Auth messages are never refused for that, nor counted
+    for (let i = 0; i < 30; i++) send({ type: "auth", token: "t" });
+    assert.equal(refused(), 5);
+    await new Promise((resolve) => setImmediate(resolve));
+    // One at a time: the first is still running
+    assert.equal(started, 1);
     socket.close();
   });
 });

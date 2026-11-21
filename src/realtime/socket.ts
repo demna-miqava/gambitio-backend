@@ -42,6 +42,13 @@ export function sendError(socket: WebSocket, message: string, code?: string, req
 
 const BUCKET_SIZE = 20;
 const REFILL_PER_SECOND = 10;
+/**
+ * Messages of one socket waiting for (or in) its handler. The rate limit
+ * bounds how fast they arrive, not how many pile up behind a slow handler
+ * (a database that takes seconds to answer): past this they are refused
+ * like messages over the rate limit.
+ */
+export const MAX_PENDING_MESSAGES = 40;
 
 /**
  * Every socket a user holds on this instance also draws from one shared
@@ -243,14 +250,21 @@ export function onValidatedMessage<S extends z.ZodType>(
   let lastRefill = Date.now();
   // Messages from one socket are handled in order
   let queue = Promise.resolve();
+  let pending = 0;
 
   channel.onMessage = (json, now) => {
+    // Session refreshes are handled by keepAuthenticated (which limits them
+    // itself), and don't use up the allowance of the messages that act
+    if (isAuthMessage(json)) return;
     tokens = Math.min(BUCKET_SIZE, tokens + ((now - lastRefill) / 1000) * REFILL_PER_SECOND);
     lastRefill = now;
 
     // Parsed first (cheap: payloads are capped) so the client learns which
     // message was dropped, e.g. a resign it should send again
-    const allowed = tokens >= 1 && (!channel.userBucket || takeUserToken(channel.userBucket, now, reserved));
+    const allowed =
+      tokens >= 1 &&
+      pending < MAX_PENDING_MESSAGES &&
+      (!channel.userBucket || takeUserToken(channel.userBucket, now, reserved));
     if (!allowed) {
       // Invalid JSON over the limit gets no answer: answering would itself be unlimited
       if (json !== undefined) sendError(socket, "Too many messages", "RATE_LIMITED", droppedRequest(json));
@@ -261,14 +275,13 @@ export function onValidatedMessage<S extends z.ZodType>(
       sendError(socket, "Invalid JSON", "INVALID_MESSAGE");
       return;
     }
-    // Session refreshes are handled by keepAuthenticated
-    if (isAuthMessage(json)) return;
     const parsed = schema.safeParse(json);
     if (!parsed.success) {
       sendError(socket, "Invalid message", "INVALID_MESSAGE");
       return;
     }
 
+    pending += 1;
     queue = queue.then(async () => {
       try {
         await handler(parsed.data, { receivedAt: now });
@@ -279,6 +292,8 @@ export function onValidatedMessage<S extends z.ZodType>(
           log.error({ err: error }, "WebSocket handler failed");
           sendError(socket, "Something went wrong", "INTERNAL_ERROR", parsed.data);
         }
+      } finally {
+        pending -= 1;
       }
     });
   };

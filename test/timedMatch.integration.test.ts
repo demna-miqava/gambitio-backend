@@ -5,6 +5,7 @@ import { connect, createUser, integrationEnabled, move, resetDb, startTestApp, t
 import { NEXT_GAME_DELAY_MS } from "../src/game/timedMatch.js";
 import { SeriesService } from "../src/services/seriesService.js";
 import { UserService } from "../src/services/userService.js";
+import { AppError } from "../src/errors/AppError.js";
 
 const skip = !integrationEnabled && "TEST_POSTGRES_URL / TEST_REDIS_URL not set";
 
@@ -280,6 +281,50 @@ describe("timed matches", { skip }, () => {
     assert.equal((await ga.next("game_ended")).reason, "resignation");
     await new Promise((r) => setTimeout(r, NEXT_GAME_DELAY_MS + 500));
     assert.deepEqual(await inProgress(state.series.id), []);
+  });
+
+  test("a timed match idle for a week is ended on its arena points, as one whose time is up", async () => {
+    const { gb, ga, state } = await matchStarted();
+    gb.send({ type: "resign" });
+    await ga.next("game_ended");
+    app.series.stop(); // the next game's timer
+    // Arena points and half points disagree (as a streak can make them)
+    await app.pg.query(
+      `UPDATE series SET "playerOnePoints" = 0, "playerTwoPoints" = 4,
+         "playerOneHalfPoints" = 2, "playerTwoHalfPoints" = 0 WHERE id = $1`,
+      [state.series.id]
+    );
+    await app.series.expireStale(new Date(Date.now() + 8 * 24 * 60 * 60_000));
+    const row = await seriesRow(state.series.id);
+    assert.deepEqual([row.status, row.endReason, row.winnerId], ["finished", "time_up", row.playerTwoId]);
+  });
+
+  test("resigning the match while its game ends, or its next game starts, still resigns it", async () => {
+    const { state } = await matchStarted();
+    const resignGame = app.liveGames.resign;
+    let calls = 0;
+    // The game ends by itself just before the resignation gets to it, and
+    // the next one starts at once
+    app.liveGames.resign = async (gameId, userId) => {
+      if (++calls > 1) return resignGame.call(app.liveGames, gameId, userId);
+      await resignGame.call(app.liveGames, gameId, userId);
+      await app.series.continueTimedMatch(state.series.id);
+      throw new AppError("The game is over", "GAME_OVER", 409);
+    };
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: `/api/series/${state.series.id}/resign`,
+        headers: { authorization: `Bearer ${bob.clerkId}` },
+      });
+      assert.equal(res.statusCode, 200);
+      assert.deepEqual([res.json().series.status, res.json().series.winnerId], ["finished", alice.id]);
+    } finally {
+      app.liveGames.resign = resignGame;
+    }
+    assert.equal(calls, 2, "the game that started meanwhile was resigned too");
+    assert.deepEqual(await inProgress(state.series.id), []);
+    app.series.stop();
   });
 
   test("the time control has to fit, and a timed match isn't also a best-of", async () => {

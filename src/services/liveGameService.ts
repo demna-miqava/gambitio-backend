@@ -21,6 +21,7 @@ import {
   GIVE_TIME_MS,
   isClockRunning,
   isFlagged,
+  LAG_SLACK_MS,
   pausedDeadline,
   remainingAt,
   resumeShift,
@@ -28,17 +29,19 @@ import {
   type MoveTiming,
 } from "../game/clock.js";
 import { STARTING_FEN } from "../game/engine.js";
-import { bothPlayersMoved, colorOf, createGame, finishGame, linkNextGame, opponentOf } from "./gameService.js";
+import { bothPlayersMoved, colorOf, finishGame, notAPlayer, opponentOf, tournamentGame } from "./gameService.js";
+import { RematchService } from "./rematchService.js";
 import { openingSummary } from "../game/openings.js";
 import { AppError } from "../errors/AppError.js";
 import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
-import { blocksBetween } from "../repositories/blockRepository.js";
 import { invalidateStats } from "./statsService.js";
 import { PositionCache } from "../game/positionCache.js";
+import { KeyedThrottle } from "../utils/keyedThrottle.js";
+import { DeadlineTimers } from "./deadlineTimers.js";
+import type { DroppedChallenge } from "./challengeService.js";
 import {
   inActiveTimedMatch,
   isTimedMatch,
-  nextSeriesGame,
   recordSeriesResult,
   seriesRepository,
   timedMatchError,
@@ -51,7 +54,7 @@ import {
 } from "./tournamentService.js";
 
 /** What a game transaction does once it has committed. */
-interface TxEffects {
+export interface TxEffects {
   /** Messages to publish */
   out: { topic: string; message: object }[];
   /** Players whose cached stats are now stale */
@@ -66,6 +69,10 @@ interface TxEffects {
   tournaments: { id: number; userIds: number[] }[];
   /** Timed matches that go on after a game ended: their next game starts in a moment */
   timedMatches: { id: number; endsAt: Date | null }[];
+  /** Open challenges deleted because their players went into a game: the other side hears they're gone */
+  droppedChallenges: DroppedChallenge[];
+  /** The players who went into that game (a rematch) */
+  startedPlayers: number[];
   /**
    * The transaction's last statement, sent in the same simple query as
    * COMMIT to save a round trip. Only for a statement nothing else follows
@@ -73,6 +80,15 @@ interface TxEffects {
    */
   finalStatement?: string;
 }
+
+/**
+ * LiveGameService's transaction runner (see run): locks the game, runs `fn`
+ * and, once it has committed, carries out its effects.
+ */
+export type GameTransaction = (
+  gameId: number,
+  fn: (tx: TxClient, game: LiveGame, fx: TxEffects) => Promise<void>
+) => Promise<void>;
 
 /** How a move was timed: see LiveGameService.move. */
 export interface LiveMoveTiming {
@@ -94,7 +110,9 @@ export interface PlayerSocketHandle {
 /**
  * Claimed delay beyond what the server can measure that gets a log line
  * (at most every LAG_LOG_EVERY_PLIES per player and game), to tune the lag
- * constants in clock.ts and spot accounts that keep claiming it.
+ * constants in clock.ts and spot accounts that keep claiming it. So does
+ * delay forgiven beyond what the TCP round trip backs: a client answering
+ * pings late claims no more than it made the server measure.
  */
 const LAG_LOG_EXCESS_MS = 300;
 const LAG_LOG_EVERY_PLIES = 40;
@@ -106,10 +124,6 @@ const LAG_LOG_EVERY_PLIES = 40;
  */
 const SPECTATOR_COUNT_EVERY_MS = 2_000;
 
-/** Fires a moment after the deadline, so the clock has surely run out. */
-const DEADLINE_SLACK_MS = 20;
-/** A deadline timer whose resolve failed tries again after this long. */
-const DEADLINE_RETRY_MS = 5_000;
 /**
  * How long the clock sweep keeps running, with no timer armed here, after
  * a failed read of the live games' deadlines (see armLiveDeadlines).
@@ -132,7 +146,6 @@ function clockOf(game: LiveGame): ClockState {
 export const spectatorsKey = (gameId: number) => `spectators:game:${gameId}`;
 
 const notFound = () => new AppError("Game not found", "GAME_NOT_FOUND", 404);
-const notAPlayer = () => new AppError("You are not a player in this game", "NOT_A_PLAYER", 403);
 const gameOver = () => new AppError("The game is over", "GAME_OVER", 409);
 // Bot games are played in the browser and stored once finished; there is
 // nothing live about them (no moves, clock or rematch here)
@@ -141,12 +154,6 @@ const takebackNotAllowed = () =>
   new AppError("There is no move of yours to take back yet", "TAKEBACK_NOT_ALLOWED", 409);
 const drawDeclined = () =>
   new AppError("Your draw offer was declined; you can offer again after your next move", "DRAW_DECLINED", 409);
-const rematchAlreadyRequested = () =>
-  new AppError("You can only ask for a rematch once per game", "REMATCH_ALREADY_REQUESTED", 409);
-// A tournament pairs its own games and scores them as played: no rematch,
-// no takeback, no abort, no time given
-const tournamentGame = (what: string) =>
-  new AppError(`${what} isn't available in a tournament game`, "TOURNAMENT_GAME", 409);
 
 /**
  * All live-game rules. The server owns the position, the clock and the
@@ -155,18 +162,26 @@ const tournamentGame = (what: string) =>
  * Every action runs in a transaction that starts by locking the game row, so
  * actions on one game are serialized across all server instances. Messages
  * are published only after the transaction commits.
+ *
+ * Rematches (RematchService) run in the same transactions, through `run`;
+ * the per-game deadline timers are a DeadlineTimers.
  */
 export class LiveGameService {
   constructor(
     private fastify: FastifyInstance,
     private hub: RealtimeHub
-  ) {}
+  ) {
+    this.rematches = new RematchService(hub, (gameId, fn) => this.run(gameId, fn));
+    this.deadlines = new DeadlineTimers((gameId) => this.resolveDeadline(gameId), fastify.log);
+  }
+
+  /** Rematches of finished games, run in the finished game's transaction */
+  private readonly rematches: RematchService;
 
   /** Parsed positions of live games, so a move doesn't replay the game */
   private positions = new PositionCache();
   /** One timer per live game this instance knows about, set for its deadline */
-  private deadlineTimers = new Map<number, { at: number; timer: NodeJS.Timeout }>();
-  private deadlineTimersEnabled = false;
+  private readonly deadlines: DeadlineTimers;
   /** Set while the startup read of live deadlines hasn't succeeded (see armLiveDeadlines) */
   private liveDeadlinesUnread = false;
   /** Until when the clock sweep runs regardless (see needsClockSweep) */
@@ -179,8 +194,10 @@ export class LiveGameService {
   private readonly startedAt = Date.now();
   /** Per game and player, the ply of the last lag log line (see LAG_LOG_EXCESS_MS) */
   private lagLogged = new Map<string, number>();
-  /** Per game, the spectator-count throttle window (see SPECTATOR_COUNT_EVERY_MS) */
-  private spectatorWindows = new Map<number, { timer: NodeJS.Timeout; pending: boolean }>();
+  /** Per game, the spectator-count throttle (see SPECTATOR_COUNT_EVERY_MS) */
+  private spectatorThrottle = new KeyedThrottle<number>(SPECTATOR_COUNT_EVERY_MS, (gameId) => {
+    void this.sendSpectatorCount(gameId);
+  });
 
   private async run(gameId: number, fn: (tx: TxClient, game: LiveGame, fx: TxEffects) => Promise<void>) {
     const fx: TxEffects = {
@@ -191,6 +208,8 @@ export class LiveGameService {
       positions: [],
       tournaments: [],
       timedMatches: [],
+      droppedChallenges: [],
+      startedPlayers: [],
     };
     if (!Number.isSafeInteger(gameId) || gameId <= 0) throw notFound();
     const tx = await this.fastify.pg.connect();
@@ -220,11 +239,7 @@ export class LiveGameService {
     }
     // The transaction has committed: from here on nothing may throw, or the
     // client gets an error for an action that actually happened.
-    for (const id of fx.ended) {
-      this.positions.drop(id);
-      this.clearDeadline(id);
-      this.forgetGame(id);
-    }
+    for (const id of fx.ended) this.forgetEnded(id);
     // A move that ends the game also set a new deadline: no timer for it
     for (const { gameId: id, at } of fx.deadlines) {
       if (!fx.ended.includes(id)) this.watchDeadline(id, at);
@@ -253,6 +268,7 @@ export class LiveGameService {
     // The lobby gets the new standings (throttled; never throws)
     for (const { id, userIds } of fx.tournaments) this.fastify.tournaments.noteChanged(id, userIds);
     for (const { id, endsAt } of fx.timedMatches) this.fastify.series.scheduleNextGame(id, endsAt);
+    await this.fastify.challenges.notifyDropped(fx.droppedChallenges, fx.startedPlayers);
   }
 
   /**
@@ -305,6 +321,32 @@ export class LiveGameService {
     for (const handle of sockets ?? []) handle.stop();
     this.lagLogged.delete(`${gameId}:white`);
     this.lagLogged.delete(`${gameId}:black`);
+  }
+
+  /** Drops all this instance holds for a game that ended (here or elsewhere). */
+  private forgetEnded(gameId: number): void {
+    this.positions.drop(gameId);
+    this.deadlines.clear(gameId);
+    this.forgetGame(gameId);
+  }
+
+  /**
+   * Forgets the games this instance holds a player's socket or a deadline
+   * timer for that have ended on another instance: only the instance whose
+   * transaction ends a game forgets it in run, and these would otherwise
+   * keep their RTT probes pinging and needsClockSweep true (the database
+   * awake) until the sockets close or the timers fire. Run by the clock
+   * sweep (src/jobs.ts).
+   */
+  async forgetEndedGames(): Promise<void> {
+    const ids = [...new Set([...this.playerSockets.keys(), ...this.deadlines.gameIds()])];
+    if (ids.length === 0) return;
+    const { rows } = await this.fastify.pg.query<{ id: number }>(
+      `SELECT t.id FROM unnest($1::int[]) AS t(id)
+       WHERE NOT EXISTS (SELECT 1 FROM games g WHERE g.id = t.id AND g.status = 'in_progress')`,
+      [ids]
+    );
+    for (const { id } of rows) this.forgetEnded(id);
   }
 
   /**
@@ -366,7 +408,7 @@ export class LiveGameService {
   async startDeadlineTimers(): Promise<void> {
     // On before anything can fail, so a failed startup read never leaves
     // every later watchDeadline a no-op. The resumes arm their own timers.
-    this.deadlineTimersEnabled = true;
+    this.deadlines.enable();
     // Before the read, so it sees the moved deadlines. A failed resume
     // leaves the game paused: its timer (resolveDeadline) or its players'
     // reconnect resumes it later.
@@ -407,19 +449,17 @@ export class LiveGameService {
    * idle tab, so it doesn't keep the database awake.
    */
   get needsClockSweep(): boolean {
-    return this.deadlineTimers.size > 0 || this.playerSockets.size > 0 || Date.now() < this.sweepUntil;
+    return this.deadlines.size > 0 || this.playerSockets.size > 0 || Date.now() < this.sweepUntil;
   }
 
   stopDeadlineTimers(): void {
-    this.deadlineTimersEnabled = false;
-    for (const id of [...this.deadlineTimers.keys()]) this.clearDeadline(id);
+    this.deadlines.stop();
   }
 
   /** Stops every timer this service holds (app shutdown). */
   stop(): void {
     this.stopDeadlineTimers();
-    for (const { timer } of this.spectatorWindows.values()) clearTimeout(timer);
-    this.spectatorWindows.clear();
+    this.spectatorThrottle.stop();
     for (const id of this.playedGameIds) {
       for (const handle of this.playerSockets.get(id) ?? []) handle.stop();
     }
@@ -427,7 +467,7 @@ export class LiveGameService {
 
   /** Live games with a deadline timer on this instance. */
   get watchedGameCount(): number {
-    return this.deadlineTimers.size;
+    return this.deadlines.size;
   }
 
   /**
@@ -437,38 +477,7 @@ export class LiveGameService {
    * (a move made on another instance) finds that out and re-arms.
    */
   watchDeadline(gameId: number, at: Date | null): void {
-    if (!this.deadlineTimersEnabled) return;
-    if (!at) return this.clearDeadline(gameId);
-    const when = at.getTime();
-    if (this.deadlineTimers.get(gameId)?.at === when) return;
-    this.armDeadline(gameId, when, Math.max(0, when - Date.now()) + DEADLINE_SLACK_MS);
-  }
-
-  /**
-   * Sets the game's timer to resolve its deadline (`when`) in `delayMs`. A
-   * resolve that fails (a transient database error, a lock timeout) tries
-   * again after DEADLINE_RETRY_MS, unless the timer was re-armed meanwhile.
-   */
-  private armDeadline(gameId: number, when: number, delayMs: number): void {
-    this.clearDeadline(gameId);
-    const timer = setTimeout(() => {
-      this.deadlineTimers.delete(gameId);
-      this.resolveDeadline(gameId).catch((err) => {
-        this.fastify.log.error({ err, gameId }, "Resolving a game deadline failed; retrying");
-        if (this.deadlineTimersEnabled && !this.deadlineTimers.has(gameId)) {
-          this.armDeadline(gameId, when, DEADLINE_RETRY_MS);
-        }
-      });
-    }, delayMs);
-    timer.unref();
-    this.deadlineTimers.set(gameId, { at: when, timer });
-  }
-
-  private clearDeadline(gameId: number): void {
-    const entry = this.deadlineTimers.get(gameId);
-    if (!entry) return;
-    clearTimeout(entry.timer);
-    this.deadlineTimers.delete(gameId);
+    this.deadlines.watch(gameId, at);
   }
 
   /**
@@ -546,8 +555,8 @@ export class LiveGameService {
           result: game.result,
           reason: game.endReason,
           winnerId: game.winnerId,
-          // An unrated game (time odds) has none, as when it ended
-          ...(game.rated && {
+          // An unrated game (time odds) or an aborted one has none, as when it ended
+          ...(game.rated && game.result !== "aborted" && {
             ratingChanges: {
               whiteRatingChange: game.whiteRatingChange ?? 0,
               blackRatingChange: game.blackRatingChange ?? 0,
@@ -573,26 +582,7 @@ export class LiveGameService {
    * throws.
    */
   async publishSpectatorCount(gameId: number, count?: number): Promise<void> {
-    const window = this.spectatorWindows.get(gameId);
-    if (window) {
-      window.pending = true;
-      return;
-    }
-    this.openSpectatorWindow(gameId);
-    await this.sendSpectatorCount(gameId, count);
-  }
-
-  private openSpectatorWindow(gameId: number): void {
-    const timer = setTimeout(() => {
-      const window = this.spectatorWindows.get(gameId);
-      this.spectatorWindows.delete(gameId);
-      if (!window?.pending) return;
-      // The trailing send opens the next window
-      this.openSpectatorWindow(gameId);
-      void this.sendSpectatorCount(gameId);
-    }, SPECTATOR_COUNT_EVERY_MS);
-    timer.unref();
-    this.spectatorWindows.set(gameId, { timer, pending: false });
+    if (this.spectatorThrottle.hit(gameId)) await this.sendSpectatorCount(gameId, count);
   }
 
   private async sendSpectatorCount(gameId: number, known?: number): Promise<void> {
@@ -670,8 +660,6 @@ export class LiveGameService {
    */
   async move(gameId: number, userId: number, input: MoveInput, timing: LiveMoveTiming = {}): Promise<void> {
     let rejected: { reason: string; fen: string; pgn: string } | null = null;
-    // The position after the stored move, cached once the transaction commits
-    let played: { chess: Chess; pgn: string; ply: number } | null = null;
 
     await this.run(gameId, async (tx, game, fx) => {
       if (game.status !== "in_progress") throw gameOver();
@@ -709,12 +697,14 @@ export class LiveGameService {
       const result = applyMoveTo(chess, game.pgn ?? "", game.numMoves, input);
       if (!result.ok) {
         // An illegal move leaves the position as it was
-        played = { chess, pgn: game.pgn ?? "", ply: game.numMoves };
+        fx.positions.push({ gameId, chess, pgn: game.pgn ?? "", ply: game.numMoves });
         rejected = { reason: result.reason, fen: game.fen ?? "", pgn: game.pgn ?? "" };
         return;
       }
 
-      const clock = afterMove(state, now, game.increment * 1000, moveTiming);
+      // The opponent's clock starts now, as the move is stored, not when it
+      // arrived: they can't answer a move before they have it (see afterMove)
+      const clock = afterMove(state, now, game.increment * 1000, moveTiming, Date.now());
       // Moving declines the opponent's pending draw offer
       const drawOfferedBy = game.drawOfferedBy === userId ? userId : null;
       const deadlineAt = new Date(deadline(clock));
@@ -735,7 +725,9 @@ export class LiveGameService {
       // A game-ending move has more to write; any other goes out with COMMIT
       if (result.outcome) await gameRepository.saveMove(tx, gameId, update);
       else fx.finalStatement = saveMoveStatement(tx, gameId, update);
-      played = { chess, pgn: result.pgn, ply: result.ply };
+      // Kept for the next move once this commits, before the move goes out
+      // (a game that ended drops it: see run)
+      fx.positions.push({ gameId, chess, pgn: result.pgn, ply: result.ply });
       fx.deadlines.push({ gameId, at: deadlineAt });
 
       fx.out.push({
@@ -758,13 +750,8 @@ export class LiveGameService {
       if (result.outcome) {
         const updated = { ...game, numMoves: result.ply, drawOfferedBy };
         await this.end(tx, updated, result.outcome, clock, fx);
-        played = null; // nothing left to play
       }
     });
-
-    // Committed: keep the position for the next move
-    const kept = played as { chess: Chess; pgn: string; ply: number } | null;
-    if (kept) this.positions.commit(gameId, kept.chess, kept.pgn, kept.ply);
 
     if (rejected) {
       const r = rejected as { reason: string; fen: string; pgn: string };
@@ -779,12 +766,15 @@ export class LiveGameService {
 
   /**
    * Logs a move that claims much more network delay than the server
-   * measured (LAG_LOG_EXCESS_MS), at most once per LAG_LOG_EVERY_PLIES for
-   * each player of a game.
+   * measured, or is forgiven much more than the TCP round trip Cloudflare
+   * measured backs (LAG_LOG_EXCESS_MS), at most once per LAG_LOG_EVERY_PLIES
+   * for each player of a game.
    */
   private noteLag(game: LiveGame, userId: number, state: ClockState, now: number, timing: LiveMoveTiming): void {
     const charge = chargeMove(state, now, { thinkMs: timing.thinkMs, measuredRttMs: timing.measuredRttMs });
-    if (charge.claimedLagMs - charge.freeMs <= LAG_LOG_EXCESS_MS) return;
+    const tcpMs = timing.rttSources?.tcpMs;
+    const overTcp = tcpMs !== undefined && charge.forgivenMs - (tcpMs + LAG_SLACK_MS) > LAG_LOG_EXCESS_MS;
+    if (charge.claimedLagMs - charge.freeMs <= LAG_LOG_EXCESS_MS && !overTcp) return;
     const key = `${game.id}:${activeColor(state.ply)}`;
     const last = this.lagLogged.get(key);
     if (last !== undefined && state.ply - last < LAG_LOG_EVERY_PLIES) return;
@@ -800,11 +790,13 @@ export class LiveGameService {
         claimedMs: charge.claimedLagMs,
         measuredMs: timing.measuredRttMs ?? null,
         pingMs: timing.rttSources?.pingMs ?? null,
-        tcpMs: timing.rttSources?.tcpMs ?? null,
+        tcpMs: tcpMs ?? null,
         forgivenMs: charge.forgivenMs,
         lagBudgetMs: charge.lagBudgetMs,
       },
-      "Move claims more network delay than measured"
+      charge.claimedLagMs - charge.freeMs > LAG_LOG_EXCESS_MS
+        ? "Move claims more network delay than measured"
+        : "Move forgiven more network delay than the TCP round trip backs"
     );
   }
 
@@ -983,7 +975,7 @@ export class LiveGameService {
     const chess = this.position(game);
     const position = undoMoves(chess, game.numMoves, plies, game.pgn ?? "");
     const at = Math.max(now, state.lastMoveAt);
-    const clock: ClockState = { ...remainingAt(state, at), lastMoveAt: at, ply: position.ply };
+    const clock: ClockState = { ...remainingAt(state, at), lastMoveAt: at, ply: position.ply, startPly: game.startPly };
     const deadlineAt = new Date(deadline(clock));
     // Nothing follows: it goes out with COMMIT
     fx.finalStatement = saveMoveStatement(tx, game.id, {
@@ -1025,7 +1017,10 @@ export class LiveGameService {
     // A plain read first: the row lock is only taken for a game that is due,
     // so connects and clock hints don't queue up behind moves
     const due = await gameRepository.findDeadline(this.fastify.pg, gameId);
-    if (!due || due.status !== "in_progress" || !due.deadlineAt) return;
+    // Ended, perhaps on another instance (whose transaction then forgot it
+    // there, not here)
+    if (!due || due.status !== "in_progress") return this.forgetEnded(gameId);
+    if (!due.deadlineAt) return;
     // A paused game is decided only once even the longest resume would have
     // passed its deadline; run resumes it first
     const at = due.pausedAt
@@ -1139,102 +1134,17 @@ export class LiveGameService {
     await this.resolveDeadline(gameId);
   }
 
-  async requestRematch(gameId: number, userId: number): Promise<void> {
-    await this.run(gameId, async (tx, game, fx) => {
-      if (game.status !== "finished") throw new AppError("The game is still in progress", "GAME_IN_PROGRESS", 409);
-      const color = colorOf(game, userId);
-      if (!color) throw notAPlayer();
-      if (game.tournamentId !== null) throw tournamentGame("A rematch");
-      if (game.rematchGameId) return;
-      if (await this.inTimedMatch(tx, game)) throw timedMatchError();
-      const opponentId = opponentOf(game, userId);
-      await assertNoBlock(tx, userId, opponentId);
-
-      if (game.rematchRequestedBy === opponentId) {
-        await this.startRematch(tx, game, fx);
-        return;
-      }
-      if (game.rematchRequestedBy === userId) return;
-      // One request per player and game: one that was declined or cancelled
-      // can't be sent again
-      if (color === "white" ? game.whiteRematchAsked : game.blackRematchAsked) throw rematchAlreadyRequested();
-
-      await gameRepository.requestRematch(tx, gameId, userId, color);
-      fx.out.push({ topic: topics.gameUser(gameId, opponentId), message: { type: "rematch_request", data: {} } });
-    });
+  /** Asks for a rematch, or starts it if the opponent has asked too (RematchService). */
+  requestRematch(gameId: number, userId: number): Promise<void> {
+    return this.rematches.requestRematch(gameId, userId);
   }
 
-  async respondToRematch(gameId: number, userId: number, accepted: boolean): Promise<void> {
-    await this.run(gameId, async (tx, game, fx) => {
-      if (!colorOf(game, userId)) throw notAPlayer();
-      const requesterId = opponentOf(game, userId);
-      if (game.rematchRequestedBy !== requesterId || game.rematchGameId) {
-        throw new AppError("There is no rematch offer to answer", "NO_REMATCH_OFFER", 409);
-      }
-
-      if (accepted) {
-        await assertNoBlock(tx, userId, requesterId);
-        await this.startRematch(tx, game, fx);
-      } else {
-        await gameRepository.setRematchRequest(tx, gameId, null);
-        fx.out.push({
-          topic: topics.gameUser(gameId, requesterId),
-          message: { type: "rematch_response", accepted: false },
-        });
-      }
-    });
+  respondToRematch(gameId: number, userId: number, accepted: boolean): Promise<void> {
+    return this.rematches.respondToRematch(gameId, userId, accepted);
   }
 
-  async cancelRematch(gameId: number, userId: number): Promise<void> {
-    await this.run(gameId, async (tx, game, fx) => {
-      if (!colorOf(game, userId) || game.rematchRequestedBy !== userId) return;
-      await gameRepository.setRematchRequest(tx, gameId, null);
-      fx.out.push({
-        topic: topics.gameUser(gameId, opponentOf(game, userId)),
-        message: { type: "rematch_canceled", data: { reason: "opponent_canceled" } },
-      });
-    });
-  }
-
-  private async startRematch(tx: TxClient, game: LiveGame, fx: TxEffects) {
-    // Queue rows are locked before the players' rows (createGame), the order
-    // matchmaking takes them in, so a player re-queueing while the rematch is
-    // accepted can't deadlock the two
-    await tx.query(`DELETE FROM matchmaking WHERE "userId" = ANY($1)`, [[game.whiteId, game.blackId]]);
-    // In a series the next game follows the series' colours; otherwise
-    // (and after a series is over) colours swap
-    const series = await nextSeriesGame(tx, game);
-    const next = series?.next ?? null;
-    const whiteId = next ? next.whiteId : game.blackId;
-    // Time odds belong to the players, not the colours: each keeps their clock
-    const timeOf = (playerId: number) => (playerId === game.whiteId ? game.whiteTime : game.blackTime);
-    const whiteTime = timeOf(whiteId);
-    const blackTime = timeOf(whiteId === game.whiteId ? game.blackId : game.whiteId);
-    const rematch = await createGame(tx, {
-      whiteId,
-      blackId: next ? next.blackId : game.whiteId,
-      time: game.time,
-      increment: game.increment,
-      odds: whiteTime !== null && blackTime !== null ? { whiteTime, blackTime } : null,
-      // A casual game's rematch is casual too, as is every game of a casual
-      // series. A series game takes the series' setting, not its own: one
-      // made unrated only because a player never moved (a timed match) says
-      // nothing of the next. (Tournament games have no rematch.)
-      rated: series ? series.rated : game.rated,
-      // From the same opening (in a series, the series' opening is the game's)
-      openingId: game.openingId,
-      ...(next && { series: { id: next.seriesId, game: next.number } }),
-    });
-    fx.deadlines.push({ gameId: rematch.id, at: rematch.deadlineAt });
-    fx.out.push(...(await linkNextGame(tx, game.id, rematch)));
-  }
-}
-
-/** A rematch is off once either player has blocked the other (worded for both sides). */
-async function assertNoBlock(tx: TxClient, userId: number, opponentId: number): Promise<void> {
-  const blocks = await blocksBetween(tx, userId, opponentId);
-  if (blocks.byFirst || blocks.bySecond) {
-    throw new AppError("A rematch with this player isn't available", "REMATCH_UNAVAILABLE", 403);
+  cancelRematch(gameId: number, userId: number): Promise<void> {
+    return this.rematches.cancelRematch(gameId, userId);
   }
 }
 

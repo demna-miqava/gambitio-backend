@@ -66,7 +66,33 @@ export class Backend extends Container<Env> {
         }),
     };
   }
+
+  /**
+   * Asked by the Worker (retirePrevious) of this generation's first backend,
+   * which always exists and is shared by every Worker isolate: whether the
+   * previous generation should still be stopped. Yes for RETIRE_WINDOW_MS
+   * from the first time any isolate asks (stored with this object, so it
+   * holds across isolates and restarts), then no: the old containers are
+   * long gone by then, and new isolates stop waking their objects for good.
+   */
+  async retiringPrevious(): Promise<boolean> {
+    const now = Date.now();
+    let since = await this.ctx.storage.get<number>(RETIRE_SINCE_KEY);
+    if (since === undefined) {
+      since = now;
+      await this.ctx.storage.put(RETIRE_SINCE_KEY, since);
+    }
+    return now - since < RETIRE_WINDOW_MS;
+  }
 }
+
+const RETIRE_SINCE_KEY = "retiringPreviousSince";
+/**
+ * How long after a generation's first request new Worker isolates still stop
+ * the previous generation: covers an old container that an isolate still
+ * running the previous version started again during the rollout.
+ */
+const RETIRE_WINDOW_MS = 10 * 60_000;
 
 /** Small stable string hash (FNV-1a), to spread keys over instances. */
 function hash(value: string): number {
@@ -146,20 +172,31 @@ let previousRetired = false;
 const RETIRE_GRACE_MS = 10_000;
 
 /**
- * Stops the previous generation's containers, once per Worker instance. They
- * would otherwise run on, with the old settings, until the last person
- * connected to them left. SIGTERM first, so the backend shuts down cleanly
- * (destroy() is a SIGKILL: games in progress would lose the downtime from
- * their clocks), then destroy() for one that didn't exit. Stopping one that
- * isn't running does nothing.
+ * Stops the previous generation's containers, once per Worker instance and
+ * only in the first minutes of the new generation (Backend.retiringPrevious;
+ * if that can't be asked, they are stopped anyway, as a stop is harmless).
+ * They would otherwise run on, with the old settings, until the last person
+ * connected to them left. Every one the old generation may have run (up to
+ * MAX_INSTANCES, not just today's BACKEND_INSTANCES, which may have been
+ * lowered in the same deploy). SIGTERM first, so the backend shuts down
+ * cleanly (destroy() is a SIGKILL: games in progress would lose the downtime
+ * from their clocks), then destroy() for one that didn't exit. Stopping one
+ * that isn't running does nothing.
  */
-async function retirePrevious(env: Env, instances: number, generation: number): Promise<void> {
+async function retirePrevious(env: Env, generation: number): Promise<void> {
   if (previousRetired || generation <= 1) return;
   previousRetired = true;
-  const old = Array.from({ length: instances }, (_, index) =>
+  const failed = (error: unknown) => console.log("Stopping an old backend failed", String(error));
+  const due = await getContainer(env.BACKEND, instanceName(0, generation))
+    .retiringPrevious()
+    .catch((error: unknown) => {
+      failed(error);
+      return true;
+    });
+  if (!due) return;
+  const old = Array.from({ length: MAX_INSTANCES }, (_, index) =>
     getContainer(env.BACKEND, instanceName(index, generation - 1))
   );
-  const failed = (error: unknown) => console.log("Stopping an old backend failed", String(error));
   await Promise.all(old.map((backend) => backend.stop("SIGTERM").catch(failed)));
   await new Promise((resolve) => setTimeout(resolve, RETIRE_GRACE_MS));
   await Promise.all(old.map((backend) => backend.destroy().catch(failed)));
@@ -193,23 +230,47 @@ const SHARE_META_TIMEOUT_MS = 3_000;
 async function sharePage(request: Request, env: Env, backend: { fetch(request: Request): Promise<Response> }): Promise<Response> {
   const page = await env.ASSETS.fetch(request);
   const url = new URL(request.url);
-  const token = request.method === "GET" ? shareTokenFromPath(url.pathname) : null;
+  const token = request.method === "GET" || request.method === "HEAD" ? shareTokenFromPath(url.pathname) : null;
   if (!token || !page.ok || !(page.headers.get("content-type") ?? "").includes("text/html")) return page;
+  if (request.method === "HEAD") {
+    // The same headers a GET gets (below), without asking the backend
+    const headers = new Headers(page.headers);
+    headers.delete("content-length");
+    headers.delete("etag");
+    headers.set("cache-control", "no-cache");
+    headers.set("x-robots-tag", "noindex");
+    return new Response(null, { status: page.status, headers });
+  }
 
   let meta = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const headers = new Headers({ accept: "application/json" });
     // The backend's rate limit counts the visitor, not this Worker
     const ip = request.headers.get("cf-connecting-ip");
     if (ip) headers.set("cf-connecting-ip", ip);
-    const response = await Promise.race([
-      backend.fetch(new Request(new URL(`/api/shared-games/${token}`, url), { headers })),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), SHARE_META_TIMEOUT_MS)),
+    // The whole answer, body included, within the time; an answer that
+    // comes too late is dropped
+    const lookup = (async () => {
+      const response = await backend.fetch(new Request(new URL(`/api/shared-games/${token}`, url), { headers }));
+      if (!response.ok) {
+        await response.body?.cancel();
+        return null;
+      }
+      return parseSharedGame(await response.json());
+    })();
+    lookup.catch(() => {});
+    const game = await Promise.race([
+      lookup,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), SHARE_META_TIMEOUT_MS);
+      }),
     ]);
-    const game = response?.ok ? parseSharedGame(await response.json()) : null;
     if (game) meta = describeSharedGame(game);
   } catch (error) {
     console.log("Share page sent without its preview", String(error));
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 
   const html = withShareMeta(await page.text(), {
@@ -234,7 +295,7 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const instances = Math.min(MAX_INSTANCES, Math.max(1, Math.floor(Number(env.BACKEND_INSTANCES ?? "1")) || 1));
     const generation = generationOf(env.BACKEND_GENERATION);
-    ctx.waitUntil(retirePrevious(env, instances, generation));
+    ctx.waitUntil(retirePrevious(env, generation));
     const backend = getContainer(env.BACKEND, instanceFor(request, instances, generation));
     if (!new URL(request.url).pathname.startsWith("/api/")) return sharePage(request, env, backend);
     return backend.fetch(toBackend(request));

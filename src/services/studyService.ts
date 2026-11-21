@@ -512,7 +512,8 @@ export class StudyService {
         [roomId]
       );
       const room = locked[0];
-      if (!room) throw roomNotFound();
+      // Asked again under the lock, as rewrite does: they may have been removed since the read above
+      if (!room || !(await this.isMember(tx, roomId, userId))) throw roomNotFound();
       const { rows: games } = await tx.query<{ pgn: string | null; status: string }>(
         `SELECT pgn, status FROM games WHERE id = $1`,
         [found.gameId]

@@ -2,6 +2,7 @@ import type { Queryable, TxClient } from "../db.js";
 import type { Game, LiveGame } from "../models/Game.js";
 import type { EndReason, GameResult } from "../game/engine.js";
 import { MAX_PAUSE_MS } from "../game/clock.js";
+import { historySideWhere, type GameHistoryFilters } from "./gameHistory.js";
 
 const GAME_COLUMNS = `
   id, "createdAt", pgn, fen, "winnerId", "numMoves", "whiteRating", "blackRating",
@@ -612,6 +613,53 @@ export const gameRepository = {
       [userId, offset + limit, limit, offset]
     );
     return rows;
+  },
+
+  /**
+   * A page of the user's history with filters (gameHistory.ts): like
+   * findPageByUserId, one side at a time, newest first, until it has
+   * offset + limit matches. Not index-only (the list's columns aren't all
+   * in games_{white,black}_history_idx): a rare filter reads the player's
+   * games from the table until the page is full. The count below is the
+   * part the index covers.
+   */
+  async findFilteredPageByUserId(
+    db: Queryable,
+    userId: number,
+    filters: GameHistoryFilters,
+    limit: number,
+    offset: number
+  ): Promise<GameListRow[]> {
+    const params: unknown[] = [userId, offset + limit, limit, offset];
+    const sides = (["white", "black"] as const)
+      .map((side) => historySideWhere(side, filters, params))
+      .filter((where): where is string => where !== null)
+      .map(
+        (where) => `(SELECT ${GAME_LIST_COLUMNS} FROM games WHERE ${where}
+           ORDER BY "createdAt" DESC, id DESC LIMIT $2)`
+      );
+    const { rows } = await db.query<GameListRow>(
+      `SELECT * FROM (${sides.join(" UNION ALL ")}) page
+       ORDER BY "createdAt" DESC, id DESC
+       LIMIT $3 OFFSET $4`,
+      params
+    );
+    return rows;
+  },
+
+  /**
+   * How many games match the filters: an index-only count over the user's
+   * entries in games_{white,black}_history_idx (migration 044), however
+   * long the history (about 6 ms for 60,000 games).
+   */
+  async countFilteredByUserId(db: Queryable, userId: number, filters: GameHistoryFilters): Promise<number> {
+    const params: unknown[] = [userId];
+    const sides = (["white", "black"] as const)
+      .map((side) => historySideWhere(side, filters, params))
+      .filter((where): where is string => where !== null)
+      .map((where) => `(SELECT COUNT(*) FROM games WHERE ${where})`);
+    const { rows } = await db.query<{ n: string }>(`SELECT ${sides.join(" + ")} AS n`, params);
+    return Number(rows[0]?.n ?? 0);
   },
 
   /**

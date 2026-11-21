@@ -104,6 +104,10 @@ describe("shared games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TES
     assert.deepEqual(await share(other.clerkId, game.id).then((r) => [r.status, r.body.code]), [403, "NOT_YOUR_GAME"]);
     assert.deepEqual(await share(white.clerkId, 999_999).then((r) => [r.status, r.body.code]), [404, "GAME_NOT_FOUND"]);
     assert.equal((await share(white.clerkId, "abc" as unknown as number)).status, 400);
+    // A table game (played at a board) is finished but never shared, and says so
+    const table = await finishedGame();
+    await app.pg.query(`UPDATE games SET "tableGame" = true, rated = false WHERE id = $1`, [table.id]);
+    assert.deepEqual(await share(white.clerkId, table.id).then((r) => [r.status, r.body.code]), [409, "TABLE_GAME"]);
     // Nothing above made a link
     const { rows } = await app.pg.query(`SELECT count(*)::int AS n FROM games WHERE "shareToken" IS NOT NULL`);
     assert.equal(rows[0].n, 0);

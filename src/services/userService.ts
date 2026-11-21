@@ -184,6 +184,9 @@ export class UserService {
     // After the user lock: accepting a challenge locks the players, then
     // takes the challenge row
     await tx.query(`DELETE FROM challenges WHERE "challengerId" = $1 OR "challengedId" = $1`, id);
+    // Sending and accepting friend requests wait for the user lock (see
+    // lockPair in FriendRepository): after the last run, which also clears
+    // the Clerk id, they find the account gone, so none lands after it
     await tx.query(`DELETE FROM friends WHERE "userOneId" = $1 OR "userTwoId" = $1`, id);
     await tx.query(`DELETE FROM friend_requests WHERE "senderId" = $1 OR "receiverId" = $1`, id);
     await tx.query(`DELETE FROM user_blocks WHERE "blockerId" = $1 OR "blockedId" = $1`, id);
@@ -192,10 +195,19 @@ export class UserService {
     await tx.query(`DELETE FROM puzzle_attempts WHERE "userId" = $1`, id);
     await tx.query(`DELETE FROM repertoire_lines WHERE "userId" = $1`, id);
     await tx.query(`DELETE FROM endgame_progress WHERE "userId" = $1`, id);
+    await tx.query(`DELETE FROM coordinate_bests WHERE "userId" = $1`, id);
+    await tx.query(`DELETE FROM coordinate_runs WHERE "userId" = $1`, id);
     await tx.query(`DELETE FROM conversion_drills WHERE "userId" = $1`, id);
     await tx.query(`DELETE FROM conversion_scans WHERE "userId" = $1`, id);
     await tx.query(`DELETE FROM game_chat_messages WHERE "senderId" = $1`, id);
     await tx.query(`DELETE FROM study_chat_messages WHERE "senderId" = $1`, id);
+    await tx.query(`DELETE FROM spectator_chat_messages WHERE "senderId" = $1`, id);
+    // Waiting duel invites go; finished duels stay (with their name, as games do)
+    await tx.query(
+      `UPDATE puzzle_duel_invites SET status = 'cancelled'
+       WHERE status = 'pending' AND ("senderId" = $1 OR "recipientId" = $1)`,
+      id
+    );
     // Table games they were named in but never confirmed carry their name as
     // text: it goes the way their profile name does
     await tx.query(

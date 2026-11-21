@@ -4,6 +4,10 @@ import { EventEmitter } from "node:events";
 import type { WebSocket } from "ws";
 import { MAX_RTT_MS, measuredRtt, median, parseClientRtt, RttProbe, CLIENT_RTT_HEADER } from "../src/routes/ws/rttProbe.js";
 import { backendHeaders, CLIENT_RTT_HEADER as WORKER_HEADER } from "../worker/clientRtt.js";
+import type { FastifyInstance } from "fastify";
+import { LiveGameService, type LiveMoveTiming } from "../src/services/liveGameService.js";
+import type { RealtimeHub } from "../src/realtime/hub.js";
+import type { ClockState } from "../src/game/clock.js";
 
 /** Enough of a ws socket for the probe: answers each ping after `delayMs` (or never). */
 class FakeSocket extends EventEmitter {
@@ -91,4 +95,26 @@ test("the Worker only lets Cloudflare's round trip through, on game sockets", ()
 
   // Nothing to change: the request goes through as it is
   assert.equal(backendHeaders("https://site.test/api/users/me", new Headers(), 37), null);
+});
+
+test("pongs answered late to stretch the ping round trip get the move logged", () => {
+  const logged: string[] = [];
+  const fastify = { log: { info: (_fields: object, message: string) => logged.push(message) } };
+  const service = new LiveGameService(fastify as unknown as FastifyInstance, {} as RealtimeHub);
+  const noteLag = (service as unknown as {
+    noteLag(game: { id: number }, userId: number, state: ClockState, now: number, timing: LiveMoveTiming): void;
+  }).noteLag.bind(service);
+  const state: ClockState = { whiteMs: 60_000, blackMs: 60_000, lastMoveAt: 0, ply: 10 };
+  // Pings answered 950ms late over a 15ms TCP round trip; the client claims just that
+  const stretched = { pingMs: 950, tcpMs: 15 };
+  noteLag({ id: 1 }, 7, state, 1_500, {
+    thinkMs: 550,
+    measuredRttMs: measuredRtt(stretched.pingMs, stretched.tcpMs),
+    rttSources: stretched,
+  });
+  assert.deepEqual(logged, ["Move forgiven more network delay than the TCP round trip backs"]);
+  // An honest player near the edge isn't
+  const near = { pingMs: 40, tcpMs: 15 };
+  noteLag({ id: 2 }, 8, state, 1_500, { thinkMs: 1_460, measuredRttMs: 40, rttSources: near });
+  assert.equal(logged.length, 1);
 });

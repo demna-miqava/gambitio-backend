@@ -241,21 +241,25 @@ export class ConversionDrillService {
     attempt: { success: boolean; moves: number },
     now = new Date()
   ): Promise<ConversionDrill> {
-    const { rows: current } = await this.db.query<{ streak: number }>(
-      `SELECT streak FROM conversion_drills WHERE id = $1 AND "userId" = $2`,
-      [drillId, userId]
-    );
-    if (!current[0]) throw drillNotFound();
-    const due = nextDue(now, attempt.success, current[0].streak);
-    await this.db.query(
-      `UPDATE conversion_drills SET attempts = attempts + 1, successes = successes + $3::int,
-         streak = $4, "dueAt" = $5, "lastAttemptAt" = $6,
-         "bestMoves" = CASE WHEN $3::int = 1 THEN LEAST(COALESCE("bestMoves", $7::smallint), $7::smallint)
-                       ELSE "bestMoves" END
-       WHERE id = $1 AND "userId" = $2`,
-      [drillId, userId, attempt.success ? 1 : 0, due.streak, due.dueAt, now, attempt.moves]
-    );
-    return this.get(userId, drillId);
+    // The update only applies to the streak it was worked out from: two
+    // attempts at once each count, the second redone from the first's streak
+    for (;;) {
+      const { rows: current } = await this.db.query<{ streak: number }>(
+        `SELECT streak FROM conversion_drills WHERE id = $1 AND "userId" = $2`,
+        [drillId, userId]
+      );
+      if (!current[0]) throw drillNotFound();
+      const due = nextDue(now, attempt.success, current[0].streak);
+      const { rowCount } = await this.db.query(
+        `UPDATE conversion_drills SET attempts = attempts + 1, successes = successes + $3::int,
+           streak = $4, "dueAt" = $5, "lastAttemptAt" = $6,
+           "bestMoves" = CASE WHEN $3::int = 1 THEN LEAST(COALESCE("bestMoves", $7::smallint), $7::smallint)
+                         ELSE "bestMoves" END
+         WHERE id = $1 AND "userId" = $2 AND streak = $8`,
+        [drillId, userId, attempt.success ? 1 : 0, due.streak, due.dueAt, now, attempt.moves, current[0].streak]
+      );
+      if (rowCount) return this.get(userId, drillId);
+    }
   }
 
   /** Drops a drill the player doesn't want (the game stays scanned). */

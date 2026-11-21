@@ -236,9 +236,10 @@ export const tournamentRepository = {
   },
 
   /**
-   * Adds a player, or brings back one who withdrew (their score is kept).
-   * `waitingSince`: when they start waiting for a game (a running
-   * tournament), or null. Returns whether the player count went up.
+   * Adds a player, or brings back one who withdrew or paused (their score
+   * is kept). `waitingSince`: when they start waiting for a game (a running
+   * tournament), or null; a player who is already in keeps theirs. Returns
+   * whether the player count went up.
    */
   async join(tx: Queryable, tournamentId: number, userId: number, waitingSince: Date | null): Promise<boolean> {
     const { rows } = await tx.query<{ status: TournamentPlayerStatus }>(
@@ -248,7 +249,11 @@ export const tournamentRepository = {
     const before = rows[0]?.status;
     await tx.query(
       `INSERT INTO tournament_players ("tournamentId", "userId", "waitingSince") VALUES ($1, $2, $3)
-       ON CONFLICT ("tournamentId", "userId") DO UPDATE SET status = 'active', "waitingSince" = $3`,
+       ON CONFLICT ("tournamentId", "userId") DO UPDATE SET status = 'active',
+         -- Joining again while in keeps the place in the queue (and the
+         -- breather after a game, or the game being played)
+         "waitingSince" = CASE WHEN tournament_players.status = 'active'
+           THEN tournament_players."waitingSince" ELSE $3 END`,
       [tournamentId, userId, waitingSince]
     );
     const counted = before === undefined || before === "withdrawn";

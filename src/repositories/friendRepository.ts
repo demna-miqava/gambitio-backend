@@ -1,5 +1,7 @@
 import type { FastifyInstance } from "fastify";
-import { notBlockedSql } from "./blockRepository.js";
+import type { Queryable } from "../db.js";
+import { UserNotFoundError } from "../errors/FriendErrors.js";
+import { blocksBetween, notBlockedSql } from "./blockRepository.js";
 import type {
   Friend,
   FriendRequest,
@@ -31,8 +33,44 @@ function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
+/**
+ * Inside a transaction: locks both users' rows (FOR SHARE, lowest id first)
+ * and says whether the two can be friends: both accounts still there, and no
+ * block either way. Blocking (ModerationService.block) and deleting an
+ * account (UserService.removePersonalData) lock these rows in modes that
+ * conflict with FOR SHARE, so neither can run between this check and the
+ * caller's write; one that ran first is seen here, and one that comes after
+ * sees what the caller wrote and removes it.
+ */
+async function lockPair(db: Queryable, first: number, second: number): Promise<"ok" | "gone" | "blocked"> {
+  const { rows } = await db.query(
+    `SELECT id FROM users WHERE id = ANY($1::int[]) AND "clerkId" IS NOT NULL ORDER BY id FOR SHARE`,
+    [[first, second]]
+  );
+  if (rows.length < 2) return "gone";
+  const blocks = await blocksBetween(db, first, second);
+  return blocks.byFirst || blocks.bySecond ? "blocked" : "ok";
+}
+
 export class FriendRepository {
   constructor(private fastify: FastifyInstance) {}
+
+  /**
+   * How many friends the user has (whose username contains `searchQuery`,
+   * if given): the total for a page past the last one, which has no rows
+   * to carry the count.
+   */
+  private async countFriends(userId: number, searchQuery?: string): Promise<number> {
+    const { rows } = await this.fastify.pg.query<{ n: number }>(
+      `SELECT COUNT(*)::int AS n
+       FROM friends f
+       INNER JOIN users u ON (${this.buildFriendJoinCondition()})
+       WHERE (f."userOneId" = $1 OR f."userTwoId" = $1)
+         AND ($2::text IS NULL OR u.username ILIKE $2 ESCAPE '\\')`,
+      [userId, searchQuery ? `%${escapeLike(searchQuery)}%` : null]
+    );
+    return rows[0]!.n;
+  }
 
   /**
    * Private helper: Builds the subquery to exclude existing friends
@@ -151,7 +189,11 @@ export class FriendRepository {
 
     const { rows } = await client.query<FriendListItemRaw>(query, params);
 
-    const total = rows[0] ? parseInt(rows[0].total_count || "0", 10) : 0;
+    const total = rows[0]
+      ? parseInt(rows[0].total_count || "0", 10)
+      : offset > 0
+        ? await this.countFriends(userId, searchQuery)
+        : 0;
 
     const friends: FriendListItem[] = rows.map((row) => ({
       id: row.id,
@@ -249,7 +291,10 @@ export class FriendRepository {
   /**
    * Creates a friend request. Returns null if one already exists between the
    * two users in either direction: the unique index on the unordered pair
-   * (migration 014) settles two users requesting each other at once.
+   * (migration 014) settles two users requesting each other at once. Also
+   * null if a block between them came in after the caller's checks (the
+   * caller's "already exists" doesn't reveal it); throws UserNotFoundError
+   * if either account was deleted meanwhile (see lockPair).
    */
   async createFriendRequest(
     senderId: number,
@@ -259,25 +304,28 @@ export class FriendRepository {
     receiverUsername: string,
     receiverAvatarUrl: string | null
   ): Promise<FriendRequest | null> {
-    const client = this.fastify.pg;
-    const { rows } = await client.query<FriendRequest>(
-      `INSERT INTO friend_requests (
-        "senderId", "receiverId", "senderUsername", "receiverUsername",
-        "senderAvatarUrl", "receiverAvatarUrl"
-      ) VALUES ($1, $2, $3, $4, $5, $6)
-      ON CONFLICT DO NOTHING
-      RETURNING *`,
-      [
-        senderId,
-        receiverId,
-        senderUsername,
-        receiverUsername,
-        senderAvatarUrl,
-        receiverAvatarUrl,
-      ]
-    );
-
-    return rows[0] ?? null;
+    return this.fastify.pg.transact(async (client) => {
+      const pair = await lockPair(client, senderId, receiverId);
+      if (pair === "gone") throw new UserNotFoundError(`User with ID ${receiverId} not found`);
+      if (pair === "blocked") return null;
+      const { rows } = await client.query<FriendRequest>(
+        `INSERT INTO friend_requests (
+          "senderId", "receiverId", "senderUsername", "receiverUsername",
+          "senderAvatarUrl", "receiverAvatarUrl"
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT DO NOTHING
+        RETURNING *`,
+        [
+          senderId,
+          receiverId,
+          senderUsername,
+          receiverUsername,
+          senderAvatarUrl,
+          receiverAvatarUrl,
+        ]
+      );
+      return rows[0] ?? null;
+    });
   }
 
   /**
@@ -338,15 +386,23 @@ export class FriendRepository {
    * friendship in one transaction. Deleting first claims the request, so two
    * concurrent accepts can't both succeed. Returns null if there is no such
    * request for this receiver (the caller works out which error applies).
+   * A request left between players who can't be friends any more (a block,
+   * a deleted account: see lockPair) is deleted and null returned too.
    */
   async acceptFriendRequest(requestId: number, receiverId: number): Promise<Friend | null> {
     return this.fastify.pg.transact(async (client) => {
+      const { rows: found } = await client.query<{ senderId: number }>(
+        `SELECT "senderId" FROM friend_requests WHERE id = $1 AND "receiverId" = $2`,
+        [requestId, receiverId]
+      );
+      if (!found[0]) return null;
+      const pair = await lockPair(client, found[0].senderId, receiverId);
       const { rows: requestRows } = await client.query<FriendRequest>(
         `DELETE FROM friend_requests WHERE id = $1 AND "receiverId" = $2 RETURNING *`,
         [requestId, receiverId]
       );
       const request = requestRows[0];
-      if (!request) return null;
+      if (!request || pair !== "ok") return null;
 
       const { rows: friendRows } = await client.query<Friend>(
         `INSERT INTO friends ("userOneId", "userTwoId", "userOneUsername", "userTwoUsername")
@@ -389,20 +445,25 @@ export class FriendRepository {
    */
   async deleteFriendship(userId: number, friendId: number): Promise<boolean> {
     const client = this.fastify.pg;
-    // Challenges are only allowed between friends, so drop pending ones too
-    const { rowCount } = await client.query(
-      `WITH dropped AS (
+    // Pending challenges between them go too, but only with a friendship:
+    // two players who aren't friends keep theirs (strangers may challenge)
+    const { rows } = await client.query<{ n: number }>(
+      `WITH unfriended AS (
+         DELETE FROM friends
+         WHERE ("userOneId" = $1 AND "userTwoId" = $2)
+         OR ("userOneId" = $2 AND "userTwoId" = $1)
+         RETURNING 1
+       ), dropped AS (
          DELETE FROM challenges
-         WHERE ("challengerId" = $1 AND "challengedId" = $2)
-            OR ("challengerId" = $2 AND "challengedId" = $1)
+         WHERE (("challengerId" = $1 AND "challengedId" = $2)
+             OR ("challengerId" = $2 AND "challengedId" = $1))
+           AND EXISTS (SELECT 1 FROM unfriended)
        )
-       DELETE FROM friends
-       WHERE ("userOneId" = $1 AND "userTwoId" = $2)
-       OR ("userOneId" = $2 AND "userTwoId" = $1)`,
+       SELECT COUNT(*)::int AS n FROM unfriended`,
       [userId, friendId]
     );
 
-    return (rowCount ?? 0) > 0;
+    return rows[0]!.n > 0;
   }
 
   /**
@@ -489,7 +550,11 @@ export class FriendRepository {
       params
     );
     return {
-      total: rows[0] ? parseInt(rows[0].total_count, 10) : 0,
+      total: rows[0]
+        ? parseInt(rows[0].total_count, 10)
+        : offset > 0
+          ? await this.countFriends(userId, searchQuery)
+          : 0,
       friends: rows.map(({ total_count: _, ...friend }) => friend),
     };
   }

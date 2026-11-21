@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   afterMove,
   chargeMove,
+  deadline,
   INITIAL_LAG_BUDGET_MS,
   isFlagged,
   LAG_BUDGET_CAP_MS,
@@ -91,6 +92,18 @@ test("flag decisions use the same rule", () => {
   assert.equal(isFlagged(state, 400), true, "nor does a move without a report");
   // A claim beyond everything: charged the excess
   assert.equal(chargeMove(state, 2_000, { thinkMs: 0, measuredRttMs: 1_000 }).chargedMs, 1_000);
+});
+
+test("a move stored after it arrived starts the opponent's clock when stored, charging the mover to arrival", () => {
+  const state: ClockState = { whiteMs: 10_000, blackMs: 500, lastMoveAt: 0, ply: 30 };
+  // Arrived at 1s, stored at 3s (it waited behind the mover's other messages)
+  const next = afterMove(state, 1_000, 0, undefined, 3_000);
+  assert.equal(next.whiteMs, 9_000, "the mover pays up to arrival");
+  assert.equal(next.blackMs, 500);
+  assert.equal(next.lastMoveAt, 3_000, "the opponent's clock starts once the move is stored");
+  assert.equal(deadline(next), 3_000 + 500 + MAX_LAG_COMPENSATION_MS, "so they aren't flagged by the wait");
+  assert.equal(afterMove(state, 1_000, 0).lastMoveAt, 1_000, "at arrival when left out");
+  assert.equal(afterMove(state, 1_000, 0, undefined, 500).lastMoveAt, 1_000, "never before arrival");
 });
 
 test("a resumed game shifts by the pause, capped, and not at all after a fallen flag", () => {

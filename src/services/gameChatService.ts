@@ -136,8 +136,8 @@ export class GameChatService {
   }
 
   /**
-   * Deletes messages past their retention, a batch at a time: game chat and
-   * the chat of study rooms watching a game (same schedule).
+   * Deletes messages past their retention, a batch at a time: game chat, the
+   * chat of study rooms watching a game, and spectator chat (same schedule).
    */
   async sweep(now = new Date()): Promise<void> {
     const before = new Date(now.getTime() - RETENTION_AFTER_END_MS);
@@ -145,5 +145,6 @@ export class GameChatService {
       (await gameChatRepository.deleteForGamesEndedBefore(this.fastify.pg, before, SWEEP_BATCH)) === SWEEP_BATCH
     );
     await this.fastify.study.sweepChat(before, SWEEP_BATCH);
+    await this.fastify.spectatorChat.sweep(before, SWEEP_BATCH);
   }
 }

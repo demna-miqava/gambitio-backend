@@ -51,7 +51,13 @@ async function referenceHistory(app: FastifyInstance, userId: number, variant: s
       variant === null
         ? Math.round((ratings.bullet + ratings.blitz + ratings.rapid) / 3)
         : ratings[variant as keyof typeof ratings];
-    const date = (r.createdAt as Date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    // The UTC day, as the days are counted (the server's time zone mustn't matter)
+    const date = (r.createdAt as Date).toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      timeZone: "UTC",
+    });
     return { date, rating };
   });
   if (points.length <= 30) return points;
@@ -207,5 +213,23 @@ describe("profile stats", { skip }, () => {
     // Without a stale window an expired value is computed again before answering
     await app.redis.setEx("test:sf", 120, JSON.stringify({ v: "stale", freshUntil: Date.now() - 1 }));
     assert.equal(await cachedValue(app.redis, app.log, "test:sf", 60, compute), 3);
+  });
+
+  test("with Redis down, a group's field is computed once for concurrent misses, and not stored", async () => {
+    const down = () => Promise.reject(new Error("Redis is down"));
+    const redis = { hGet: down, get: down, eval: down } as unknown as typeof app.redis;
+    const log = { ...app.log, warn: () => {} } as typeof app.log;
+    let calls = 0;
+    const compute = async () => {
+      calls++;
+      await new Promise((r) => setTimeout(r, 30));
+      return calls;
+    };
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () => cachedField(redis, log, statsCache(1), "summary", 60, compute))
+    );
+    assert.deepEqual(results, [1, 1, 1, 1, 1]);
+    // Once it's done, the next miss computes again
+    assert.equal(await cachedField(redis, log, statsCache(1), "summary", 60, compute), 2);
   });
 });

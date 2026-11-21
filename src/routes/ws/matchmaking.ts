@@ -35,6 +35,10 @@ export async function matchmakingWebSocketRoute(fastify: FastifyInstance) {
     };
 
     onValidatedMessage(socket, matchmakingClientMessageSchema, request.log, async () => {
+      // Set before the socket's "close" event, which comes once the client
+      // answers: an entry still being added is taken back out (below), and
+      // never paired
+      closed = true;
       await leaveQueue();
       socket.close();
     });
@@ -43,16 +47,17 @@ export async function matchmakingWebSocketRoute(fastify: FastifyInstance) {
       leaveQueue().catch((err) => request.log.error({ err }, "Failed to leave matchmaking"));
     });
 
-    await hub.attach(socket, {
-      userId: user.id,
-      topics: [topics.matchmaking(user.id)],
-      presence: "matchmaking",
-    });
-
     try {
+      // Inside the try: a socket that can't be attached (Redis failing) is
+      // told and closed instead of being left open, never searching
+      await hub.attach(socket, {
+        userId: user.id,
+        topics: [topics.matchmaking(user.id)],
+        presence: "matchmaking",
+      });
       const entry = await matchmaking.enqueue(user.id, time, increment);
       requestId = entry.id;
-      // The player left while we were adding them: the close handler ran
+      // The player left or cancelled while we were adding them: that ran
       // before requestId was set, so take them back out here.
       if (closed) {
         await leaveQueue();

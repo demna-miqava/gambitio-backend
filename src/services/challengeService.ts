@@ -1,9 +1,16 @@
 import type { FastifyInstance } from "fastify";
 import { AppError } from "../errors/AppError.js";
 import { gameRepository } from "../repositories/gameRepository.js";
-import { AlreadyInGameError, createGame, lockPlayers, matchFoundData } from "./gameService.js";
+import {
+  AlreadyInGameError,
+  announceGameStart,
+  createGame,
+  lockPlayers,
+  matchCreatedMessages,
+  matchFoundData,
+} from "./gameService.js";
 import type { LiveGame } from "../models/Game.js";
-import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
+import { topics, type RealtimeHub } from "../realtime/hub.js";
 import { getTimeControl, ratingColumns, type PlayerColor } from "../models/common.js";
 import { MIRROR_MATCH_LENGTH, seriesColors, seriesOdds } from "../game/series.js";
 import { isTimedMatch, seriesRepository, timedMatchError, type SeriesRow } from "./seriesService.js";
@@ -76,8 +83,18 @@ export const CHALLENGE_TTL_MS = 10 * 60_000;
  */
 export const challengeTimings = { offlineGraceMs: 15_000 };
 
-/** Why a challenge ended without being answered, as told to its sender */
-type WithdrawReason = "expired" | "offline";
+/**
+ * Why a challenge ended without being answered, as told to its sender.
+ * "playing": the sender went into a game themselves (nothing to announce
+ * to them: their page drops the challenge without a word).
+ */
+type WithdrawReason = "expired" | "offline" | "playing";
+
+/** An open challenge deleted because one of its two players started a game */
+export interface DroppedChallenge {
+  challengerId: number;
+  challengedId: number;
+}
 
 /**
  * Limits on challenging, so a challenge (a pop-up, and a push notification
@@ -152,6 +169,10 @@ function challengeReceivedMessage(challenge: ReceivedChallenge) {
  */
 export class ChallengeService {
   private graceTimers = new Map<number, NodeJS.Timeout>();
+  /** When each user last sent a challenge from this instance (ms); see withdrawIfStillOffline */
+  private lastSent = new Map<number, number>();
+  /** Until CHALLENGE_TTL_MS after this, challenges a previous process stored may still be open */
+  private startedAt = Date.now();
 
   constructor(
     private fastify: FastifyInstance,
@@ -161,6 +182,31 @@ export class ChallengeService {
       for (const timer of this.graceTimers.values()) clearTimeout(timer);
       this.graceTimers.clear();
     });
+  }
+
+  /**
+   * Whether the user may have sent a challenge from this instance that is
+   * still open (or this process started too recently to tell).
+   */
+  private sentRecently(userId: number): boolean {
+    if (Date.now() - this.startedAt <= CHALLENGE_TTL_MS) return true;
+    const at = this.lastSent.get(userId);
+    if (at === undefined) return false;
+    if (Date.now() - at <= CHALLENGE_TTL_MS) return true;
+    this.lastSent.delete(userId);
+    return false;
+  }
+
+  /** Remembers that the user sent a challenge, forgetting the ones that have expired by now. */
+  private noteSent(userId: number): void {
+    const now = Date.now();
+    // Oldest first (re-set entries move to the end), so this stops at the first one still open
+    for (const [id, at] of this.lastSent) {
+      if (now - at <= CHALLENGE_TTL_MS) break;
+      this.lastSent.delete(id);
+    }
+    this.lastSent.delete(userId);
+    this.lastSent.set(userId, now);
   }
 
   /** The challenge the user sent and is waiting on, if any (the latest one). */
@@ -179,6 +225,11 @@ export class ChallengeService {
    * withdrawn (accepting would fail anyway, see accept()).
    */
   async withdrawIfStillOffline(userId: number): Promise<void> {
+    // Challenges are sent over the challenger's notifications socket, so
+    // while no other instance runs, a user who sent none here within
+    // CHALLENGE_TTL_MS has none open: the database isn't asked (it was,
+    // after every closed tab, keeping it awake)
+    if (!this.hub.othersAlive && !this.sentRecently(userId)) return;
     if (await this.hub.isPresent("notifications", userId)) return;
     clearTimeout(this.graceTimers.get(userId));
     const timer = setTimeout(() => {
@@ -378,6 +429,7 @@ export class ChallengeService {
     if (!challenge) throw new AppError("Challenged user not found", "USER_NOT_FOUND", 404);
     // Keeps the challenge sweep running until this one can have expired
     this.fastify.jobs.noteChallenge();
+    this.noteSent(challenger.id);
 
     await this.hub.publish(
       topics.notifications(data.challengedId),
@@ -450,7 +502,13 @@ export class ChallengeService {
     challengedId: number,
     { stranger }: { stranger: boolean }
   ): Promise<void> {
-    const declined = await this.fastify.redis.get(declinedKey(challengerId, challengedId));
+    // Without Redis the limits are skipped rather than nobody being able to
+    // challenge anyone (as for creating a tournament)
+    const unlimited = (err: unknown) => {
+      this.fastify.log.warn({ err }, "Challenge limits unavailable");
+      return null;
+    };
+    const declined = await this.fastify.redis.get(declinedKey(challengerId, challengedId)).catch(unlimited);
     if (declined !== null) {
       const declinedAt = Number(declined) > 1e12 ? Number(declined) : null;
       const cooldownSeconds = stranger ? STRANGER_DECLINE_COOLDOWN_SECONDS : FRIEND_DECLINE_COOLDOWN_SECONDS;
@@ -476,16 +534,16 @@ export class ChallengeService {
       `challenge:pair:${challengerId}:${challengedId}`,
       PAIR_CHALLENGES.max,
       PAIR_CHALLENGES.windowSeconds
-    );
-    if (!pairAllowed) throw rateLimited();
+    ).catch(unlimited);
+    if (pairAllowed === false) throw rateLimited();
     if (!stranger) return;
     const allowed = await withinLimit(
       this.fastify.redis,
       `challenge:strangers:${challengerId}`,
       STRANGER_CHALLENGES.max,
       STRANGER_CHALLENGES.windowSeconds
-    );
-    if (!allowed) throw rateLimited();
+    ).catch(unlimited);
+    if (allowed === false) throw rateLimited();
   }
 
   /** The series a player wants to continue, if they may: theirs, active, between games. */
@@ -572,23 +630,41 @@ export class ChallengeService {
     await this.notifyWithdrawn(rows, "expired");
   }
 
+  /**
+   * After a game has started for `playerIds`, whose open challenges its
+   * transaction deleted: the other side of each hears it is gone. The
+   * sender of one hears it expired, unless they are the one who started
+   * playing ("playing": they aren't told their own challenge "expired" as
+   * their game opens). Never throws.
+   */
+  async notifyDropped(rows: readonly DroppedChallenge[], playerIds: readonly number[]): Promise<void> {
+    if (rows.length === 0) return;
+    await this.notifyWithdrawn(rows, (row) => (playerIds.includes(row.challengerId) ? "playing" : "expired")).catch(
+      (err) => this.fastify.log.error({ err }, "Failed to announce dropped challenges")
+    );
+  }
+
   private async notifyWithdrawn(
-    rows: { challengerId: number; challengedId: number }[],
-    reason: WithdrawReason
+    rows: readonly DroppedChallenge[],
+    why: WithdrawReason | ((row: DroppedChallenge) => WithdrawReason)
   ): Promise<void> {
     // All at once: publish() delivers locally in call order, and the Redis
     // PUBLISHes go out back to back instead of one round trip each
     await Promise.all(
-      rows.flatMap(({ challengerId, challengedId }) => [
-        this.hub.publish(topics.notifications(challengedId), {
-          type: "challenge_cancelled",
-          data: { challengerId },
-        }),
-        this.hub.publish(topics.notifications(challengerId), {
-          type: "challenge_declined",
-          data: { challengedId, reason },
-        }),
-      ])
+      rows.flatMap((row) => {
+        const { challengerId, challengedId } = row;
+        const reason = typeof why === "function" ? why(row) : why;
+        return [
+          this.hub.publish(topics.notifications(challengedId), {
+            type: "challenge_cancelled",
+            data: { challengerId },
+          }),
+          this.hub.publish(topics.notifications(challengerId), {
+            type: "challenge_declined",
+            data: { challengedId, reason },
+          }),
+        ];
+      })
     );
   }
 
@@ -609,6 +685,8 @@ export class ChallengeService {
 
     const pair = [challengerId, challengedId];
     let game: LiveGame;
+    /** The two players' other open challenges, deleted with this one */
+    let dropped: DroppedChallenge[] = [];
     try {
       game = await this.fastify.pg.transact(async (tx) => {
         // Locks in the order matchmaking takes them (queue rows, then players
@@ -634,7 +712,12 @@ export class ChallengeService {
         // in a game; a refusal below rolls that back), and reads whether
         // either player, or the series, has a game in progress
         const { rows } = await tx.query<
-          Challenge & { challengerGameId: number | null; challengedGameId: number | null; seriesBusy: boolean }
+          Challenge & {
+            challengerGameId: number | null;
+            challengedGameId: number | null;
+            seriesBusy: boolean;
+            others: DroppedChallenge[] | null;
+          }
         >(
           `WITH dropped AS (
              DELETE FROM challenges WHERE "challengerId" = ANY($3) OR "challengedId" = ANY($3)
@@ -646,7 +729,9 @@ export class ChallengeService {
              (SELECT id FROM games WHERE status = 'in_progress' AND ("whiteId" = $2 OR "blackId" = $2)
               LIMIT 1) AS "challengedGameId",
              EXISTS (SELECT 1 FROM games WHERE "seriesId" = d."seriesId" AND status = 'in_progress')
-               AS "seriesBusy"
+               AS "seriesBusy",
+             (SELECT json_agg(json_build_object('challengerId', o."challengerId", 'challengedId', o."challengedId"))
+              FROM dropped o WHERE o.id <> d.id) AS others
            FROM dropped d WHERE d."challengerId" = $1 AND d."challengedId" = $2`,
           [challengerId, challengedId, pair]
         );
@@ -654,7 +739,8 @@ export class ChallengeService {
         if (!claimed || Date.now() - new Date(claimed.createdAt).getTime() > CHALLENGE_TTL_MS) {
           throw new AppError("Challenge not found", "CHALLENGE_NOT_FOUND", 404);
         }
-        const { challengerGameId, challengedGameId, seriesBusy, ...challenge } = claimed;
+        const { challengerGameId, challengedGameId, seriesBusy, others, ...challenge } = claimed;
+        dropped = others ?? [];
         if (challenge.seriesId !== seriesId || (version !== undefined && challenge.version !== version)) {
           throw changedError();
         }
@@ -749,19 +835,9 @@ export class ChallengeService {
       throw error;
     }
 
-    this.fastify.liveGames.watchDeadline(game.id, game.deadlineAt);
-    // All at once: publish() delivers locally in call order (each player
-    // gets match_created before active_game), and the Redis PUBLISHes go out
-    // back to back instead of one round trip each
-    await Promise.all(
-      [game.whiteId, game.blackId].flatMap((playerId) => [
-        this.hub.publish(topics.notifications(playerId), {
-          type: "match_created",
-          data: matchFoundData(game, playerId),
-        }),
-        this.hub.publish(topics.notifications(playerId), activeGameMessage(game.id)),
-      ])
-    );
+    // Each player gets match_created before active_game (publish() delivers
+    // in call order)
+    await announceGameStart(this.fastify, { games: [game], messages: matchCreatedMessages(game), dropped });
     // The challenger may have switched tabs while waiting for the answer
     const data = matchFoundData(game, challengerId);
     void this.fastify.push.notify(

@@ -29,7 +29,7 @@ function jwt(privateKey: KeyObject, header: object, payload: object): string {
 
 function sessionPayload(sub: string, extra: object = {}) {
   const now = Math.floor(Date.now() / 1000);
-  return { sub, iat: now - 5, nbf: now - 5, exp: now + 60, ...extra };
+  return { sub, iat: now - 5, nbf: now - 5, exp: now + 60, azp: "https://gambitio.test", ...extra };
 }
 
 const allowAll = () => true;
@@ -231,10 +231,8 @@ describe("clerkAuthProvider", () => {
       },
     });
     assert.equal(await auth.verifyToken(jwt(privateKey, { kid: "any" }, sessionPayload("user_1"))), "user_1");
-    assert.equal(
-      await auth.verifyToken(jwt(privateKey, {}, sessionPayload("user_1", { azp: "https://gambitio.test" }))),
-      "user_1"
-    );
+    // No authorized party at all is rejected too, as Clerk's authorizedParties does
+    assert.equal(await auth.verifyToken(jwt(privateKey, {}, sessionPayload("user_1", { azp: undefined }))), null);
     assert.equal(
       await auth.verifyToken(jwt(privateKey, {}, sessionPayload("user_1", { azp: "https://evil.test" }))),
       null

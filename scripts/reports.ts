@@ -30,7 +30,7 @@ if (!connectionString) {
 }
 
 const LIST_SQL = (where: string, order: string) => `
-  SELECT r.id, r."createdAt", r.status, r.reason, r."gameId", r."studyRoomId", r.details,
+  SELECT r.id, r."createdAt", r.status, r.reason, r."gameId", r."studyRoomId", r."spectatorGameId", r.details,
          reporter.username AS reporter, reported.username AS reported, r."reportedId",
          (SELECT COUNT(*) FROM user_reports o WHERE o."reportedId" = r."reportedId") AS "reportsOfPlayer",
          (SELECT COUNT(DISTINCT o."reporterId") FROM user_reports o WHERE o."reportedId" = r."reportedId")
@@ -57,6 +57,7 @@ try {
           `  by ${safe(r.reporter)}` +
           (r.gameId ? `  game ${r.gameId}` : "") +
           (r.studyRoomId ? `  study room ${r.studyRoomId}` : "") +
+          (r.spectatorGameId ? `  spectator chat of game ${r.spectatorGameId}` : "") +
           (r.details ? `\n      ${safe(r.details.replace(/\s+/g, " "))}` : "")
       );
     }
@@ -89,12 +90,25 @@ try {
         if (r.gameId) console.log(`  Game ${r.gameId}`);
         // Migration 041; a room that was deleted since is no longer named
         if (r.studyRoomId) console.log(`  Study room ${r.studyRoomId}`);
+        // Migration 045
+        if (r.spectatorGameId) console.log(`  Spectator chat of game ${r.spectatorGameId}`);
         if (r.details) console.log(`  Details: ${safeBlock(r.details, "           ")}`);
-        const chat: { userId: number; text: string; at: string }[] = r.chatExcerpt ?? [];
+        const chat: { userId: number; username?: string; text: string; at: string }[] = r.chatExcerpt ?? [];
         if (chat.length > 0) {
-          console.log(r.studyRoomId ? "  Chat in that study room:" : "  Chat in that game:");
+          console.log(
+            r.studyRoomId
+              ? "  Chat in that study room:"
+              : r.spectatorGameId
+                ? "  Spectator chat in that game:"
+                : "  Chat in that game:"
+          );
           for (const m of chat) {
-            const who = m.userId === r.reportedId ? r.reported : m.userId === r.reporterId ? r.reporter : m.userId;
+            const who =
+              m.userId === r.reportedId
+                ? r.reported
+                : m.userId === r.reporterId
+                  ? r.reporter
+                  : (m.username ?? m.userId);
             console.log(`    [${safe(m.at)}] ${safe(who)}: ${safe(m.text)}`);
           }
         }

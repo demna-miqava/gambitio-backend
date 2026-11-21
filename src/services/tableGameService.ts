@@ -87,10 +87,16 @@ export class TableGameService {
     const ratingColumn = `"${getTimeControl(time)}Rating"`;
 
     const { game, request } = await this.fastify.pg.transact(async (tx) => {
+      // The recorder's row and the friend's, lowest id first as game
+      // creation locks players (gameService), so two saves naming each
+      // other, or a save and a game between the two starting, can't each
+      // hold one row while waiting for the other. Saves by one recorder
+      // take turns on it, so a save with the same id that committed
+      // meanwhile is seen below
+      await tx.query(`SELECT 1 FROM users WHERE id = ANY($1::int[]) ORDER BY id FOR NO KEY UPDATE`, [
+        friendId === null ? [userId] : [userId, friendId],
+      ]);
       if (clientId !== undefined) {
-        // Saves by one recorder take this lock one at a time, so a save
-        // with the same id that committed meanwhile is seen here
-        await tx.query(`SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, [userId]);
         const saved = await gameRepository.findTableGameByClientId(tx, userId, clientId);
         if (saved) return { game: saved, request: null };
       }

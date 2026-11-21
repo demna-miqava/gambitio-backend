@@ -327,5 +327,110 @@ describe("blocking and reporting", { skip }, () => {
       );
       assert.equal(await count("user_reports"), 20);
     });
+
+    test("two reports of the same player sent at once file one", async () => {
+      // Connections open first, so the four really run side by side
+      await Promise.all([1, 2, 3, 4, 5, 6, 7, 8].map(() => app.pg.query(`SELECT pg_sleep(0.02)`)));
+      // Through the service: the route's own per-minute limit isn't what's tested
+      const sent = await Promise.allSettled(
+        [1, 2, 3, 4].map(() => app.moderation.report(alice.id, { reportedId: bob.id, reason: "cheating" }))
+      );
+      assert.equal(sent.filter((r) => r.status === "fulfilled").length, 1);
+      for (const r of sent) if (r.status === "rejected") assert.equal(r.reason.code, "ALREADY_REPORTED");
+      assert.equal(await count("user_reports"), 1);
+    });
+  });
+
+  /**
+   * Friend requests racing a block or an account deletion. A transaction
+   * holding a lock stands in the way of both, so they line up in a known
+   * order; the outcome must be the one where the block (or deletion) came
+   * second and cleaned up after the other.
+   */
+  describe("races with friend requests", () => {
+    /** Runs `work` in a transaction and keeps it open until release() (which commits, or rolls back). */
+    const hold = async (work: (tx: { query: FastifyInstance["pg"]["query"] }) => Promise<unknown>) => {
+      let release!: (commit: boolean) => void;
+      const released = new Promise<boolean>((resolve) => (release = resolve));
+      let held!: () => void;
+      const isHeld = new Promise<void>((resolve) => (held = resolve));
+      const done = app.pg
+        .transact(async (tx) => {
+          await work(tx as any);
+          held();
+          if (!(await released)) throw new Error("rolled back");
+        })
+        .catch(() => {});
+      await isHeld;
+      return async (commit = false) => {
+        release(commit);
+        await done;
+      };
+    };
+    /** Resolves once `n` statements in this database are waiting for a lock. */
+    const lockWaiters = async (n: number) => {
+      for (let i = 0; i < 300; i++) {
+        const { rows } = await app.pg.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM pg_stat_activity
+           WHERE datname = current_database() AND wait_event_type = 'Lock'`
+        );
+        if (rows[0]!.n >= n) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error(`Never saw ${n} statements waiting for a lock`);
+    };
+    const sendRequest = (from: { clerkId: string }, to: { id: number }) =>
+      request("POST", "/api/friend-requests", from.clerkId, { receiverId: to.id });
+
+    test("a block while a request is being accepted still ends the friendship", async () => {
+      const id = (await sendRequest(alice, bob)).json().data.id;
+      const release = await hold((tx) => tx.query(`SELECT 1 FROM friend_requests WHERE id = $1 FOR UPDATE`, [id]));
+      const accepting = request("POST", `/api/friend-requests/${id}/accept`, bob.clerkId);
+      await lockWaiters(1);
+      const blocking = block(alice, bob);
+      await lockWaiters(2);
+      await release();
+
+      assert.equal((await accepting).statusCode, 200);
+      assert.equal((await blocking).statusCode, 204);
+      assert.equal(await count("friends"), 0);
+      assert.equal(await count("user_blocks"), 1);
+    });
+
+    test("a request sent as a block comes in isn't left between the two", async () => {
+      // A request the other way, not yet committed: Alice's insert waits on it
+      const release = await hold((tx) =>
+        tx.query(
+          `INSERT INTO friend_requests ("senderId", "receiverId", "senderUsername", "receiverUsername")
+           VALUES ($1, $2, 'bobby', 'alice')`,
+          [bob.id, alice.id]
+        )
+      );
+      const sending = sendRequest(alice, bob);
+      await lockWaiters(1);
+      const blocking = block(bob, alice);
+      await lockWaiters(2);
+      await release();
+
+      assert.equal((await sending).statusCode, 201);
+      assert.equal((await blocking).statusCode, 204);
+      assert.equal(await count("friend_requests"), 0);
+    });
+
+    test("a request to an account deleted while it was being accepted makes no friendship", async () => {
+      const id = (await sendRequest(alice, bob)).json().data.id;
+      // What account deletion does to the row, in its last transaction
+      const release = await hold(async (tx) => {
+        await tx.query(`SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, [alice.id]);
+        await tx.query(`UPDATE users SET "clerkId" = NULL WHERE id = $1`, [alice.id]);
+      });
+      const accepting = request("POST", `/api/friend-requests/${id}/accept`, bob.clerkId);
+      await lockWaiters(1);
+      await release(true);
+
+      assert.equal((await accepting).statusCode, 404);
+      assert.equal(await count("friends"), 0);
+      assert.equal(await count("friend_requests"), 0);
+    });
   });
 });

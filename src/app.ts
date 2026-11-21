@@ -1,4 +1,4 @@
-import { isIPv4, isIPv6 } from "node:net";
+import { isIP, isIPv4, isIPv6 } from "node:net";
 import fastify, { type FastifyError, type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
@@ -16,6 +16,7 @@ import { ChallengeService } from "./services/challengeService.js";
 import { SeriesService } from "./services/seriesService.js";
 import { StudyService } from "./services/studyService.js";
 import { GameChatService } from "./services/gameChatService.js";
+import { SpectatorChatService } from "./services/spectatorChatService.js";
 import { TableGameService } from "./services/tableGameService.js";
 import { ModerationService } from "./services/moderationService.js";
 import { TournamentService } from "./services/tournamentService.js";
@@ -38,6 +39,9 @@ import { seriesRoutes } from "./routes/series.js";
 import { repertoireRoutes } from "./routes/repertoire.js";
 import { studyRoutes } from "./routes/study.js";
 import { endgameRoutes } from "./routes/endgames.js";
+import { coordinateRoutes } from "./routes/coordinates.js";
+import { puzzleDuelRoutes } from "./routes/puzzleDuels.js";
+import { PuzzleDuelService } from "./services/puzzleDuelService.js";
 import { pushRoutes } from "./routes/push.js";
 import { moderationRoutes } from "./routes/moderation.js";
 import { tournamentRoutes } from "./routes/tournaments.js";
@@ -54,6 +58,8 @@ declare module "fastify" {
     series: SeriesService;
     study: StudyService;
     gameChat: GameChatService;
+    spectatorChat: SpectatorChatService;
+    puzzleDuels: PuzzleDuelService;
     tableGames: TableGameService;
     moderation: ModerationService;
     tournaments: TournamentService;
@@ -76,11 +82,13 @@ export interface BuildOptions {
 /**
  * The caller's address. On Cloudflare every request reaches the backend
  * through the Worker, so req.ip is Cloudflare's; the edge puts the real one
- * in CF-Connecting-IP (and overwrites any value a client sends).
+ * in CF-Connecting-IP (and overwrites any value a client sends). Anything
+ * there that isn't an address (only possible without Cloudflare in front)
+ * is ignored rather than made into a rate-limit bucket of its own.
  */
 export function clientIp(req: { ip: string; headers: Record<string, string | string[] | undefined> }): string {
   const forwarded = req.headers["cf-connecting-ip"];
-  return typeof forwarded === "string" && forwarded ? forwarded : req.ip;
+  return typeof forwarded === "string" && isIP(forwarded) !== 0 ? forwarded : req.ip;
 }
 
 /**
@@ -178,17 +186,26 @@ export function rateLimitKey(req: {
  * behind one address use the site together. Counted per instance.
  */
 const PER_IP_PER_MINUTE = 3_000;
+/**
+ * Addresses counted one by one in a minute. Past this (a flood from very
+ * many addresses) the addresses not seen yet that minute share one count,
+ * so the limiter's memory stays bounded and the flood is still limited;
+ * the addresses already counted keep their own.
+ */
+const PER_IP_MAX_ADDRESSES = 100_000;
+const OVERFLOW_KEY = "overflow";
 
-function perIpLimiter() {
-  let windowStart = Date.now();
+export function perIpLimiter(now: () => number = Date.now) {
+  let windowStart = now();
   let counts = new Map<string, number>();
   return (ip: string): boolean => {
-    const now = Date.now();
-    if (now - windowStart >= 60_000) {
-      windowStart = now;
+    const at = now();
+    if (at - windowStart >= 60_000) {
+      windowStart = at;
       counts = new Map();
     }
-    const key = rateLimitAddress(ip);
+    const address = rateLimitAddress(ip);
+    const key = counts.has(address) || counts.size < PER_IP_MAX_ADDRESSES ? address : OVERFLOW_KEY;
     const n = (counts.get(key) ?? 0) + 1;
     counts.set(key, n);
     return n <= PER_IP_PER_MINUTE;
@@ -288,6 +305,12 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
     timeWindow: "1 minute",
     hook: "preHandler",
     keyGenerator: rateLimitKey,
+    // With the code every other 429 here has (the error handler passes it on)
+    errorResponseBuilder: (_req, context) =>
+      Object.assign(new Error(`Rate limit exceeded, retry in ${context.after}`), {
+        statusCode: context.statusCode,
+        code: "RATE_LIMITED",
+      }),
   });
   const ipAllowed = perIpLimiter();
   app.addHook("onRequest", async (req, reply) => {
@@ -301,18 +324,27 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   app.addHook("onSend", async (_request, reply) => {
     reply.header("x-content-type-options", "nosniff");
   });
+  const hub = new RealtimeHub(app.redis, app.log);
+  app.decorate("hub", hub);
+  // preClose hooks run in the order they are added, so this runs before
+  // @fastify/websocket's (which closes every socket without a code) and
+  // long before the onClose hook below: the sockets close with 1001 and,
+  // the hub knowing it is stopping, without their onDetach side effects
+  // (a shutdown isn't the users leaving)
+  app.addHook("preClose", async () => {
+    hub.closeForShutdown();
+  });
   await app.register(websocket, {
     options: { maxPayload: 16 * 1024, handleProtocols: selectWsProtocol },
   });
-
-  const hub = new RealtimeHub(app.redis, app.log);
-  app.decorate("hub", hub);
   app.decorate("liveGames", new LiveGameService(app, hub));
   app.decorate("matchmaking", new MatchmakingService(app, hub));
   app.decorate("challenges", new ChallengeService(app, hub));
   app.decorate("series", new SeriesService(app, hub));
   app.decorate("study", new StudyService(app, hub));
   app.decorate("gameChat", new GameChatService(app, hub));
+  app.decorate("spectatorChat", new SpectatorChatService(app, hub));
+  app.decorate("puzzleDuels", new PuzzleDuelService(app, hub));
   app.decorate("tableGames", new TableGameService(app, hub));
   app.decorate("moderation", new ModerationService(app, hub));
   app.decorate("tournaments", new TournamentService(app, hub));
@@ -337,7 +369,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   });
   // Hooks run in reverse order, so this runs before Redis/Postgres close
   app.addHook("onClose", async () => {
-    app.jobs.stop();
+    await app.jobs.stop();
     app.tournaments.stop();
     await hub.stop();
   });
@@ -356,6 +388,8 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   await app.register(repertoireRoutes, { prefix: "/api" });
   await app.register(studyRoutes, { prefix: "/api" });
   await app.register(endgameRoutes, { prefix: "/api" });
+  await app.register(coordinateRoutes, { prefix: "/api" });
+  await app.register(puzzleDuelRoutes, { prefix: "/api" });
   await app.register(pushRoutes, { prefix: "/api" });
   await app.register(moderationRoutes, { prefix: "/api" });
   await app.register(tournamentRoutes, { prefix: "/api" });

@@ -1,6 +1,7 @@
 import { Chess } from "chess.js";
 import type { PlayerColor } from "../models/common.js";
 import { AppError } from "../errors/AppError.js";
+import { readPgn } from "./botGame.js";
 
 /** Longest line a repertoire may hold, in half-moves. */
 export const MAX_LINE_PLIES = 60;
@@ -106,42 +107,26 @@ export function buildBook(lines: BookLine[]): Book {
   return builder.book;
 }
 
-/** Result tokens that end PGN movetext. */
-const PGN_RESULT = /^(1-0|0-1|1\/2-1\/2|\*)$/;
-
 /**
  * The moves of a stored game, in SAN, read from its PGN text without
- * replaying it (checkGame plays them, once). Stored PGNs are written by the
- * server (appendToPgn, chess.js's pgn()): tag lines, then "1. e4 e5 2. Nf3 *".
- * Comments, variations, annotations and NAGs are skipped as well, in case a
- * PGN has them. A game set up from another position has no moves here (the
- * repertoire starts from the standard one). At most `max` moves are read:
- * checkGame never looks further than a line can be long.
+ * replaying it (checkGame plays them, once), by the reader bot games are
+ * checked with (readPgn): comments, variations, NAGs and move numbers are
+ * skipped, and annotations ("!?") taken off the moves. Stored PGNs are
+ * written by the server (appendToPgn, chess.js's pgn()), so text the reader
+ * refuses never comes from one: it has no moves here. Nor has a game set up
+ * from another position (the repertoire starts from the standard one). At
+ * most `max` moves are returned: checkGame never looks further than a line
+ * can be long.
  */
 export function pgnSans(pgn: string, max = Infinity): string[] {
-  // The tag pairs, one per line
-  const tags = pgn.match(/^\s*\[.*\]\s*$/gm) ?? [];
-  if (tags.some((tag) => /^\s*\[\s*(FEN|SetUp)\s/.test(tag))) return [];
-  let text = pgn
-    .replace(/^\s*\[.*\]\s*$/gm, " ")
-    .replace(/\{[^}]*\}/g, " ") // {comments}
-    .replace(/;[^\n]*/g, " "); // comments to the end of the line
-  // (Variations), which can be nested: innermost first
-  for (let previous = ""; previous !== text; ) {
-    previous = text;
-    text = text.replace(/\([^()]*\)/g, " ");
+  let read: ReturnType<typeof readPgn>;
+  try {
+    read = readPgn(pgn);
+  } catch {
+    return [];
   }
-
-  const sans: string[] = [];
-  for (const token of text.split(/\s+/)) {
-    if (sans.length >= max) break;
-    // A move number ("12." or "12...") may be written against its move ("12.e4")
-    const move = token.replace(/^\d+\.+/, "").replace(/[!?]+$/, "");
-    if (!move || move.startsWith("$")) continue;
-    if (PGN_RESULT.test(move)) break;
-    sans.push(move);
-  }
-  return sans;
+  if (read.headers.has("FEN") || read.headers.has("SetUp")) return [];
+  return read.sans.slice(0, max).map((san) => san.replace(/[!?]+$/, ""));
 }
 
 export type GameCheckStatus =

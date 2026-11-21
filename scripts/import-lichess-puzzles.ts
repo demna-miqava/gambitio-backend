@@ -45,6 +45,9 @@ const BATCH_SIZE = 1000;
 export async function refreshThemeCounts(client: pg.Client | pg.PoolClient): Promise<void> {
   await client.query("BEGIN");
   try {
+    // A full pass over a few million rows can outlast the app's statement
+    // timeout, which may be the role's default (ensureSessionTimeouts)
+    await client.query("SET LOCAL statement_timeout = 0");
     await client.query("DELETE FROM puzzle_theme_counts");
     await client.query(
       `INSERT INTO puzzle_theme_counts (theme, count)
@@ -62,14 +65,22 @@ async function main() {
   const limitIndex = rest.indexOf("--limit");
   const limit = limitIndex >= 0 ? Number(rest[limitIndex + 1]) : Infinity;
   const connectionString = process.env.POSTGRES_CONNECTION_STRING;
-  if (!file || !connectionString) {
+  // "--limit" with no number, or not a whole one, would otherwise import everything
+  if (!file || !connectionString || !(limit === Infinity || (Number.isInteger(limit) && limit > 0))) {
     console.error("Usage: npm run import-puzzles -- <lichess_db_puzzle.csv> [--limit N]");
     process.exit(1);
   }
 
   const client = new pg.Client({ connectionString });
   await client.connect();
+  try {
+    await importFile(client, file, limit);
+  } finally {
+    await client.end();
+  }
+}
 
+async function importFile(client: pg.Client, file: string, limit: number) {
   let batch: [string, string, string, number, string[]][] = [];
   let imported = 0;
 
@@ -106,7 +117,6 @@ async function main() {
   await flush();
   console.log(`\nDone: ${imported} puzzles. Counting themes...`);
   await refreshThemeCounts(client);
-  await client.end();
   console.log("Theme counts updated");
 }
 

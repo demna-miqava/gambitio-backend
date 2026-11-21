@@ -22,6 +22,8 @@ import { withinLimit } from "../utils/rateLimit.js";
 import { newShareToken } from "../utils/shareToken.js";
 import { openingAllowsRating, openingPosition, openingSummary } from "../game/openings.js";
 import { activeGameMessage, topics } from "../realtime/hub.js";
+import type { DroppedChallenge } from "./challengeService.js";
+import { hasHistoryFilters, type GameHistoryFilters } from "../repositories/gameHistory.js";
 
 /**
  * Bot games one user can save a day. A bot game takes a few minutes, so 200
@@ -131,6 +133,12 @@ export class AlreadyInGameError extends AppError {
   }
 }
 
+export const notAPlayer = () => new AppError("You are not a player in this game", "NOT_A_PLAYER", 403);
+// A tournament pairs its own games and scores them as played: no rematch,
+// no takeback, no abort, no time given
+export const tournamentGame = (what: string) =>
+  new AppError(`${what} isn't available in a tournament game`, "TOURNAMENT_GAME", 409);
+
 /** The message a player receives when a game they're in is created. */
 export function matchFoundData(game: LiveGame, userId: number) {
   const color = colorOf(game, userId)!;
@@ -199,6 +207,8 @@ export class GameService {
     const token = await gameRepository.share(this.fastify.pg, gameId, userId, newShareToken());
     if (token) return token;
     const game = await this.requireOwnGame(gameId, userId);
+    // Table games show in history and review only (migration 040)
+    if (game.tableGame) throw new AppError("A game played at a board can't be shared", "TABLE_GAME", 409);
     throw game.status === "finished"
       ? new AppError("An aborted game can't be shared", "GAME_ABORTED", 409)
       : new AppError("The game can be shared once it's over", "GAME_NOT_FINISHED", 409);
@@ -223,19 +233,24 @@ export class GameService {
   async getGamesByUserId(
     userId: number,
     page: number = 1,
-    limit: number = 10
+    limit: number = 10,
+    filters: GameHistoryFilters = {}
   ): Promise<PaginatedGamesResponse> {
     const normalizedPage = Math.max(1, page);
     const normalizedLimit = Math.min(Math.max(1, limit), 100);
     const offset = (normalizedPage - 1) * normalizedLimit;
-    const games = await gameRepository.findPageByUserId(this.fastify.pg, userId, normalizedLimit, offset);
+    const filtered = hasHistoryFilters(filters);
+    const games = filtered
+      ? await gameRepository.findFilteredPageByUserId(this.fastify.pg, userId, filters, normalizedLimit, offset)
+      : await gameRepository.findPageByUserId(this.fastify.pg, userId, normalizedLimit, offset);
     // A short first page is the whole history; otherwise the count is the
     // user's "listedGames" counter (migration 030) plus their game in
-    // progress, two index lookups however long the history is
-    const total =
-      normalizedPage === 1 && games.length < normalizedLimit
-        ? games.length
-        : await gameRepository.countByUserId(this.fastify.pg, userId);
+    // progress, two index lookups however long the history is. Filtered,
+    // it is counted (index-only, see countFilteredByUserId)
+    let total: number;
+    if (normalizedPage === 1 && games.length < normalizedLimit) total = games.length;
+    else if (filtered) total = await gameRepository.countFilteredByUserId(this.fastify.pg, userId, filters);
+    else total = await gameRepository.countByUserId(this.fastify.pg, userId);
     return {
       data: games.map(toGameListItem),
       pagination: {
@@ -261,13 +276,18 @@ export class GameService {
     const bot = getBotById(input.botId);
     if (!bot) throw new AppError("Unknown bot", "UNKNOWN_BOT", 400);
     // Counted before the replay, so the cap also bounds the work spent on
-    // uploads that turn out to be invalid
+    // uploads that turn out to be invalid. If Redis can't be reached the
+    // game is saved anyway: the cap only stops scripts, and a finished game
+    // the player just played isn't sent again
     const allowed = await withinLimit(
       this.fastify.redis,
       `botgames:saved:${userId}`,
       BOT_GAMES_PER_DAY,
       24 * 60 * 60
-    );
+    ).catch((err) => {
+      this.fastify.log.warn({ err }, "Bot game save limit unavailable");
+      return true;
+    });
     if (!allowed) {
       throw new AppError(
         "You've saved a lot of bot games today. Try again tomorrow.",
@@ -477,6 +497,94 @@ export async function createGame(
   });
 }
 
+/*
+ * Starting a game. Every path that starts one (matchmaking, an accepted
+ * challenge, a rematch, a timed match's next game, a tournament pairing)
+ * takes its locks in this order, so any two of them racing for the same
+ * player wait for each other instead of deadlocking:
+ *
+ *   1. the players' matchmaking rows (dequeuePlayers, or locked first)
+ *   2. a series row, if the game belongs to one
+ *   3. the players' rows, in id order (lockPlayers, createGame)
+ *   4. challenge rows (dropChallengesOf)
+ *
+ * after whatever row the path itself starts from (the finished game of a
+ * rematch or timed match, a tournament and its players' rows). Matchmaking
+ * and accepting a challenge fold steps 1 and 4 into statements of their own
+ * (to save round trips), in this same order. Once the transaction commits,
+ * announceGameStart arms the deadlines and tells everyone concerned.
+ */
+
+/**
+ * Takes players about to start a game out of the matchmaking queue, so a
+ * search they left running doesn't pair them again. Must come before
+ * anything else the game locks (a series, the players' rows): matchmaking
+ * locks queue rows first.
+ */
+export async function dequeuePlayers(tx: Queryable, playerIds: number[]): Promise<void> {
+  await tx.query(`DELETE FROM matchmaking WHERE "userId" = ANY($1)`, [playerIds]);
+}
+
+/**
+ * Deletes every open challenge of players who are now in a game, and returns
+ * them for announceGameStart (the other side hears each is gone). Must come
+ * after the players' rows are locked (createGame, lockPlayers), as accepting
+ * a challenge takes them.
+ */
+export async function dropChallengesOf(tx: Queryable, playerIds: number[]): Promise<DroppedChallenge[]> {
+  const { rows } = await tx.query<DroppedChallenge>(
+    `DELETE FROM challenges WHERE "challengerId" = ANY($1) OR "challengedId" = ANY($1)
+     RETURNING "challengerId", "challengedId"`,
+    [playerIds]
+  );
+  return rows;
+}
+
+/** What games that just started leave to do after the commit (see announceGameStart). */
+export interface GameStart {
+  games: LiveGame[];
+  /** The messages that take the players to their game */
+  messages: { topic: string; message: object }[];
+  /** The players' open challenges, deleted as the games started (dropChallengesOf) */
+  dropped: readonly DroppedChallenge[];
+}
+
+/**
+ * The messages that open a new game wherever its players are: match_created
+ * then active_game on each one's notifications topic (an accepted challenge,
+ * a tournament pairing).
+ */
+export function matchCreatedMessages(game: LiveGame): GameStart["messages"] {
+  return [game.whiteId, game.blackId].flatMap((playerId) => [
+    { topic: topics.notifications(playerId), message: { type: "match_created", data: matchFoundData(game, playerId) } },
+    { topic: topics.notifications(playerId), message: activeGameMessage(game.id) },
+  ]);
+}
+
+/**
+ * After the transaction that started games has committed: arms their
+ * deadline timers, sends the messages and tells the other side of each
+ * dropped challenge. Never throws: the games exist, so the caller mustn't
+ * report a failure. (A rematch, started inside LiveGameService.run, does
+ * the same through its effects.)
+ */
+export async function announceGameStart(fastify: FastifyInstance, { games, messages, dropped }: GameStart) {
+  for (const game of games) fastify.liveGames.watchDeadline(game.id, game.deadlineAt);
+  // All at once: publish() delivers locally in call order, and the Redis
+  // PUBLISHes go out back to back instead of one round trip each
+  await Promise.all(
+    messages.map(({ topic, message }) =>
+      fastify.hub
+        .publish(topic, message)
+        .catch((err) => fastify.log.error({ err, topic }, "Failed to announce a new game"))
+    )
+  );
+  await fastify.challenges.notifyDropped(
+    dropped,
+    games.flatMap((game) => [game.whiteId, game.blackId])
+  );
+}
+
 /**
  * Ends a game that the caller has locked with gameRepository.lockById.
  * Returns null if the game was already finished, so ending twice (both
@@ -561,7 +669,10 @@ export async function finishGame(
     whiteRatingChange: ratingChanges?.whiteRatingChange ?? 0,
     blackRatingChange: ratingChanges?.blackRatingChange ?? 0,
   });
-  if (!finished) return null;
+  // The game was in progress as read, so only a caller that didn't lock it
+  // gets here: fail, rolling the players' rows back, rather than commit
+  // their new ratings for a game someone else ended
+  if (!finished) throw new Error(`Game ${game.id} was ended concurrently`);
 
   return { winnerId, ratingChanges };
 }

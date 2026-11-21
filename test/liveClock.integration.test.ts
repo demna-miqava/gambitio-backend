@@ -332,6 +332,64 @@ describe("live clocks, pauses and offer limits", { skip }, () => {
     });
   });
 
+  test("a move that waited before being stored charges the mover to arrival and starts the opponent's clock when stored", async () => {
+    const { game, white } = await startedGame(["whitey", "blacky"]);
+    await age(game.id, 5_000);
+    const before = await row(game.id);
+    // Arrived 2 seconds ago (it queued behind the mover's other messages)
+    const receivedAt = Date.now() - 2_000;
+    const storedFrom = Date.now();
+    await app.liveGames.move(game.id, white.id, { from: "g1", to: "f3" }, { receivedAt });
+    const after = await row(game.id);
+    assert.equal(after.numMoves, 3);
+    assert.equal(after.whiteTimeLeftMs, before.whiteTimeLeftMs - (receivedAt - before.lastMoveAt.getTime()));
+    assert.ok(after.lastMoveAt.getTime() >= storedFrom, "black's clock didn't start before the move was stored");
+    assert.equal(after.deadlineAt.getTime(), after.lastMoveAt.getTime() + after.blackTimeLeftMs + 1_000);
+  });
+
+  test("a rematch offer goes once its sender has left the game", async () => {
+    const { game, w, b } = await startedGame(["whitey", "blacky"]);
+    b.send({ type: "resign" });
+    await w.next("game_ended");
+    await b.next("game_ended");
+    w.send({ type: "rematch_request" });
+    await b.next("rematch_request");
+    await w.close();
+    await sleep(100);
+
+    b.send({ type: "rematch_response", data: { accepted: true } });
+    const canceled = await b.next("rematch_canceled");
+    assert.equal(canceled.data.reason, "opponent_left");
+    const { rows } = await app.pg.query(`SELECT count(*)::int AS n FROM games`);
+    assert.equal(rows[0].n, 1, "no game started");
+    assert.equal((await app.pg.query(`SELECT "rematchRequestedBy" FROM games WHERE id = $1`, [game.id])).rows[0]
+      .rematchRequestedBy, null);
+  });
+
+  test("a game that ended on another instance is forgotten here", async () => {
+    const { game } = await startedGame(["whitey", "blacky"]);
+    assert.deepEqual(app.liveGames.playedGameIds, [game.id]);
+    await app.pg.query(`UPDATE games SET status = 'finished', result = 'draw', "endReason" = 'draw_agreement',
+      "deadlineAt" = NULL WHERE id = $1`, [game.id]);
+    await app.jobs.runClockSweep();
+    assert.deepEqual(app.liveGames.playedGameIds, []);
+  });
+
+  test("a rated game that was aborted reports no rating changes on reconnect", async () => {
+    const white = await createUser(app, "whitey");
+    const black = await createUser(app, "blacky");
+    const game = await newGame(white.id, black.id);
+    const w = await open(`/game/${game.id}`, white.clerkId);
+    await w.next("initial_game_state");
+    w.send({ type: "abort" });
+    await w.next("game_ended");
+    const again = await open(`/game/${game.id}`, white.clerkId);
+    const state = await again.next("initial_game_state");
+    assert.equal(state.data.result, "aborted");
+    assert.equal(state.data.rated, true);
+    assert.equal(state.data.ratingChanges, undefined);
+  });
+
   test("the player sockets of a game are tracked until the game ends", async () => {
     const { game, w, b } = await startedGame(["whitey", "blacky"]);
     assert.deepEqual(app.liveGames.playedGameIds, [game.id]);

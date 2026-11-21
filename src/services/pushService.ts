@@ -162,11 +162,15 @@ export class PushService {
     if (!isPushServiceEndpoint(subscription.endpoint)) {
       throw new AppError("This browser's push service isn't supported", "PUSH_ENDPOINT_NOT_ALLOWED", 400);
     }
+    // Saved again (every sign-in does): failures from before start over, and
+    // a new id puts it last in line for the eviction below, which keeps the
+    // browsers saved most recently rather than those added most recently
     await this.fastify.pg.query(
       `INSERT INTO push_subscriptions ("userId", endpoint, p256dh, auth)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (endpoint) DO UPDATE SET
-         "userId" = EXCLUDED."userId", p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth`,
+         "userId" = EXCLUDED."userId", p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, failures = 0,
+         id = nextval(pg_get_serial_sequence('push_subscriptions', 'id'))`,
       [userId, subscription.endpoint, subscription.p256dh, subscription.auth]
     );
     await this.fastify.pg.query(

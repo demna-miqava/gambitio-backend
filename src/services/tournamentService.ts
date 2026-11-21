@@ -16,9 +16,19 @@ import { pairKey, tournamentRepository } from "../repositories/tournamentReposit
 import { lastPairingMs, outcomeFor, pairArena, scoreGame } from "../game/arena.js";
 import type { GameResult } from "../game/engine.js";
 import { chatLength, stripInvisibleText } from "../game/chatText.js";
-import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
-import { createGame, findActiveGames, lockPlayers, matchFoundData } from "./gameService.js";
+import { topics, type RealtimeHub } from "../realtime/hub.js";
+import {
+  announceGameStart,
+  createGame,
+  dequeuePlayers,
+  dropChallengesOf,
+  findActiveGames,
+  lockPlayers,
+  matchCreatedMessages,
+} from "./gameService.js";
+import { KeyedThrottle } from "../utils/keyedThrottle.js";
 import { withinLimit } from "../utils/rateLimit.js";
+import type { DroppedChallenge } from "./challengeService.js";
 
 /** What a tournament may be set up with (the create form offers a subset). */
 export const TOURNAMENT_LIMITS = {
@@ -56,6 +66,13 @@ const LIVE_GAMES_SHOWN = 10;
  * One per creator can be open, so this is far above what is ever on.
  */
 const OPEN_READ_LIMIT = 500;
+/**
+ * How often an instance reads the open tournaments again, for ones another
+ * instance created (and so only that one watches): should that instance go
+ * away, one of them waits at most this long to start, be paired or close.
+ * Kept well over Neon's 5-minute suspend delay, as TIMED_MATCH_REFRESH_MS.
+ */
+export const OPEN_REFRESH_MS = 10 * 60_000;
 /** Players one pairing pass reads; more than that wait for the next pass */
 const WAITING_PER_PASS = 500;
 /** The lobby gets the standings at most once per this long (see noteChanged). */
@@ -174,10 +191,15 @@ export async function recordTournamentResult(
 export class TournamentService {
   /** Open tournaments this instance knows of: what `needsTick` reads, so an idle server asks the database nothing */
   private watched = new Map<number, { status: TournamentStatus; startsAt: number }>();
-  /** Per tournament, the standings throttle window (see STANDINGS_EVERY_MS) */
-  private windows = new Map<number, { timer: NodeJS.Timeout; pending: boolean; changed: Set<number> }>();
+  /** Per tournament, the standings throttle, noting the players whose line changed (see STANDINGS_EVERY_MS) */
+  private standingsThrottle = new KeyedThrottle<number, number>(STANDINGS_EVERY_MS, (tournamentId, changed) => {
+    void this.publishStandings(tournamentId, changed);
+  });
   /** Set while the startup read of the open tournaments hasn't succeeded (see loadOpen) */
   private openUnread = false;
+  /** When the open tournaments were last read (ms), and the read in flight */
+  private openLoadedAt = 0;
+  private openLoading: Promise<void> | null = null;
 
   constructor(
     private fastify: FastifyInstance,
@@ -200,23 +222,43 @@ export class TournamentService {
    * otherwise this instance would know of no tournament, and one whose
    * players aren't here yet would start late or not at all.
    */
-  async loadOpen(): Promise<void> {
-    try {
-      const open = await tournamentRepository.findOpen(this.fastify.pg, OPEN_READ_LIMIT);
-      this.openUnread = false;
-      for (const tournament of open) this.watch(tournament);
-    } catch (err) {
-      this.openUnread = true;
-      throw err;
-    }
+  loadOpen(): Promise<void> {
+    this.openLoading ??= (async () => {
+      try {
+        const open = await tournamentRepository.findOpen(this.fastify.pg, OPEN_READ_LIMIT);
+        this.openUnread = false;
+        this.openLoadedAt = Date.now();
+        for (const tournament of open) this.watch(tournament);
+      } catch (err) {
+        this.openUnread = true;
+        throw err;
+      } finally {
+        this.openLoading = null;
+      }
+    })();
+    return this.openLoading;
+  }
+
+  /** loadOpen again, for tournaments another instance created (see OPEN_REFRESH_MS). Never throws. */
+  refreshOpen(): Promise<void> {
+    return this.loadOpen().catch((err) => this.fastify.log.error({ err }, "Reading the open tournaments failed"));
   }
 
   /**
    * Whether the tick has anything to do: a tournament this instance knows of
    * is running, or about to start (or the startup read of them failed and
    * is to be tried again).
+   *
+   * Asked by the tick's timer, so it also starts the read of the open
+   * tournaments every OPEN_REFRESH_MS: one another instance created is then
+   * ticked here too, should that instance go away. Only while this
+   * instance has sockets attached, so a server nobody uses lets the
+   * database sleep.
    */
   get needsTick(): boolean {
+    if (Date.now() - this.openLoadedAt >= OPEN_REFRESH_MS && this.hub.attachedCount > 0) {
+      void this.refreshOpen();
+    }
     if (this.openUnread) return true;
     const soon = Date.now() + TOURNAMENT_TICK_MS;
     for (const entry of this.watched.values()) {
@@ -226,8 +268,7 @@ export class TournamentService {
   }
 
   stop(): void {
-    for (const { timer } of this.windows.values()) clearTimeout(timer);
-    this.windows.clear();
+    this.standingsThrottle.stop();
   }
 
   /** Forgets every tournament this instance was watching (tests, after the tables are emptied). */
@@ -235,6 +276,8 @@ export class TournamentService {
     this.stop();
     this.watched.clear();
     this.openUnread = false;
+    // As if just read: a refresh started now could bring back what was cleared
+    this.openLoadedAt = Date.now();
   }
 
   /**
@@ -550,6 +593,11 @@ export class TournamentService {
    * deadlock with this.
    */
   async pair(tournamentId: number, now = new Date()): Promise<number[]> {
+    // Only players with the lobby (or a tournament game) open are paired:
+    // closing the tab is all it takes to stop getting games. Read before the
+    // transaction, so no row stays locked while Redis answers
+    const present = new Set(await this.hub.memberUserIds(tournamentPresenceKey(tournamentId)));
+    let dropped: DroppedChallenge[] = [];
     const games = await this.fastify.pg.transact(async (tx) => {
       const tournament = await tournamentRepository.tryLock(tx, tournamentId);
       if (!tournament || tournament.status !== "running") return [];
@@ -558,9 +606,6 @@ export class TournamentService {
 
       const waiting = await tournamentRepository.lockWaiting(tx, tournamentId, now, WAITING_PER_PASS);
       if (waiting.length < 2) return [];
-      // Only players with the lobby (or a tournament game) open are paired:
-      // closing the tab is all it takes to stop getting games
-      const present = new Set(await this.hub.memberUserIds(tournamentPresenceKey(tournamentId)));
       const here = waiting.filter((p) => present.has(p.userId));
       if (here.length < 2) return [];
 
@@ -587,8 +632,9 @@ export class TournamentService {
 
       const paired = pairs.flatMap((p) => [p.whiteId, p.blackId]);
       // Queue rows before the players' rows, the order matchmaking takes
-      // them in: these players are about to play
-      await tx.query(`DELETE FROM matchmaking WHERE "userId" = ANY($1)`, [paired]);
+      // them in. Only locked here: they are deleted below for the players
+      // who do get a game, so one whose opponent is dropped keeps searching
+      await tx.query(`SELECT 1 FROM matchmaking WHERE "userId" = ANY($1) ORDER BY id FOR UPDATE`, [paired]);
       const players = await lockPlayers(tx, paired);
       // Under the locks: whoever started another game since the first look
       const active = await findActiveGames(tx, paired);
@@ -598,9 +644,10 @@ export class TournamentService {
       );
       if (ready.length === 0) return [];
       const playing = ready.flatMap((p) => [p.whiteId, p.blackId]);
-      await tx.query(`DELETE FROM challenges WHERE "challengerId" = ANY($1) OR "challengedId" = ANY($1)`, [
-        playing,
-      ]);
+      // Their queue rows are locked already, so deleting them now keeps the
+      // order every game start takes (see dequeuePlayers)
+      await dequeuePlayers(tx, playing);
+      dropped = await dropChallengesOf(tx, playing);
 
       const created: LiveGame[] = [];
       for (const { whiteId, blackId } of ready) {
@@ -621,20 +668,9 @@ export class TournamentService {
       return created;
     });
 
-    for (const game of games) this.fastify.liveGames.watchDeadline(game.id, game.deadlineAt);
     // The same messages a challenge's game starts with: the app opens the
     // game wherever the player is
-    await Promise.all(
-      games.flatMap((game) =>
-        [game.whiteId, game.blackId].flatMap((playerId) => [
-          this.hub.publish(topics.notifications(playerId), {
-            type: "match_created",
-            data: matchFoundData(game, playerId),
-          }),
-          this.hub.publish(topics.notifications(playerId), activeGameMessage(game.id)),
-        ])
-      )
-    ).catch((err) => this.fastify.log.error({ err, tournamentId }, "Failed to announce tournament games"));
+    await announceGameStart(this.fastify, { games, messages: games.flatMap(matchCreatedMessages), dropped });
     if (games.length > 0) {
       // And to the lobby, which every paired player has open (it is what
       // made them count as here): a player whose notifications socket was
@@ -714,26 +750,7 @@ export class TournamentService {
    * down there asking every time anything changes.
    */
   noteChanged(tournamentId: number, userIds: readonly number[] = []): void {
-    const window = this.windows.get(tournamentId);
-    if (window) {
-      window.pending = true;
-      for (const userId of userIds) window.changed.add(userId);
-      return;
-    }
-    this.openWindow(tournamentId);
-    void this.publishStandings(tournamentId, userIds);
-  }
-
-  private openWindow(tournamentId: number): void {
-    const timer = setTimeout(() => {
-      const window = this.windows.get(tournamentId);
-      this.windows.delete(tournamentId);
-      if (!window?.pending) return;
-      this.openWindow(tournamentId);
-      void this.publishStandings(tournamentId, [...window.changed]);
-    }, STANDINGS_EVERY_MS);
-    timer.unref();
-    this.windows.set(tournamentId, { timer, pending: false, changed: new Set() });
+    if (this.standingsThrottle.hit(tournamentId, userIds)) void this.publishStandings(tournamentId, userIds);
   }
 
   /**

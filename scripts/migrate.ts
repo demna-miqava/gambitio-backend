@@ -47,6 +47,11 @@ export async function migrate(connectionString: string, log = console.log) {
       const sql = await readFile(path.join(MIGRATIONS_DIR, file), "utf8");
       await client.query("BEGIN");
       try {
+        // The app's limits (statement_timeout 5 s and the idle one) may be
+        // the role's defaults (ensureSessionTimeouts in src/db.ts), which
+        // this session would get too: an index build or a backfill can take
+        // longer. SET LOCAL holds for this transaction, also through a pooler
+        await client.query("SET LOCAL statement_timeout = 0; SET LOCAL idle_in_transaction_session_timeout = 0");
         await client.query(sql);
         await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [file]);
         await client.query("COMMIT");

@@ -37,8 +37,17 @@ const highestOf = (user: UserRatings, variant: TimeControl) =>
     ]
   );
 
-/** Same output as toLocaleDateString("en-US", ...), without building a formatter per call. */
-const DATE_FORMAT = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" });
+/**
+ * Same output as toLocaleDateString("en-US", ...), without building a
+ * formatter per call. In UTC, the calendar the rating history's days are
+ * counted in (see history), whatever the server's own time zone.
+ */
+const DATE_FORMAT = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+  timeZone: "UTC",
+});
 const formatDate = (date: Date) => DATE_FORMAT.format(date);
 
 /**
@@ -191,7 +200,9 @@ export class StatsService {
        GROUP BY u.id`,
       [userId]
     );
-    return rows[0]!;
+    // Not cached: the summary's other half answers 404 for this anyway
+    if (!rows[0]) throw new AppError("User not found", "USER_NOT_FOUND", 404);
+    return rows[0];
   }
 
   /** Detailed stats for one period and variant: GET /users/:id/stats */

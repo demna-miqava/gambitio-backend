@@ -198,8 +198,9 @@ export function clerkSigningKeyFetcher(secretKey: string): SigningKeyFetcher {
 /**
  * Verifies Clerk session tokens (REST bearer tokens and WebSocket tokens
  * alike). `isAuthorizedParty` rejects tokens minted for other origins: like
- * Clerk's own `authorizedParties` option, it checks the `azp` claim when the
- * token has one, but can match origins by rule rather than from a fixed list.
+ * Clerk's own `authorizedParties` option, it requires the `azp` claim (the
+ * origin the browser asked for the token from) and rejects a token without
+ * one, but can match origins by rule rather than from a fixed list.
  *
  * Verification itself is always Clerk's verifyToken with a local key
  * (`jwtKey`), so it never makes a network request: the key is CLERK_JWT_KEY
@@ -230,7 +231,7 @@ export function clerkAuthProvider(options: {
           if (!key) return null;
         }
         const payload = await verifyToken(token, { jwtKey: key });
-        if (typeof payload.azp === "string" && !isAuthorizedParty(payload.azp)) return null;
+        if (typeof payload.azp !== "string" || !isAuthorizedParty(payload.azp)) return null;
         return payload.sub ?? null;
       } catch {
         return null;

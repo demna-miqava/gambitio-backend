@@ -8,6 +8,7 @@ import { StatsService } from "../services/statsService.js";
 import { authMiddleware, clerkAuthMiddleware } from "../middleware/auth.js";
 import { paginationSchema } from "../schemas/pagination.js";
 import { syncUserSchema, checkUsernameSchema } from "../schemas/userSchemas.js";
+import { gameHistoryQuery } from "../schemas/gameHistorySchemas.js";
 import { AppError } from "../errors/AppError.js";
 
 // Capped at Postgres' integer max: a larger id would be a 500, not a 404
@@ -117,8 +118,18 @@ export async function userRoutes(fastify: FastifyInstance) {
    */
   fastify.get("/users/:userId/games", { preHandler: authMiddleware, config: heavy }, async (request) => {
     const { userId } = userIdParams.parse(request.params);
-    const { page, limit } = paginationSchema.parse(request.query);
-    return gameService.getGamesByUserId(userId, page, limit);
+    const { page, limit, opponent, ...filters } = gameHistoryQuery.parse(request.query);
+    if (opponent === undefined) return gameService.getGamesByUserId(userId, page, limit, filters);
+    // By id: names on old games are as they were then. Found through the
+    // unique index on lower(username), never a scan of users
+    const found = await userRepository.findByUsername(opponent);
+    if (!found) {
+      return { data: [], pagination: { page, limit, total: 0, totalPages: 0 }, opponent: null };
+    }
+    return {
+      ...(await gameService.getGamesByUserId(userId, page, limit, { ...filters, opponentId: found.id })),
+      opponent: { id: found.id, username: found.username },
+    };
   });
 
   /**

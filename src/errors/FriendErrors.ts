@@ -23,7 +23,7 @@ export class FriendNotFoundError extends FriendError {
  */
 export class FriendshipExistsError extends FriendError {
   constructor(message: string = 'Friendship already exists') {
-    super(message, 'FRIENDSHIP_EXISTS', 400);
+    super(message, 'FRIENDSHIP_EXISTS', 409);
   }
 }
 
@@ -32,7 +32,7 @@ export class FriendshipExistsError extends FriendError {
  */
 export class FriendRequestExistsError extends FriendError {
   constructor(message: string = 'Friend request already exists') {
-    super(message, 'FRIEND_REQUEST_EXISTS', 400);
+    super(message, 'FRIEND_REQUEST_EXISTS', 409);
   }
 }
 

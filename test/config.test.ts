@@ -2,7 +2,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
 import { clerkJwtKey, isLanOrigin, loadConfig, originChecker } from "../src/config.js";
-import { rateLimitAddress, rateLimitKey } from "../src/app.js";
+import { clientIp, perIpLimiter, rateLimitAddress, rateLimitKey } from "../src/app.js";
 
 const base = { POSTGRES_CONNECTION_STRING: "x", CLERK_PUBLISHABLE_KEY: "x", CLERK_SECRET_KEY: "x" };
 
@@ -43,6 +43,14 @@ describe("originChecker", () => {
     assert.equal(allowed("http://localhost:5173"), true);
     assert.equal(allowed("http://phone.test:5173"), true);
     assert.equal(allowed("http://192.168.0.102:5173"), false);
+  });
+
+  test("origins are compared as a browser sends them, however they were written", () => {
+    const allowed = originChecker(
+      loadConfig({ ...base, FRONTEND_URL: "https://Gambitio.Test/", EXTRA_FRONTEND_ORIGINS: "http://phone.test:80/ " })
+    );
+    assert.equal(allowed("https://gambitio.test"), true);
+    assert.equal(allowed("http://phone.test"), true);
   });
 
   test("ALLOW_LAN_ORIGINS adds private-network origins, nothing else", () => {
@@ -167,5 +175,32 @@ describe("rateLimitKey", () => {
     assert.equal(rateLimitKey(req({ clerkId: "user_abc" })), "clerk:user_abc");
     assert.equal(rateLimitKey(req({}, { authorization: `Bearer ${forged}` })), "ip:2001:db8:1:2::/64");
     assert.equal(rateLimitKey({ ip: "10.0.0.1", headers: {} }), "ip:10.0.0.1");
+  });
+});
+
+describe("clientIp", () => {
+  test("takes CF-Connecting-IP only when it is an address", () => {
+    assert.equal(clientIp({ ip: "10.0.0.1", headers: { "cf-connecting-ip": "203.0.113.9" } }), "203.0.113.9");
+    assert.equal(clientIp({ ip: "10.0.0.1", headers: { "cf-connecting-ip": "2001:db8::1" } }), "2001:db8::1");
+    assert.equal(clientIp({ ip: "10.0.0.1", headers: { "cf-connecting-ip": "made-up-bucket" } }), "10.0.0.1");
+    assert.equal(clientIp({ ip: "10.0.0.1", headers: {} }), "10.0.0.1");
+  });
+});
+
+describe("perIpLimiter", () => {
+  test("a flood from more addresses than it counts shares one count, and its memory stays bounded", () => {
+    let now = 0;
+    const allowed = perIpLimiter(() => now);
+    // The addresses counted one by one this minute
+    for (let i = 0; i < 100_000; i++) allowed(`10.${(i >> 16) & 255}.${(i >> 8) & 255}.${i & 255}`);
+    // Every new address after that draws from one count of 3000
+    let refused = 0;
+    for (let i = 0; i < 3_001; i++) if (!allowed(`11.0.${(i >> 8) & 255}.${i & 255}`)) refused++;
+    assert.equal(refused, 1);
+    // An address counted before the flood keeps its own
+    assert.equal(allowed("10.0.0.1"), true);
+    // A new minute starts over
+    now += 60_000;
+    assert.equal(allowed("11.0.0.1"), true);
   });
 });

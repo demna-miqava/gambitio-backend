@@ -335,6 +335,13 @@ describe("series, repertoire, study rooms and endgames", { skip }, () => {
       assert.equal(renamed.json().line.name, "Giuoco");
       // Not someone else's
       assert.equal((await request("PATCH", `/api/repertoire/${line.id}`, bob.clerkId, { name: "x" })).statusCode, 404);
+      // Moved to a colour that already has the same moves
+      const black = (
+        await request("POST", "/api/repertoire", alice.clerkId, { color: "black", name: "Same", moves: line.moves })
+      ).json().line;
+      const clash = await request("PATCH", `/api/repertoire/${black.id}`, alice.clerkId, { color: "white" });
+      assert.deepEqual([clash.statusCode, clash.json().code], [409, "LINE_EXISTS"]);
+      assert.equal((await request("DELETE", `/api/repertoire/${black.id}`, alice.clerkId)).statusCode, 204);
 
       const practised = (await request("POST", `/api/repertoire/${line.id}/practice`, alice.clerkId, { correct: true })).json().line;
       assert.equal(practised.streak, 1);
@@ -464,6 +471,11 @@ describe("series, repertoire, study rooms and endgames", { skip }, () => {
       // Sent, then cancelled by the sender
       let sent = await request("POST", "/api/friend-requests", alice.clerkId, { receiverId: bob.id });
       assert.equal(sent.statusCode, 201);
+      // Either way round, a second one is a conflict
+      for (const [from, to] of [[alice, bob], [bob, alice]] as const) {
+        const again = await request("POST", "/api/friend-requests", from.clerkId, { receiverId: to.id });
+        assert.deepEqual([again.statusCode, again.json().code], [409, "FRIEND_REQUEST_EXISTS"]);
+      }
       const received = await updated(nb, "request_received");
       assert.deepEqual(received.data.user, { id: alice.id, username: "alice", avatarUrl: null });
       let requestId: number = sent.json().data.id;
@@ -515,6 +527,28 @@ describe("series, repertoire, study rooms and endgames", { skip }, () => {
       await request("POST", `/api/friend-requests/${fromBob.json().data.id}/decline`, alice.clerkId);
       assert.equal((await send(bob, alice)).json().code, "FRIEND_REQUEST_COOLDOWN");
       assert.ok((await app.redis.ttl(`friendreq:cooldown:${bob.id}:${alice.id}`)) > 23 * 3600);
+    });
+
+    test("a page past the last still has the total; unfriending a stranger leaves their challenge", async () => {
+      await befriend(alice.id, bob.id);
+      const friendsPage = (await request("GET", `/api/users/${alice.id}/friends?page=3&limit=10`, alice.clerkId)).json();
+      assert.deepEqual([friendsPage.data, friendsPage.pagination.total, friendsPage.pagination.totalPages], [[], 1, 1]);
+      const searched = (await request("GET", `/api/users/${alice.id}/friends?page=3&limit=10&q=bob`, alice.clerkId)).json();
+      assert.equal(searched.pagination.total, 1);
+      const none = (await request("GET", `/api/users/${alice.id}/friends?page=3&limit=10&q=zzz`, alice.clerkId)).json();
+      assert.equal(none.pagination.total, 0);
+      const opponents = (await request("GET", "/api/friends/opponents?page=3&limit=10", alice.clerkId)).json();
+      assert.deepEqual([opponents.data, opponents.pagination.total], [[], 1]);
+
+      // Not friends: a 404, and a pending challenge between them stays
+      const carol = await createUser(app, "carol");
+      await app.pg.query(
+        `INSERT INTO challenges ("challengerId", "challengedId", "challengerUsername", time, increment)
+         VALUES ($1, $2, 'carol', 180, 0)`,
+        [carol.id, alice.id]
+      );
+      assert.equal((await request("DELETE", `/api/friends/${carol.id}`, alice.clerkId)).statusCode, 404);
+      assert.equal((await app.pg.query(`SELECT 1 FROM challenges`)).rowCount, 1);
     });
 
     test("one account can send only so many friend requests a day", async () => {

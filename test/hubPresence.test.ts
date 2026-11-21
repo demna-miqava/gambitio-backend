@@ -13,10 +13,13 @@ class FakeSocket extends EventEmitter {
   readonly OPEN = 1;
   readonly CLOSED = 3;
   readyState = 1;
+  closedWith: number | undefined;
   ping() {}
   terminate() {}
   send() {}
-  close() {
+  close(code?: number) {
+    this.closedWith = code;
+    this.readyState = this.CLOSED;
     this.emit("close");
   }
 }
@@ -33,9 +36,11 @@ function fakeRedis(sets: Record<string, string[]>, aliveInstances: string[]) {
       commands.push(`MGET ${keys.join(" ")}`);
       return keys.map((key) => (aliveInstances.some((id) => key === `instance:${id}`) ? "1" : null));
     },
-    async zRem() {
+    async zRem(key: string, members: string | string[]) {
       commands.push("ZREM");
-      return 0;
+      const gone = new Set([members].flat());
+      if (sets[key]) sets[key] = sets[key].filter((m) => !gone.has(m));
+      return gone.size;
     },
     multi() {
       const chain = {
@@ -132,4 +137,47 @@ test("isPresent still reads Redis for a user with no socket here", async (t) => 
   // Even alone and with a cached answer: its callers (challenges) get what Redis says
   assert.deepEqual([...(await hub.presentUserIds("notifications", [2]))], []);
   assert.equal(await hub.isPresent("notifications", 2), true);
+});
+
+test("a member left in Redis by one of this instance's closed sockets doesn't count, and is removed", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+  const sets: Record<string, string[]> = {};
+  const redis = fakeRedis(sets, []);
+  const { hub } = hubOver(redis);
+  // Its removal failed (a Redis blip when the socket closed), or a lost
+  // reply's add landed after the removal
+  sets["presence:notifications:2"] = [`2:${hub.instanceId}:99`];
+  t.mock.timers.tick(80_000);
+  assert.equal(await hub.isPresent("notifications", 2), false);
+  assert.deepEqual(sets["presence:notifications:2"], []);
+
+  // A socket that is attached here does count
+  const socket = new FakeSocket();
+  await hub.attach(socket as unknown as WebSocket, { userId: 3, topics: [] });
+  assert.equal(await hub.addMembership(socket as unknown as WebSocket, "spectators:1"), true);
+  sets["spectators:1"] = [`3:${hub.instanceId}:1`];
+  assert.equal(await hub.countMembers("spectators:1"), 1);
+  socket.close();
+  // Even if the Redis set still had it
+  sets["spectators:1"] = [`3:${hub.instanceId}:1`];
+  assert.equal(await hub.countMembers("spectators:1"), 0);
+});
+
+test("a shutdown closes the sockets with 1001 and isn't taken for the users leaving", async () => {
+  const redis = fakeRedis({}, []);
+  const { hub } = hubOver(redis);
+  const socket = new FakeSocket();
+  let detached = 0;
+  await hub.attach(socket as unknown as WebSocket, {
+    userId: 1,
+    topics: ["t"],
+    presence: "notifications",
+    onDetach: async () => void detached++,
+  });
+  hub.closeForShutdown();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(socket.closedWith, 1001);
+  assert.equal(hub.attachedCount, 0);
+  assert.equal(hub.isStopping, true);
+  assert.equal(detached, 0);
 });

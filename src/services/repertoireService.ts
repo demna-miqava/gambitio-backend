@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import type { PlayerColor } from "../models/common.js";
 import { AppError } from "../errors/AppError.js";
+import { isUniqueViolation } from "../db.js";
 import {
   BookBuilder,
   checkGame,
@@ -44,6 +45,7 @@ const LINE_COLUMNS = `id, color, name, moves, plies, "createdAt", "updatedAt", "
 const toLine = (row: LineRow): RepertoireLine => ({ ...row, moves: row.moves.split(" ") });
 
 const lineNotFound = () => new AppError("Line not found", "LINE_NOT_FOUND", 404);
+const lineExists = () => new AppError("This line is already in your repertoire", "LINE_EXISTS", 409);
 
 /** Recent games compared with the repertoire. */
 export interface RepertoireGameCheck extends GameCheck {
@@ -91,9 +93,7 @@ export class RepertoireService {
        RETURNING ${LINE_COLUMNS}`,
       [userId, input.color, input.name.trim(), moves.join(" "), moves.length]
     );
-    if (!rows[0]) {
-      throw new AppError("This line is already in your repertoire", "LINE_EXISTS", 409);
-    }
+    if (!rows[0]) throw lineExists();
     return toLine(rows[0]);
   }
 
@@ -102,13 +102,19 @@ export class RepertoireService {
     lineId: number,
     input: { name?: string | undefined; color?: PlayerColor | undefined }
   ): Promise<RepertoireLine> {
-    const { rows } = await this.fastify.pg.query<LineRow>(
-      `UPDATE repertoire_lines SET
-         name = COALESCE($3, name), color = COALESCE($4, color), "updatedAt" = now()
-       WHERE id = $1 AND "userId" = $2
-       RETURNING ${LINE_COLUMNS}`,
-      [lineId, userId, input.name?.trim() ?? null, input.color ?? null]
-    );
+    const { rows } = await this.fastify.pg
+      .query<LineRow>(
+        `UPDATE repertoire_lines SET
+           name = COALESCE($3, name), color = COALESCE($4, color), "updatedAt" = now()
+         WHERE id = $1 AND "userId" = $2
+         RETURNING ${LINE_COLUMNS}`,
+        [lineId, userId, input.name?.trim() ?? null, input.color ?? null]
+      )
+      .catch((error: unknown) => {
+        // Moved to the colour that already has these moves
+        if (isUniqueViolation(error)) throw lineExists();
+        throw error;
+      });
     if (!rows[0]) throw lineNotFound();
     return toLine(rows[0]);
   }

@@ -2,12 +2,13 @@ import type { FastifyInstance } from "fastify";
 import type { MatchmakingRequest } from "../models/Matchmaking.js";
 import { getTimeControl, ratingColumns } from "../models/common.js";
 import { gameRepository } from "../repositories/gameRepository.js";
-import { createGame, lockPlayers, matchFoundData, AlreadyInGameError } from "./gameService.js";
+import { announceGameStart, createGame, lockPlayers, matchFoundData, AlreadyInGameError } from "./gameService.js";
 import { timeControlLabel } from "./pushService.js";
 import { activeGameMessage, topics, type RealtimeHub } from "../realtime/hub.js";
 import { notBlockedSql } from "../repositories/blockRepository.js";
 import type { LiveGame } from "../models/Game.js";
 import { AppError } from "../errors/AppError.js";
+import type { DroppedChallenge } from "./challengeService.js";
 
 const INITIAL_RATING_RANGE = 50;
 const RANGE_STEP = 50;
@@ -18,6 +19,9 @@ const MAX_WAIT_MS = 10 * 60_000;
 const CANDIDATES_PER_PAIRING = 5;
 /** At startup, entries at least this old may be left over (see removeLeftovers) */
 const LEFTOVER_AGE_MS = 5_000;
+
+/** What one pairing attempt did: started a game (dropping these challenges), found an opponent who can't play, or nothing */
+type PairOutcome = { game: LiveGame; dropped: DroppedChallenge[] } | "retry" | null;
 
 /** Rating window that widens the longer a player has waited. */
 export function ratingRangeFor(waitedMs: number): number {
@@ -75,10 +79,14 @@ export class MatchmakingService {
       if (activeGameId !== null) throw new AlreadyInGameError(activeGameId);
 
       const col = ratingColumns(getTimeControl(time)).rating;
-      await tx.query(`DELETE FROM matchmaking WHERE "userId" = $1`, [userId]);
+      // An entry already there (another tab searching) is replaced in the
+      // same statement: a delete then an insert let two searches starting
+      // at once both insert, and one failed on the one-entry-per-user index
       const { rows } = await tx.query<MatchmakingRequest>(
         `INSERT INTO matchmaking ("userId", rating, time, increment)
          SELECT id, "${col}", $2, $3 FROM users WHERE id = $1
+         ON CONFLICT ("userId") DO UPDATE SET id = DEFAULT, "createdAt" = DEFAULT,
+           rating = EXCLUDED.rating, time = EXCLUDED.time, increment = EXCLUDED.increment
          RETURNING id, "createdAt", rating, time, increment, "userId"`,
         [userId, time, increment]
       );
@@ -105,9 +113,52 @@ export class MatchmakingService {
    * LOCKED (an entry another pairing holds is skipped). Candidates whose
    * player has no matchmaking socket on any live instance (rows left behind
    * by an instance that crashed) are removed instead of being paired.
+   *
+   * Only this entry's own player failing (their account is gone, or they
+   * are in a game) throws. An opponent who can't play after all (in a game
+   * started since the candidates were read, or a deleted account) loses
+   * their entry, and the pairing looks again: the player who was searching
+   * keeps searching.
    */
   private async pair(requestId: number): Promise<LiveGame | null> {
-    const created = await this.fastify.pg.transact(async (tx) => {
+    let outcome: PairOutcome = "retry";
+    // Each retry removes an entry, so this only ends early in a crowd of them
+    for (let attempt = 0; attempt < CANDIDATES_PER_PAIRING && outcome === "retry"; attempt++) {
+      outcome = await this.pairOnce(requestId);
+    }
+    if (outcome === null || outcome === "retry") return null;
+    const { game: created, dropped } = outcome;
+    // The search page opens the game; the other side of each open challenge
+    // of the two hears it is gone
+    await announceGameStart(this.fastify, {
+      games: [created],
+      messages: [created.whiteId, created.blackId].flatMap((playerId) => [
+        { topic: topics.matchmaking(playerId), message: { type: "match_found", data: matchFoundData(created, playerId) } },
+        { topic: topics.notifications(playerId), message: activeGameMessage(created.id) },
+      ]),
+      dropped,
+    });
+    for (const playerId of [created.whiteId, created.blackId]) {
+      // Someone waiting for an opponent has often switched to another tab
+      void this.fastify.push.notify(
+        playerId,
+        {
+          title: "Your game has started",
+          body: `${timeControlLabel(created.time, created.increment)} against ${
+            playerId === created.whiteId ? created.blackUsername : created.whiteUsername
+          }. Your clock is running.`,
+          url: `/game/${created.id}`,
+          tag: `game-${created.id}`,
+        },
+        60
+      );
+    }
+    return created;
+  }
+
+  /** One pairing attempt (see pair): the game and the challenges it dropped, "retry", or null. */
+  private async pairOnce(requestId: number): Promise<PairOutcome> {
+    return this.fastify.pg.transact(async (tx) => {
       const { rows: candidates } = await tx.query<{
         selfId: number;
         selfUserId: number;
@@ -151,26 +202,44 @@ export class MatchmakingService {
         increment: opponent.increment,
       };
 
-      await tx.query(`DELETE FROM matchmaking WHERE id = ANY($1)`, [[self.id, opponent.id, ...gone]]);
       const pair = [self.userId, opponent.userId];
-      // Players after queue rows, the order accepting a challenge takes them in
+      // Players after queue rows (locked above), the order accepting a
+      // challenge takes them in
       const players = await lockPlayers(tx, pair);
-      if (players.size < 2) throw new AppError("Player not found", "USER_NOT_FOUND", 404);
-      // After the player locks: whether either is in a game now. The open
-      // challenges of the two go in the same round trip (they are about to
-      // play; a refusal below rolls that back)
-      const { rows: active } = await tx.query<{ id: number; whiteId: number; blackId: number }>(
-        `WITH dropped AS (
-           DELETE FROM challenges WHERE "challengerId" = ANY($1) OR "challengedId" = ANY($1)
+      // After the player locks: the games either is in now. When both can
+      // play, their open challenges are dropped in the same round trip
+      // (they are about to play)
+      const { rows: found } = await tx.query<{ gameId: number | null; a: number; b: number }>(
+        `WITH busy AS (
+           SELECT id, "whiteId", "blackId" FROM games
+           WHERE status = 'in_progress' AND ("whiteId" = ANY($1) OR "blackId" = ANY($1))
+         ), dropped AS (
+           DELETE FROM challenges
+           WHERE ("challengerId" = ANY($1) OR "challengedId" = ANY($1)) AND $2 AND NOT EXISTS (SELECT 1 FROM busy)
+           RETURNING "challengerId", "challengedId"
          )
-         SELECT id, "whiteId", "blackId" FROM games
-         WHERE status = 'in_progress' AND ("whiteId" = ANY($1) OR "blackId" = ANY($1))`,
-        [pair]
+         SELECT id AS "gameId", "whiteId" AS a, "blackId" AS b FROM busy
+         UNION ALL
+         SELECT NULL, "challengerId", "challengedId" FROM dropped`,
+        [pair, players.size === 2]
       );
-      if (active[0]) throw new AlreadyInGameError(active[0].id);
+      const busy = new Map<number, number>();
+      const dropped: DroppedChallenge[] = [];
+      for (const row of found) {
+        if (row.gameId === null) dropped.push({ challengerId: row.a, challengedId: row.b });
+        else for (const userId of [row.a, row.b]) busy.set(userId, row.gameId);
+      }
+      if (!players.has(self.userId)) throw new AppError("Player not found", "USER_NOT_FOUND", 404);
+      const ownGameId = busy.get(self.userId);
+      if (ownGameId !== undefined) throw new AlreadyInGameError(ownGameId);
+      if (!players.has(opponent.userId) || busy.has(opponent.userId)) {
+        await tx.query(`DELETE FROM matchmaking WHERE id = ANY($1)`, [[opponent.id, ...gone]]);
+        return "retry";
+      }
+      await tx.query(`DELETE FROM matchmaking WHERE id = ANY($1)`, [[self.id, opponent.id, ...gone]]);
 
       const selfIsWhite = Math.random() < 0.5;
-      return createGame(
+      const game = await createGame(
         tx,
         {
           whiteId: selfIsWhite ? self.userId : opponent.userId,
@@ -180,37 +249,8 @@ export class MatchmakingService {
         },
         { locked: players }
       );
+      return { game, dropped };
     });
-
-    if (!created) return null;
-    this.fastify.liveGames.watchDeadline(created.id, created.deadlineAt);
-    // All at once: publish() delivers locally in call order, and the Redis
-    // PUBLISHes go out back to back instead of one round trip each
-    await Promise.all(
-      [created.whiteId, created.blackId].flatMap((playerId) => [
-        this.hub.publish(topics.matchmaking(playerId), {
-          type: "match_found",
-          data: matchFoundData(created, playerId),
-        }),
-        this.hub.publish(topics.notifications(playerId), activeGameMessage(created.id)),
-      ])
-    );
-    for (const playerId of [created.whiteId, created.blackId]) {
-      // Someone waiting for an opponent has often switched to another tab
-      void this.fastify.push.notify(
-        playerId,
-        {
-          title: "Your game has started",
-          body: `${timeControlLabel(created.time, created.increment)} against ${
-            playerId === created.whiteId ? created.blackUsername : created.whiteUsername
-          }. Your clock is running.`,
-          url: `/game/${created.id}`,
-          tag: `game-${created.id}`,
-        },
-        60
-      );
-    }
-    return created;
   }
 
   /**
@@ -246,12 +286,11 @@ export class MatchmakingService {
         const game = await this.pair(row.id);
         if (game) paired.add(game.whiteId).add(game.blackId);
       } catch (error) {
-        if (!(error instanceof AlreadyInGameError)) throw error;
-        // The game may be the opponent's (one started since the opponent was
-        // picked): only a player who is in a game leaves the queue
-        if ((await gameRepository.findActiveGameIdForUser(this.fastify.pg, row.userId)) !== null) {
-          await this.cancel(row.id);
-        }
+        // pair() only throws these for the entry's own player (in a game, or
+        // their account is gone): the entry goes, and the pass goes on
+        const own = error instanceof AlreadyInGameError || (error instanceof AppError && error.code === "USER_NOT_FOUND");
+        if (!own) throw error;
+        await this.cancel(row.id);
       }
     }
   }

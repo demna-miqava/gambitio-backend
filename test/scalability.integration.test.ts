@@ -13,6 +13,7 @@ import {
   type TestSocket,
 } from "./helpers.js";
 import { createGame, finishGame } from "../src/services/gameService.js";
+import { historySideWhere } from "../src/repositories/gameHistory.js";
 import { RealtimeHub } from "../src/realtime/hub.js";
 import { reauthTimings } from "../src/realtime/socket.js";
 import { unverifiedSubject } from "../src/app.js";
@@ -230,14 +231,14 @@ describe("scalability changes", { skip: !integrationEnabled && "TEST_POSTGRES_UR
     assert.equal(profile.json().user.friendCount, 1);
     const friends = await act(white.clerkId, "GET", `/api/users/${white.id}/friends`);
     assert.deepEqual(friends.json().data.map((f: { id: number }) => f.id), [black.id]);
-    // Sending again is refused
+    // Sending again is refused: a conflict
     const again = await app.inject({
       method: "POST",
       url: "/api/friend-requests",
       headers: { authorization: `Bearer ${black.clerkId}` },
       payload: { receiverId: white.id },
     });
-    assert.equal(again.statusCode, 400);
+    assert.deepEqual([again.statusCode, again.json().code], [409, "FRIENDSHIP_EXISTS"]);
   });
 
   test("settings update in one statement, creating the row if missing", async () => {
@@ -367,9 +368,33 @@ describe("scalability changes", { skip: !integrationEnabled && "TEST_POSTGRES_UR
        ) page ORDER BY "createdAt" DESC, id DESC LIMIT 10 OFFSET 90`,
       [white.id, 100]
     );
-    assert.match(history, /games_white_created_idx/);
-    assert.match(history, /games_black_created_idx/);
+    assert.match(history, /games_white_history_idx/);
+    assert.match(history, /games_black_history_idx/);
     assert.doesNotMatch(history, /Seq Scan/);
+
+    // Filtered pages and counts can read only the index (migration 044),
+    // never the player's games from the table: with every filter on, the
+    // index still covers the query. (In this small table, all the pair's,
+    // Postgres would rightly pick a sequential scan, hence the SETs.)
+    const params: unknown[] = [white.id];
+    const where = (["white", "black"] as const).map((side) =>
+      historySideWhere(
+        side,
+        { result: "drawn", timeControl: "blitz", rated: true, kind: "online", opponentId: black.id, since: new Date(0) },
+        params
+      )
+    );
+    const filteredCount = await app.pg.transact(async (tx) => {
+      await tx.query("SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off");
+      const { rows } = await tx.query(
+        `EXPLAIN SELECT (SELECT COUNT(*) FROM games WHERE ${where[0]}) + (SELECT COUNT(*) FROM games WHERE ${where[1]})`,
+        params
+      );
+      return rows.map((r: any) => r["QUERY PLAN"]).join("\n");
+    });
+    // One per side (with an opponent, either history index can serve a side)
+    assert.equal(filteredCount.match(/Index Only Scan using games_(white|black)_history_idx/g)?.length, 2);
+    assert.doesNotMatch(filteredCount, /Seq Scan|Bitmap Heap Scan|[^y] Index Scan/);
 
     const pair = await plan(
       `SELECT id FROM games

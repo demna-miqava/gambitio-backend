@@ -96,14 +96,19 @@ export class ModerationService {
     if (blockerId === blockedId) throw new AppError("You can't block yourself", "SELF_BLOCK", 400);
 
     const dropped = await this.fastify.pg.transact(async (tx) => {
-      const { rows: target } = await tx.query(
-        `SELECT 1 FROM users WHERE id = $1 AND "clerkId" IS NOT NULL -- not a deleted account`,
-        [blockedId]
+      // Both players' rows, lowest id first. Sending and accepting friend
+      // requests lock them too (FOR SHARE, FriendRepository), so none can
+      // land between this block and the deletes below; and two blocks by the
+      // same player take turns, so they can't both slip under the limit
+      const { rows: players } = await tx.query<{ id: number; live: boolean }>(
+        `SELECT id, "clerkId" IS NOT NULL AS live -- not a deleted account
+         FROM users WHERE id = ANY($1::int[]) ORDER BY id FOR NO KEY UPDATE`,
+        [[blockerId, blockedId]]
       );
-      if (target.length === 0) throw new AppError("User not found", "USER_NOT_FOUND", 404);
+      if (!players.some((p) => p.id === blockedId && p.live)) {
+        throw new AppError("User not found", "USER_NOT_FOUND", 404);
+      }
 
-      // The count and the insert are one statement, so two requests at once
-      // can't both slip under the limit
       const { rows: inserted } = await tx.query(
         `INSERT INTO user_blocks ("blockerId", "blockedId")
          SELECT $1, $2
@@ -208,8 +213,10 @@ export class ModerationService {
    * game). With a study room instead (migration 041), the reporter must be
    * in it (and not kept out of it as a player of its live game), and the
    * reported player must be in it too or have written in its chat, which
-   * is copied the same way. One player can be reported once a day by the
-   * same account.
+   * is copied the same way. With a game's spectator chat (migration 045),
+   * the reporter mustn't be playing in the game and the reported player must
+   * have written in that chat, which is copied. One player can be reported
+   * once a day by the same account.
    */
   async report(
     reporterId: number,
@@ -219,11 +226,12 @@ export class ModerationService {
       details?: string | undefined;
       gameId?: number | undefined;
       studyRoomId?: number | undefined;
+      spectatorGameId?: number | undefined;
     }
   ): Promise<{ id: number }> {
-    const { reportedId, reason, gameId, studyRoomId } = input;
-    if (gameId !== undefined && studyRoomId !== undefined) {
-      throw new AppError("A report is about a game or a study room, not both", "INVALID_REPORT", 400);
+    const { reportedId, reason, gameId, studyRoomId, spectatorGameId } = input;
+    if ([gameId, studyRoomId, spectatorGameId].filter((v) => v !== undefined).length > 1) {
+      throw new AppError("A report is about one game, study room or spectator chat", "INVALID_REPORT", 400);
     }
     if (reporterId === reportedId) throw new AppError("You can't report yourself", "SELF_REPORT", 400);
     const details = cleanReportDetails(input.details);
@@ -251,45 +259,74 @@ export class ModerationService {
       throw new AppError("That isn't a study room you share with this player", "NOT_YOUR_ROOM", 400);
     }
 
-    const { rows: recent } = await this.fastify.pg.query(
-      `SELECT 1 FROM user_reports
-       WHERE "reporterId" = $1 AND "reportedId" = $2
-         AND "createdAt" > now() - make_interval(hours => $3)
-       LIMIT 1`,
-      [reporterId, reportedId, REPEAT_REPORT_HOURS]
-    );
-    if (recent.length > 0) {
-      throw new AppError(
-        "You've already reported this player. We'll look into it.",
-        "ALREADY_REPORTED",
-        409
-      );
-    }
-    const allowed = await withinLimit(
-      this.fastify.redis,
-      `reports:${reporterId}`,
-      REPORTS_PER_DAY.max,
-      REPORTS_PER_DAY.windowSeconds
-    );
-    if (!allowed) {
-      throw new AppError("You've sent a lot of reports today. Try again tomorrow.", "REPORT_RATE_LIMITED", 429);
+    if (
+      spectatorGameId !== undefined &&
+      !(await this.fastify.spectatorChat.canReportFrom(spectatorGameId, reporterId, reportedId))
+    ) {
+      throw new AppError("This player hasn't written in that game's spectator chat", "NOT_IN_SPECTATOR_CHAT", 400);
     }
 
-    const { rows } = await this.fastify.pg.query<{ id: number }>(
-      // The latest messages of the game's chat, or of the room's (at most one is given)
-      `INSERT INTO user_reports ("reporterId", "reportedId", reason, details, "gameId", "studyRoomId", "chatExcerpt")
-       VALUES ($1, $2, $3, $4, $5::int, $7::int, COALESCE(
-         (SELECT jsonb_agg(jsonb_build_object('userId', m."senderId", 'text', m.body, 'at', m."createdAt")
-                           ORDER BY m.id)
-          FROM (SELECT id, "senderId", body, "createdAt" FROM game_chat_messages
-                WHERE "gameId" = $5::int ORDER BY id DESC LIMIT $6) m),
-         (SELECT jsonb_agg(jsonb_build_object('userId', m."senderId", 'text', m.body, 'at', m."createdAt")
-                           ORDER BY m.id)
-          FROM (SELECT id, "senderId", body, "createdAt" FROM study_chat_messages
-                WHERE "roomId" = $7::int ORDER BY id DESC LIMIT $6) m)))
-       RETURNING id`,
-      [reporterId, reportedId, reason, details, gameId ?? null, CHAT_EXCERPT_LIMIT, studyRoomId ?? null]
-    );
-    return { id: rows[0]!.id };
+    return this.fastify.pg.transact(async (tx) => {
+      // The reporter's row: two reports of theirs at once are checked one
+      // after the other, so a double submit doesn't file the same one twice
+      await tx.query(`SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE`, [reporterId]);
+      const { rows: recent } = await tx.query(
+        `SELECT 1 FROM user_reports
+         WHERE "reporterId" = $1 AND "reportedId" = $2
+           AND "createdAt" > now() - make_interval(hours => $3)
+         LIMIT 1`,
+        [reporterId, reportedId, REPEAT_REPORT_HOURS]
+      );
+      if (recent.length > 0) {
+        throw new AppError(
+          "You've already reported this player. We'll look into it.",
+          "ALREADY_REPORTED",
+          409
+        );
+      }
+      const allowed = await withinLimit(
+        this.fastify.redis,
+        `reports:${reporterId}`,
+        REPORTS_PER_DAY.max,
+        REPORTS_PER_DAY.windowSeconds
+      );
+      if (!allowed) {
+        throw new AppError("You've sent a lot of reports today. Try again tomorrow.", "REPORT_RATE_LIMITED", 429);
+      }
+
+      const { rows } = await tx.query<{ id: number }>(
+        // The latest messages of the game's chat, the room's, or the game's
+        // spectator chat (at most one is given)
+        `INSERT INTO user_reports ("reporterId", "reportedId", reason, details, "gameId", "studyRoomId",
+           "spectatorGameId", "chatExcerpt")
+         VALUES ($1, $2, $3, $4, $5::int, $7::int, $8::int, COALESCE(
+           (SELECT jsonb_agg(jsonb_build_object('userId', m."senderId", 'text', m.body, 'at', m."createdAt")
+                             ORDER BY m.id)
+            FROM (SELECT id, "senderId", body, "createdAt" FROM game_chat_messages
+                  WHERE "gameId" = $5::int ORDER BY id DESC LIMIT $6) m),
+           (SELECT jsonb_agg(jsonb_build_object('userId', m."senderId", 'text', m.body, 'at', m."createdAt")
+                             ORDER BY m.id)
+            FROM (SELECT id, "senderId", body, "createdAt" FROM study_chat_messages
+                  WHERE "roomId" = $7::int ORDER BY id DESC LIMIT $6) m),
+           -- Many people write here, so each message keeps its writer's name too
+           (SELECT jsonb_agg(jsonb_build_object('userId', m."senderId", 'username', m.username, 'text', m.body,
+                                                'at', m."createdAt") ORDER BY m.id)
+            FROM (SELECT c.id, c."senderId", u.username, c.body, c."createdAt"
+                  FROM spectator_chat_messages c JOIN users u ON u.id = c."senderId"
+                  WHERE c."gameId" = $8::int ORDER BY c.id DESC LIMIT $6) m)))
+         RETURNING id`,
+        [
+          reporterId,
+          reportedId,
+          reason,
+          details,
+          gameId ?? null,
+          CHAT_EXCERPT_LIMIT,
+          studyRoomId ?? null,
+          spectatorGameId ?? null,
+        ]
+      );
+      return { id: rows[0]!.id };
+    });
   }
 }

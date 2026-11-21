@@ -24,6 +24,11 @@ const SERIES_SWEEP_MS = 30 * 60_000;
 const TIMED_MATCH_SWEEP_MS = 10_000;
 /** Chat messages go an hour after their game ends: an hourly pass is close enough */
 const CHAT_SWEEP_MS = 60 * 60_000;
+/**
+ * Backstop for the timers that end puzzle duels (PuzzleDuelService), and
+ * the pass that expires their invites
+ */
+const DUEL_SWEEP_MS = 10_000;
 
 /**
  * Background timers. Each pass is idempotent and uses row locks, so running
@@ -40,6 +45,9 @@ const CHAT_SWEEP_MS = 60 * 60_000;
  */
 export function createJobs(app: FastifyInstance) {
   const timers: NodeJS.Timeout[] = [];
+  /** Passes under way, so stop() can wait for them before Redis and Postgres close */
+  const inFlight = new Set<Promise<void>>();
+  let started = false;
 
   /**
    * Until when the challenge sweep runs. Challenges are sent over the
@@ -62,8 +70,19 @@ export function createJobs(app: FastifyInstance) {
         .armLiveDeadlines()
         .catch((err) => app.log.error({ err }, "Reading live game deadlines failed again"));
     }
+    // Games that ended on another instance, so their sockets and timers here
+    // stop keeping the sweep (and the database) busy
+    await app.liveGames
+      .forgetEndedGames()
+      .catch((err) => app.log.error({ err }, "Checking for games that ended elsewhere failed"));
     const ids = await gameRepository.findIdsPastDeadline(app.pg, new Date(), 50);
-    for (const id of ids) await app.liveGames.resolveDeadline(id);
+    // One game that fails to resolve (it comes first again next time, the
+    // oldest deadline) must not hold up the others
+    for (const id of ids) {
+      await app.liveGames
+        .resolveDeadline(id)
+        .catch((err) => app.log.error({ err, gameId: id }, "Clock sweep: resolving a game failed"));
+    }
   }
 
   function every(ms: number, name: string, when: () => boolean, fn: () => Promise<void>) {
@@ -72,11 +91,13 @@ export function createJobs(app: FastifyInstance) {
       setInterval(() => {
         if (running || !when()) return;
         running = true;
-        fn()
+        const pass = fn()
           .catch((err) => app.log.error({ err }, `${name} failed`))
           .finally(() => {
             running = false;
+            inFlight.delete(pass);
           });
+        inFlight.add(pass);
       }, ms)
     );
   }
@@ -87,7 +108,10 @@ export function createJobs(app: FastifyInstance) {
     noteChallenge() {
       challengesUntil = challengeWindow();
     },
+    /** Safe to call more than once: only the first call starts anything. */
     start() {
+      if (started) return;
+      started = true;
       app.liveGames
         .startDeadlineTimers()
         .catch((err) => app.log.error({ err }, "Arming game deadline timers failed"));
@@ -155,12 +179,25 @@ export function createJobs(app: FastifyInstance) {
         () => app.hub.attachedCount > 0,
         () => app.gameChat.sweep()
       );
+      // Puzzle duels: only while this instance started one, sent an invite,
+      // or has a timer armed (PuzzleDuelService.needsSweep), or another
+      // instance is running (its duels may need ending if it went away)
+      app.puzzleDuels.startTimers();
+      every(
+        DUEL_SWEEP_MS,
+        "Puzzle duel sweep",
+        () => app.puzzleDuels.needsSweep || (app.hub.othersAlive && app.hub.attachedCount > 0),
+        () => app.puzzleDuels.sweep()
+      );
     },
-    stop() {
+    /** Stops the timers at once; resolves when the passes already under way have finished. */
+    async stop(): Promise<void> {
       for (const timer of timers) clearInterval(timer);
       timers.length = 0;
       app.liveGames.stop();
       app.series.stop();
+      app.puzzleDuels.stop();
+      await Promise.all(inFlight);
     },
   };
 }

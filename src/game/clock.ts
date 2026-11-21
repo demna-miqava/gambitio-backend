@@ -38,9 +38,14 @@ export const FIRST_MOVE_TIMEOUT_MS = 30_000;
  *
  * Browsers answer pings on their own, but a client that isn't a browser
  * could answer them late to look farther away than it is (the TCP round
- * trip can't be stretched that way). LiveGameService logs moves claiming
- * much more than measured, with both round trips, to tune these constants
- * and spot such accounts.
+ * trip can't be stretched that way), and so have up to
+ * MAX_LAG_COMPENSATION_MS a move forgiven free. The ping round trip isn't
+ * capped by the TCP one: that only covers the browser to Cloudflare's
+ * edge, and a player far from the container (one region, see
+ * wrangler.jsonc) honestly pings much more. LiveGameService logs, with both
+ * round trips, moves claiming much more than measured and moves forgiven
+ * much more than the TCP round trip backs, to tune these constants and spot
+ * such accounts.
  *
  * MAX_LAG_COMPENSATION_MS is also how long the server waits past a flag
  * before ending the game, so a move already on its way still counts.
@@ -186,13 +191,18 @@ export function isFlagged(state: ClockState, now: number, timing?: MoveTiming): 
 /**
  * Clock after the side to move completes a move received at `now`, charging
  * chargeMove's time, adding the increment and keeping the mover's new lag
- * budget.
+ * budget. The opponent's clock starts at `nextTurnAt` (lastMoveAt): when
+ * the move is stored, which can be later than `now` when the move waited
+ * behind the mover's earlier messages or the database. That wait costs
+ * neither player: the mover is charged up to `now`, and the opponent can't
+ * have seen the move before it was stored.
  */
 export function afterMove(
   state: ClockState,
   now: number,
   incrementMs: number,
-  timing?: MoveTiming
+  timing?: MoveTiming,
+  nextTurnAt = now
 ): ClockState {
   const mover = activeColor(state.ply);
   const running = clockRunning(state);
@@ -203,7 +213,7 @@ export function afterMove(
     whiteMs: mover === "white" ? left : state.whiteMs,
     blackMs: mover === "black" ? left : state.blackMs,
     ...(mover === "white" ? { whiteLagBudgetMs: charge.lagBudgetMs } : { blackLagBudgetMs: charge.lagBudgetMs }),
-    lastMoveAt: now,
+    lastMoveAt: Math.max(now, nextTurnAt),
     ply: state.ply + 1,
   };
 }

@@ -19,10 +19,17 @@ const reportSchema = z
      * in its chat
      */
     studyRoomId: id.optional(),
+    /**
+     * Or the game whose spectator chat it happened in (migration 045): the
+     * reporter isn't playing in it, and the reported player has written in
+     * its spectator chat
+     */
+    spectatorGameId: id.optional(),
   })
-  .refine((body) => body.gameId === undefined || body.studyRoomId === undefined, {
-    message: "A report is about a game or a study room, not both",
-  });
+  .refine(
+    (body) => [body.gameId, body.studyRoomId, body.spectatorGameId].filter((v) => v !== undefined).length <= 1,
+    { message: "A report is about one game, study room or spectator chat" }
+  );
 
 /** Blocking and reporting can't be used to probe or flood: a few a minute is plenty */
 const limited = { rateLimit: { max: 30, timeWindow: "1 minute" } };

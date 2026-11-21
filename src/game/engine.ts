@@ -193,8 +193,8 @@ export function truncatePgn(pgn: string, ply: number, undone: string[]): string 
  * no headers set: the seven-tag roster, a blank line, the moves, then the
  * result token, which stays "*" (chess.js never sets Result).
  */
-const PGN_HEADER = new Chess().pgn().replace(/\n \*$/, "");
-const PGN_TAIL = " *";
+export const PGN_HEADER = new Chess().pgn().replace(/\n \*$/, "");
+export const PGN_TAIL = " *";
 
 /**
  * The PGN after appending the move `san` at half-move `ply` (0-based), in

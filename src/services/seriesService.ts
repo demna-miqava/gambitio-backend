@@ -26,10 +26,19 @@ import {
 } from "../game/timedMatch.js";
 import { AppError } from "../errors/AppError.js";
 import { topics, type RealtimeHub } from "../realtime/hub.js";
-import { AlreadyInGameError, createGame, linkNextGame, toGameListItem } from "./gameService.js";
+import {
+  AlreadyInGameError,
+  announceGameStart,
+  createGame,
+  dequeuePlayers,
+  dropChallengesOf,
+  linkNextGame,
+  toGameListItem,
+} from "./gameService.js";
 import { GAME_LIST_COLUMNS, type GameListRow } from "../repositories/gameRepository.js";
 import { openingAllowsRating, openingSummary } from "../game/openings.js";
 import { blocksBetween } from "../repositories/blockRepository.js";
+import type { DroppedChallenge } from "./challengeService.js";
 
 /** A row of the series table. */
 export interface SeriesRow extends SeriesScore, TimedScore {
@@ -428,7 +437,13 @@ export const timedMatchError = (what = "The next game of a timed match starts by
 
 /** What starting the next game of a timed match did (see SeriesService.startNextGame). */
 type NextGameStep =
-  | { kind: "started"; game: LiveGame; messages: { topic: string; message: object }[] }
+  | {
+      kind: "started";
+      game: LiveGame;
+      messages: { topic: string; message: object }[];
+      /** The players' open challenges, deleted as the game started */
+      dropped: DroppedChallenge[];
+    }
   | { kind: "ended"; summary: SeriesSummary }
   | null;
 
@@ -472,11 +487,13 @@ export class SeriesService {
 
   /** Timed matches still on, whichever instance created them (at startup: a previous process's too). */
   async loadTimedMatches(): Promise<void> {
-    this.timedLoadedAt = Date.now();
     // From series_timed_active_idx: only the active timed matches are read
     const { rows } = await this.fastify.pg.query<{ endsAt: Date | null }>(
       `SELECT MAX("endsAt") AS "endsAt" FROM series WHERE status = 'active' AND "matchMinutes" IS NOT NULL`
     );
+    // Only once it worked: a failed read (the database waking up) is tried
+    // again by the sweep's next look, not TIMED_MATCH_REFRESH_MS later
+    this.timedLoadedAt = Date.now();
     if (rows[0]?.endsAt) this.noteTimedMatch(rows[0].endsAt);
   }
 
@@ -545,17 +562,15 @@ export class SeriesService {
       await this.ended(step.summary);
       return;
     }
-    const { game, messages } = step;
-    this.fastify.liveGames.watchDeadline(game.id, game.deadlineAt);
+    const { game, messages, dropped } = step;
     // As a rematch does: the finished game's page moves on to the new one
-    await Promise.all(messages.map(({ topic, message }) => this.hub.publish(topic, message))).catch((err) =>
-      this.fastify.log.error({ err, seriesId }, "Failed to publish the next timed match game")
-    );
+    await announceGameStart(this.fastify, { games: [game], messages, dropped });
   }
 
   private async startNextGame(tx: Queryable, seriesId: number): Promise<NextGameStep> {
-    // Locks in a rematch's order: the last game's row, queue rows, the
-    // series, the players (createGame)
+    // Locks in a rematch's order: the last game's row, then as every game
+    // starts (see dequeuePlayers): queue rows, the series, the players
+    // (createGame), challenges
     const { rows: last } = await tx.query<{ id: number; whiteId: number; blackId: number; status: string }>(
       `SELECT id, "whiteId", "blackId", status FROM games WHERE "seriesId" = $1 ORDER BY id DESC LIMIT 1 FOR UPDATE`,
       [seriesId]
@@ -569,7 +584,7 @@ export class SeriesService {
     // were locked after it, so ending the match locks the series again
     // (still after the last game's row, which stays locked)
     await tx.query(`SAVEPOINT next_game`);
-    await tx.query(`DELETE FROM matchmaking WHERE "userId" = ANY($1)`, [[previous.whiteId, previous.blackId]]);
+    await dequeuePlayers(tx, [previous.whiteId, previous.blackId]);
     const keepSearches = () => tx.query(`ROLLBACK TO SAVEPOINT next_game`);
     const series = await seriesRepository.lockSummary(tx, seriesId);
     if (!series || series.status !== "active" || !isTimedMatch(series)) {
@@ -607,24 +622,23 @@ export class SeriesService {
       openingId: series.openingId,
       series: { id: series.id, game: number },
     });
-    return { kind: "started", game, messages: await linkNextGame(tx, previous.id, game) };
+    // The two are playing now, so their open challenges go
+    const dropped = await dropChallengesOf(tx, [game.whiteId, game.blackId]);
+    return { kind: "started", game, messages: await linkNextGame(tx, previous.id, game), dropped };
   }
 
   async getSeries(seriesId: number) {
     const summary = await seriesRepository.summary(this.fastify.pg, seriesId);
     if (!summary) throw seriesNotFound();
+    // All of them: a series' format bounds how many it has
     const { rows } = await this.fastify.pg.query<GameListRow & { seriesGame: number }>(
       `SELECT ${GAME_LIST_COLUMNS} FROM games WHERE "seriesId" = $1 ORDER BY id`,
-      [seriesId]
-    );
-    const { rows: live } = await this.fastify.pg.query<{ id: number }>(
-      `SELECT id FROM games WHERE "seriesId" = $1 AND status = 'in_progress' LIMIT 1`,
       [seriesId]
     );
     return {
       series: summary,
       games: rows.map(toGameListItem),
-      liveGameId: live[0]?.id ?? null,
+      liveGameId: rows.find((game) => game.status === "in_progress")?.id ?? null,
     };
   }
 
@@ -644,6 +658,16 @@ export class SeriesService {
    * played: that game is resigned first, like any other.
    */
   async resign(seriesId: number, userId: number): Promise<SeriesSummary> {
+    // A timed match's next game may start between resigning the game being
+    // played and the match: that one is resigned too
+    for (let attempt = 1; ; attempt++) {
+      const result = await this.resignOnce(seriesId, userId, attempt === 3);
+      if (result) return result;
+    }
+  }
+
+  /** One go at resign(): null when a timed match's next game started meanwhile (`last`: throw instead). */
+  private async resignOnce(seriesId: number, userId: number, last: boolean): Promise<SeriesSummary | null> {
     // A timed match never waits between games for long: resigning it
     // resigns the game being played first
     const current = await seriesRepository.find(this.fastify.pg, seriesId);
@@ -659,7 +683,10 @@ export class SeriesService {
         [seriesId]
       );
       if (rows[0]) {
-        await this.fastify.liveGames.resign(rows[0].id, userId);
+        await this.fastify.liveGames.resign(rows[0].id, userId).catch((error) => {
+          // Ended by itself in the meantime: the match is resigned all the same
+          if (!(error instanceof AppError && error.code === "GAME_OVER")) throw error;
+        });
         resignedGame = true;
       }
     }
@@ -676,12 +703,14 @@ export class SeriesService {
         throw new AppError("The series is already over", "SERIES_OVER", 409);
       }
       if (await seriesRepository.hasGameInProgress(tx, seriesId)) {
+        if (isTimedMatch(series) && !last) return null;
         throw new AppError("Finish the current game first", "SERIES_GAME_IN_PROGRESS", 409);
       }
       const winnerId = series.playerOneId === userId ? series.playerTwoId : series.playerOneId;
       const summary = (await seriesRepository.saveScore(tx, seriesId, series, { winnerId, endReason: "resignation" }))!;
       return { summary, endedHere: true };
     });
+    if (!result) return null;
     if (result.endedHere) await this.ended(result.summary);
     return result.summary;
   }
@@ -719,6 +748,12 @@ export class SeriesService {
         [seriesId, cutoff, series.createdAt]
       );
       if (!rows[0]?.idle) return null;
+      // A timed match idle this long is long past its time (its own sweep
+      // missed it): it ends as one whose time is up, on arena points
+      if (isTimedMatch(series)) {
+        const winnerId = timedMatchWinner(series);
+        return (await seriesRepository.saveScore(tx, seriesId, series, { winnerId, endReason: "time_up" }))!;
+      }
       const { winnerId } = expiredSeriesDecision(series);
       return (await seriesRepository.saveScore(tx, seriesId, series, { winnerId, endReason: "expired" }))!;
     });
@@ -776,28 +811,35 @@ export class SeriesService {
       `SELECT ${GAME_LIST_COLUMNS} FROM games WHERE ${pair} ORDER BY "createdAt" DESC, id DESC LIMIT 10`,
       [userId, opponentId]
     );
-    const { rows: seriesRows } = await this.fastify.pg.query<SummaryRow>(
-      `${SUMMARY_SELECT}
-       WHERE (s."playerOneId" = $1 AND s."playerTwoId" = $2) OR (s."playerOneId" = $2 AND s."playerTwoId" = $1)
-       ORDER BY s."createdAt" DESC`,
+    // The pair's series: counted in the database, and only the latest read
+    const pairSeries = `(s."playerOneId" = $1 AND s."playerTwoId" = $2) OR (s."playerOneId" = $2 AND s."playerTwoId" = $1)`;
+    const { rows: seriesTotals } = await this.fastify.pg.query<{
+      won: number;
+      lost: number;
+      drawn: number;
+      active: number;
+    }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE s.status = 'finished' AND s."winnerId" = $1)::int AS won,
+         COUNT(*) FILTER (WHERE s.status = 'finished' AND s."winnerId" = $2)::int AS lost,
+         COUNT(*) FILTER (WHERE s.status = 'finished' AND s."winnerId" IS NULL)::int AS drawn,
+         COUNT(*) FILTER (WHERE s.status <> 'finished')::int AS active
+       FROM series s WHERE ${pairSeries}`,
       [userId, opponentId]
     );
-    const allSeries = seriesRows.map(toSeriesSummary);
-    const finished = allSeries.filter((s) => s.status === "finished");
+    const { rows: seriesRows } = await this.fastify.pg.query<SummaryRow>(
+      `${SUMMARY_SELECT} WHERE ${pairSeries} ORDER BY s."createdAt" DESC LIMIT 5`,
+      [userId, opponentId]
+    );
     const t = totals[0]!;
     return {
       opponent,
       wins: Number(t.wins),
       draws: Number(t.draws),
       losses: Number(t.losses),
-      series: {
-        won: finished.filter((s) => s.winnerId === userId).length,
-        lost: finished.filter((s) => s.winnerId === opponentId).length,
-        drawn: finished.filter((s) => s.winnerId === null).length,
-        active: allSeries.length - finished.length,
-      },
+      series: seriesTotals[0]!,
       recentGames: recent.map(toGameListItem),
-      recentSeries: allSeries.slice(0, 5),
+      recentSeries: seriesRows.map(toSeriesSummary),
     };
   }
 }

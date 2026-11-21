@@ -191,6 +191,13 @@ describe("conversion drills", { skip }, () => {
     assert.deepEqual([again.streak, again.bestMoves], [2, 24]);
     assert.ok((new Date(again.dueAt).getTime() - Date.now()) / 86_400_000 > 2.9);
 
+    // Several at once (connections opened first, so they really overlap):
+    // each counts, and the streak counts all of them
+    await Promise.all([1, 2, 3, 4, 5, 6, 7, 8].map(() => app.pg.query(`SELECT pg_sleep(0.02)`)));
+    await Promise.all([1, 2, 3].map(() => attempt(true, 40)));
+    const after = (await request("GET", "/api/conversion-drills", alice.clerkId)).json().drills[0];
+    assert.deepEqual([after.attempts, after.successes, after.streak], [6, 5, 5]);
+
     assert.equal((await request("DELETE", `/api/conversion-drills/${drill.id}`, alice.clerkId)).statusCode, 204);
     assert.equal((await request("GET", "/api/conversion-drills", alice.clerkId)).json().drills.length, 0);
   });

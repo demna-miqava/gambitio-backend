@@ -133,8 +133,9 @@ export async function cachedField<T>(
     log.warn({ err, key }, "Cache read failed");
   }
   const seen = generation;
-  // Without a generation (Redis failed) the result can't be checked, so it isn't stored
-  if (seen === null) return compute();
+  // Without a generation (Redis failed) the result can't be checked, so it
+  // isn't stored; concurrent misses still share one computation
+  if (seen === null) return singleFlight(`${key}\u0000${field}\u0000uncached`, compute);
   return singleFlight(`${key}\u0000${field}\u0000${seen}`, async () => {
     const value = await compute();
     await redis

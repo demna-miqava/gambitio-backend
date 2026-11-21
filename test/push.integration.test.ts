@@ -74,11 +74,15 @@ describe("push endpoints", () => {
   test("VAPID keys come as a pair", () => {
     const base = { POSTGRES_CONNECTION_STRING: "postgres://x", CLERK_PUBLISHABLE_KEY: "pk", CLERK_SECRET_KEY: "sk" };
     assert.equal(vapidKeys(loadConfig({ ...base, VAPID_PUBLIC_KEY: "", VAPID_PRIVATE_KEY: "" })), null);
-    assert.deepEqual(vapidKeys(loadConfig({ ...base, VAPID_PUBLIC_KEY: "pub", VAPID_PRIVATE_KEY: "priv" })), {
-      subject: "http://localhost:5173",
-      publicKey: "pub",
-      privateKey: "priv",
-    });
+    // The subject defaults to the site, which must then be https: (push
+    // services refuse an http: one, so push is off rather than failing)
+    assert.equal(vapidKeys(loadConfig({ ...base, VAPID_PUBLIC_KEY: "pub", VAPID_PRIVATE_KEY: "priv" })), null);
+    assert.deepEqual(
+      vapidKeys(
+        loadConfig({ ...base, FRONTEND_URL: "https://gambitio.test/", VAPID_PUBLIC_KEY: "pub", VAPID_PRIVATE_KEY: "priv" })
+      ),
+      { subject: "https://gambitio.test", publicKey: "pub", privateKey: "priv" }
+    );
     assert.throws(() => loadConfig({ ...base, VAPID_PUBLIC_KEY: "pub" }), /set both or neither/);
     assert.throws(
       () => loadConfig({ ...base, VAPID_PUBLIC_KEY: "pub", VAPID_PRIVATE_KEY: "priv", VAPID_SUBJECT: "someone" }),
@@ -419,5 +423,18 @@ describe("push notifications", { skip: !integrationEnabled && "TEST_POSTGRES_URL
     const { rows } = await app.pg.query<{ endpoint: string }>(`SELECT endpoint FROM push_subscriptions ORDER BY id`);
     assert.equal(rows.length, 10);
     assert.equal(rows[0]!.endpoint, endpointFor("device-2"));
+
+    // Saved again (a sign-in on it): the most recent now, and its failures start over
+    await app.pg.query(`UPDATE push_subscriptions SET failures = 2 WHERE endpoint = $1`, [endpointFor("device-2")]);
+    // Through the service: the route's per-minute limit is used up by now
+    const again = (name: string) => app.push.subscribe(a.id, { endpoint: endpointFor(name), ...keys });
+    await again("device-2");
+    await again("device-12");
+    const { rows: kept } = await app.pg.query<{ endpoint: string; failures: number }>(
+      `SELECT endpoint, failures FROM push_subscriptions ORDER BY id`
+    );
+    assert.equal(kept.length, 10);
+    assert.equal(kept[0]!.endpoint, endpointFor("device-4"));
+    assert.deepEqual(kept.at(-2), { endpoint: endpointFor("device-2"), failures: 0 });
   });
 });

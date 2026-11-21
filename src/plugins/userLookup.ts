@@ -19,6 +19,12 @@ const MAX_ENTRIES = 10_000;
  */
 export class UserLookup {
   private entries = new Map<string, { user: AuthenticatedUser; at: number }>();
+  /**
+   * Counts forget() and clear() calls. A lookup that was reading while one
+   * ran may have read the row before it was deleted: it answers, but doesn't
+   * cache that, which would bring the deleted account back for TTL_MS.
+   */
+  private epoch = 0;
 
   constructor(private db: Queryable) {}
 
@@ -27,13 +33,14 @@ export class UserLookup {
     const hit = this.entries.get(clerkId);
     if (hit && now - hit.at < TTL_MS) return hit.user;
 
+    const epoch = this.epoch;
     const { rows } = await this.db.query<AuthenticatedUser>(
       `SELECT id, username, "avatarUrl" FROM users WHERE "clerkId" = $1`,
       [clerkId]
     );
     const user = rows[0] ?? null;
     this.entries.delete(clerkId);
-    if (user) {
+    if (user && epoch === this.epoch) {
       this.entries.set(clerkId, { user, at: now });
       if (this.entries.size > MAX_ENTRIES) {
         const oldest = this.entries.keys().next().value;
@@ -44,10 +51,12 @@ export class UserLookup {
   }
 
   forget(clerkId: string): void {
+    this.epoch++;
     this.entries.delete(clerkId);
   }
 
   clear(): void {
+    this.epoch++;
     this.entries.clear();
   }
 }

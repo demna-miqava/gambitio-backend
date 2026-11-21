@@ -8,7 +8,7 @@ import { spectatorsKey } from "../../services/liveGameService.js";
 import { CLIENT_RTT_HEADER, parseClientRtt, RttProbe } from "./rttProbe.js";
 
 export async function gameWebSocketRoute(fastify: FastifyInstance) {
-  const { hub, liveGames, gameChat } = fastify;
+  const { hub, liveGames, gameChat, spectatorChat } = fastify;
 
   fastify.get<{ Params: { id: string } }>(
     "/game/:id",
@@ -58,6 +58,14 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
       // player's, before the database is touched.
       onValidatedMessage(socket, gameClientMessageSchema, request.log, async (message, { receivedAt }) => {
         const userId = user.id;
+        // The one thing only someone who isn't playing can send (the
+        // insert checks again, against the game's row)
+        if (message.type === "spectator_chat") {
+          if (await isPlayerSocket) {
+            throw new AppError("Players can't use the spectator chat", "NOT_A_SPECTATOR", 403);
+          }
+          return spectatorChat.send(gameId, userId, message.text);
+        }
         if (message.type !== "sync" && !(await isPlayerSocket)) {
           throw new AppError("You are not a player in this game", "NOT_A_PLAYER", 403);
         }
@@ -150,7 +158,27 @@ export async function gameWebSocketRoute(fastify: FastifyInstance) {
               return null;
             })
           : null;
-        sendJson(socket, { ...state, data: { ...data, spectators, ...(chat && { chat }) } });
+        // Spectator chat is for everyone but the players, while the game is
+        // on and after: only a non-player's socket is subscribed to it, and
+        // only then is its history read (state() is null for a player
+        // anyway). Subscribed first, so a message sent while the history is
+        // read isn't missed (the client drops a repeat by id)
+        let spectatorChatState = null;
+        if (!isPlayer && hub.subscribe(socket, topics.spectatorChat(gameId))) {
+          spectatorChatState = await spectatorChat.state(gameId, user.id).catch((err) => {
+            request.log.error({ err }, "Failed to load spectator chat");
+            return null;
+          });
+        }
+        sendJson(socket, {
+          ...state,
+          data: {
+            ...data,
+            spectators,
+            ...(chat && { chat }),
+            ...(spectatorChatState && { spectatorChat: spectatorChatState }),
+          },
+        });
         return spectators;
       }
 

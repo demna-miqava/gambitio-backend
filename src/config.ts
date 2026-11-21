@@ -7,6 +7,16 @@ const optionalText = z
   .optional()
   .transform((value) => (value?.trim() ? value.trim() : undefined));
 
+/**
+ * An origin as a browser sends it (Origin header, a token's azp): scheme and
+ * host in lower case, no trailing slash or path, no default port. Origins
+ * are compared as text, so "https://Site.dev/" must become "https://site.dev".
+ */
+const origin = z
+  .string()
+  .url()
+  .transform((value) => new URL(value).origin);
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   PORT: z.coerce.number().int().positive().default(8080),
@@ -37,7 +47,7 @@ const envSchema = z.object({
     }
     return pem;
   }).optional(),
-  FRONTEND_URL: z.string().url().default("http://localhost:5173"),
+  FRONTEND_URL: origin.default("http://localhost:5173"),
   // Comma-separated origins also allowed besides FRONTEND_URL, e.g. the LAN
   // address used to open the dev server from a phone
   EXTRA_FRONTEND_ORIGINS: z
@@ -49,7 +59,7 @@ const envSchema = z.object({
         .map((origin) => origin.trim())
         .filter(Boolean)
     )
-    .pipe(z.array(z.string().url()))
+    .pipe(z.array(origin))
     .optional(),
   // "true" also allows any origin on a private network (192.168.x.x, 10.x.x.x,
   // 172.16-31.x.x, *.local): for opening the dev server from a phone when
@@ -107,11 +117,18 @@ export function clerkJwtKey(raw: string): string | null {
   return pem;
 }
 
-/** The VAPID keys push messages are signed with, or null when push isn't configured. */
+/**
+ * The VAPID keys push messages are signed with, or null when push isn't
+ * configured. Without VAPID_SUBJECT the subject is FRONTEND_URL, which push
+ * services only take as an https: address: with an http: one (local
+ * development) every send would fail, so push is off instead.
+ */
 export function vapidKeys(config: Config): { subject: string; publicKey: string; privateKey: string } | null {
   if (!config.VAPID_PUBLIC_KEY || !config.VAPID_PRIVATE_KEY) return null;
+  const subject = config.VAPID_SUBJECT ?? (config.FRONTEND_URL.startsWith("https://") ? config.FRONTEND_URL : null);
+  if (!subject) return null;
   return {
-    subject: config.VAPID_SUBJECT ?? config.FRONTEND_URL,
+    subject,
     publicKey: config.VAPID_PUBLIC_KEY,
     privateKey: config.VAPID_PRIVATE_KEY,
   };

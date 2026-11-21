@@ -126,7 +126,9 @@ export async function puzzleRoutes(fastify: FastifyInstance) {
     );
     if (rowCount === 0) {
       const exists = await fastify.pg.query("SELECT 1 FROM puzzles WHERE id = $1", [id]);
-      if (exists.rowCount === 0) return reply.status(404).send({ error: "Puzzle not found" });
+      if (exists.rowCount === 0) {
+        return reply.status(404).send({ error: "Puzzle not found", code: "PUZZLE_NOT_FOUND" });
+      }
     }
     return reply.status(204).send();
   });

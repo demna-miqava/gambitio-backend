@@ -268,6 +268,8 @@ describe("game chat", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_R
     const game = await newGame();
     const { w, b } = await joinGame(game.id);
     w.send(move("e2e4"));
+    // Not sent back to back: the two sockets' messages can arrive in either order
+    await b.next("move", (m) => m.move.lan === "e2e4");
     b.send(move("e7e5"));
     await w.next("move", (m) => m.move.lan === "e7e5");
     w.send({ type: "resign" });

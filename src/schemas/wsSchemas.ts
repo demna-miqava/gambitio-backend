@@ -45,6 +45,9 @@ export const gameClientMessageSchema = z.discriminatedUnion("type", [
   // A chat message to the other player. Only bounded here: the text is
   // cleaned and its real length checked in GameChatService
   z.object({ type: z.literal("chat"), text: z.string().min(1).max(CHAT_MAX_RAW_LENGTH) }),
+  // A message to the game's spectator chat (anyone but its players). Only
+  // bounded here: cleaned and checked in SpectatorChatService
+  z.object({ type: z.literal("spectator_chat"), text: z.string().min(1).max(CHAT_MAX_RAW_LENGTH) }),
 ]);
 export type GameClientMessage = z.infer<typeof gameClientMessageSchema>;
 

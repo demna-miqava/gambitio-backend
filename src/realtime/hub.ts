@@ -3,6 +3,7 @@ import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
 import type { createClient } from "redis";
 import { sendText } from "./socket.js";
+import { closeRedis } from "../plugins/redis.js";
 
 type RedisClient = ReturnType<typeof createClient>;
 
@@ -38,6 +39,13 @@ export const topics = {
   studyUser: (roomId: number, userId: number) => `study:${roomId}:user:${userId}`,
   /** Everyone with a tournament's lobby open */
   tournament: (tournamentId: number) => `tournament:${tournamentId}`,
+  /**
+   * A game's spectator chat (SpectatorChatService). Only sockets of people
+   * who aren't playing in the game are ever subscribed (hub.subscribe, once
+   * the game socket knows), and every message is published with both
+   * players in its exclude list (publishExcept)
+   */
+  spectatorChat: (gameId: number) => `game:${gameId}:spectator-chat`,
 };
 
 /**
@@ -64,6 +72,8 @@ interface Attached {
 /** What goes over the Redis channel */
 type Envelope =
   | { origin: string; topic: string; message: object }
+  /** For every socket on the topic except those of these users (publishExcept) */
+  | { origin: string; except: number[]; topic: string; message: object }
   | { origin: string; closeUser: number }
   | { origin: string; closeTopic: string; code: number; reason: string }
   /** "This instance is alive": sent on start and on every heartbeat */
@@ -105,6 +115,14 @@ export class RealtimeHub {
   private heartbeat: NodeJS.Timeout | null = null;
   private keyRefresh: NodeJS.Timeout | null = null;
   private socketSeq = 0;
+  /**
+   * Membership ids of this instance's attached sockets. A member of a Redis
+   * set tagged with this instance but not in here is a leftover (its
+   * socket's removal failed on a Redis blip, or an add whose reply was lost
+   * landed after all): liveMembers drops it instead of counting a closed
+   * socket for as long as the set lives.
+   */
+  private localMembers = new Set<string>();
   /** Set while shutting down: sockets close because of us, not the user */
   private stopping = false;
   /**
@@ -137,24 +155,48 @@ export class RealtimeHub {
     await this.renewLiveness();
     this.sub = this.redis.duplicate();
     this.sub.on("error", (err) => this.log.error({ err }, "Redis subscriber error"));
+    // While the subscriber was down this instance heard nothing, including a
+    // new instance's announcement: assume others are alive again until their
+    // heartbeats say otherwise, as on start
+    this.sub.on("ready", () => {
+      this.othersSeenAt = Date.now();
+    });
     await this.sub.connect();
     await this.sub.subscribe(CHANNEL, (raw) => this.onEnvelope(raw));
     // Subscribed first, then announced: the instances already running start
     // publishing to Redis again the moment this arrives, before this one
     // serves its first request
     await this.announce();
-    this.heartbeat = setInterval(() => void this.beat(), HEARTBEAT_MS);
-    this.keyRefresh = setInterval(() => void this.refreshKeys(), KEY_REFRESH_MS);
+    // Neither may reject unhandled: that would end the process
+    this.heartbeat = setInterval(
+      () => void this.beat().catch((err) => this.log.error({ err }, "Heartbeat failed")),
+      HEARTBEAT_MS
+    );
+    this.keyRefresh = setInterval(
+      () => void this.refreshKeys().catch((err) => this.log.error({ err }, "Refreshing set expiries failed")),
+      KEY_REFRESH_MS
+    );
+  }
+
+  /**
+   * The start of a shutdown: from now on a socket closing is this server
+   * going away, not the user leaving (no onDetach), and every attached socket
+   * is closed with 1001 ("going away"). Called before the HTTP server stops
+   * (app.ts, preClose), so it runs before @fastify/websocket closes the
+   * sockets itself without a code. Safe to call again.
+   */
+  closeForShutdown(): void {
+    this.stopping = true;
+    for (const socket of this.attached.keys()) socket.close(1001, "Server shutting down");
   }
 
   async stop(): Promise<void> {
-    this.stopping = true;
+    this.closeForShutdown();
     if (this.heartbeat) clearInterval(this.heartbeat);
     if (this.keyRefresh) clearInterval(this.keyRefresh);
-    for (const socket of this.attached.keys()) socket.close(1001, "Server shutting down");
     await Promise.all([...this.attached.keys()].map((s) => this.detach(s)));
     await this.redis.del(instanceKey(this.instanceId)).catch(() => {});
-    if (this.sub) await this.sub.quit();
+    if (this.sub) await closeRedis(this.sub);
   }
 
   /** Registers a socket on topics (and optionally presence); cleans up when it closes. */
@@ -184,6 +226,7 @@ export class RealtimeHub {
       onDetach: options.onDetach,
     };
     this.attached.set(socket, entry);
+    for (const { member } of entry.memberships) this.localMembers.add(member);
     this.socketsPerUser.set(entry.userId, this.userSocketCount(entry.userId) + 1);
     if (entry.presence) {
       this.bump(entry.presence, 1);
@@ -202,6 +245,21 @@ export class RealtimeHub {
   }
 
   /**
+   * Adds a topic to a socket already attached (one whose topics depend on
+   * something read after attaching, like whether it is a player's). Returns
+   * false if the socket has gone. Removed with the others when it closes.
+   */
+  subscribe(socket: WebSocket, topic: string): boolean {
+    const entry = this.attached.get(socket);
+    if (!entry) return false;
+    if (!entry.topics.includes(topic)) entry.topics = [...entry.topics, topic];
+    let set = this.local.get(topic);
+    if (!set) this.local.set(topic, (set = new Set()));
+    set.add(socket);
+    return true;
+  }
+
+  /**
    * Adds an attached socket to a Redis set shared by all instances (e.g. a
    * game's spectators). It is removed when the socket closes; a crashed
    * instance's entries stop counting once its liveness key expires.
@@ -212,6 +270,7 @@ export class RealtimeHub {
     if (!entry) return false;
     const membership = { key, member: this.memberId(entry.userId) };
     entry.memberships.push(membership);
+    this.localMembers.add(membership.member);
     await this.addMember(membership);
     // Closed while we were writing: detach may have run before the write
     if (!this.attached.has(socket)) {
@@ -239,19 +298,22 @@ export class RealtimeHub {
   }
 
   /**
-   * Members of a set whose instance is still alive. Members of dead
-   * instances are removed as they are found.
+   * Members of a set whose socket is still open: this instance's own
+   * attached sockets (see localMembers), and the members of other instances
+   * that are still alive. Members of dead instances, and this instance's
+   * leftovers, are removed as they are found.
    */
   private async liveMembers(key: string): Promise<string[]> {
     const members = await this.redis.zRange(key, 0, -1);
     const others = [...new Set(members.map(instanceOf))].filter((id) => id !== this.instanceId);
-    if (others.length === 0) return members;
-    const flags = await this.redis.mGet(others.map(instanceKey));
+    const flags = others.length > 0 ? await this.redis.mGet(others.map(instanceKey)) : [];
     const dead = new Set(others.filter((_, i) => flags[i] === null));
-    if (dead.size === 0) return members;
-    const stale = members.filter((m) => dead.has(instanceOf(m)));
+    const isLive = (m: string) =>
+      instanceOf(m) === this.instanceId ? this.localMembers.has(m) : !dead.has(instanceOf(m));
+    const stale = members.filter((m) => !isLive(m));
+    if (stale.length === 0) return members;
     await this.redis.zRem(key, stale).catch(() => {});
-    return members.filter((m) => !dead.has(instanceOf(m)));
+    return members.filter(isLive);
   }
 
   private async detach(socket: WebSocket): Promise<void> {
@@ -270,6 +332,7 @@ export class RealtimeHub {
       set?.delete(socket);
       if (set?.size === 0) this.local.delete(topic);
     }
+    for (const { member } of entry.memberships) this.localMembers.delete(member);
     for (const { key, member } of entry.memberships) {
       await this.redis.zRem(key, member).catch(() => {});
     }
@@ -319,6 +382,23 @@ export class RealtimeHub {
     return this.send(
       `${this.ownPrefix}"topic":${JSON.stringify(topic)},"message":${payload}}`
     );
+  }
+
+  /**
+   * publish(), except that sockets of the users in `except` don't get it, on
+   * any instance: the list travels with the message and each instance
+   * filters its own sockets. One publish however many sockets listen, for
+   * chats where some listeners mustn't see some messages (blocks).
+   */
+  publishExcept(topic: string, message: object, except: readonly number[]): Promise<void> {
+    const excluded = new Set(except);
+    const payload = JSON.stringify(message);
+    this.deliverLocal(topic, payload, excluded);
+    if (!this.othersAlive) return Promise.resolve();
+    // "except" before "topic", so receivers never take the fast path
+    // (MESSAGE_ENVELOPE) that would deliver it to everyone
+    const envelope: Envelope = { origin: this.instanceId, except: [...excluded], topic, message };
+    return this.send(JSON.stringify(envelope));
   }
 
   /** Closes every socket a user holds, on all instances (their account is gone). */
@@ -504,7 +584,7 @@ export class RealtimeHub {
       if (typeof topic === "string") this.deliverLocal(topic, raw.slice(message[0].length, -1));
       return;
     }
-    let parsed: Partial<Envelope> & { topic?: string; message?: object; closeUser?: number; closeTopic?: string; code?: number; reason?: string };
+    let parsed: Partial<Envelope> & { topic?: string; message?: object; except?: unknown; closeUser?: number; closeTopic?: string; code?: number; reason?: string };
     try {
       parsed = JSON.parse(raw);
     } catch {
@@ -516,16 +596,29 @@ export class RealtimeHub {
     if (typeof parsed.closeTopic === "string") {
       return this.closeTopicLocal(parsed.closeTopic, parsed.code ?? 4003, parsed.reason ?? "Access removed");
     }
+    if (parsed.except !== undefined) {
+      // A malformed list delivers to nobody rather than to everyone
+      if (!Array.isArray(parsed.except) || typeof parsed.topic !== "string" || !parsed.message) return;
+      const except = new Set(parsed.except.filter((id): id is number => typeof id === "number"));
+      if (except.size !== parsed.except.length) return;
+      return this.deliverLocal(parsed.topic, JSON.stringify(parsed.message), except);
+    }
     if (typeof parsed.topic === "string" && parsed.message) {
       this.deliverLocal(parsed.topic, JSON.stringify(parsed.message));
     }
   }
 
-  private deliverLocal(topic: string, payload: string): void {
+  private deliverLocal(topic: string, payload: string, except?: ReadonlySet<number>): void {
     const sockets = this.local.get(topic);
     if (!sockets) return;
     // Not socket.send: a socket too far behind is dropped (MAX_BUFFERED_BYTES)
-    for (const socket of sockets) sendText(socket, payload);
+    for (const socket of sockets) {
+      if (except) {
+        const userId = this.attached.get(socket)?.userId;
+        if (userId === undefined || except.has(userId)) continue;
+      }
+      sendText(socket, payload);
+    }
   }
 
   private closeTopicLocal(topic: string, code: number, reason: string): void {
@@ -558,6 +651,8 @@ export class RealtimeHub {
         socket.terminate();
         continue;
       }
+      // Closing already: its "close" event detaches it
+      if (socket.readyState !== socket.OPEN) continue;
       entry.alive = false;
       socket.ping();
     }

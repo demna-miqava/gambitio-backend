@@ -1,7 +1,7 @@
 import { Chess } from "chess.js";
 import type { PlayerColor } from "../models/common.js";
 import { AppError } from "../errors/AppError.js";
-import { detectOutcome, winFor, type Outcome } from "./engine.js";
+import { detectOutcome, PGN_HEADER, PGN_TAIL, winFor, type Outcome } from "./engine.js";
 
 /**
  * Longest PGN accepted for a bot game. The browser sends chess.js's pgn()
@@ -24,13 +24,6 @@ export interface ReplayedBotGame {
 
 const invalid = (message: string) => new AppError(message, "INVALID_BOT_GAME", 400);
 const notLegal = () => invalid("The PGN isn't a legal game");
-
-/**
- * chess.js's pgn() for a game from the initial position with no headers
- * set (the seven-tag roster), without its result token: what live games
- * store before their moves (see appendToPgn in engine.ts).
- */
-const PGN_HEADER = new Chess().pgn().replace(/\n \*$/, "");
 
 const RESULT_TOKENS = new Set(["1-0", "0-1", "1/2-1/2", "*"]);
 
@@ -167,7 +160,8 @@ export function playBrowserPgn(
       throw invalid("Moves were played after the game was over");
     }
   }
-  return { chess, pgn: `${PGN_HEADER}\n\n${movetext.join(" ")} *`, numMoves: sans.length };
+  // The format live games store (see appendToPgn in engine.ts)
+  return { chess, pgn: `${PGN_HEADER}\n\n${movetext.join(" ")}${PGN_TAIL}`, numMoves: sans.length };
 }
 
 /** readPgn, with its errors in `invalid`'s code */

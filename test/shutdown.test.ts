@@ -43,3 +43,26 @@ test("a second SIGTERM during shutdown is ignored, so the pause and close still 
   await flush();
   assert.deepEqual(steps, ["pause started", "paused", "closed", "exit 0"]);
 });
+
+test("a shutdown that stalls exits anyway once the time is up", async () => {
+  const steps: string[] = [];
+  const app = {
+    log: { info: () => {}, error: () => {} },
+    liveGames: { pauseForShutdown: async () => 1 },
+    // A socket that never answers the close, say
+    close: () => new Promise<void>(() => void steps.push("closing")),
+  };
+  const proc = Object.assign(new EventEmitter(), {
+    exit: (code: number) => void steps.push(`exit ${code}`),
+  });
+  installShutdownHandlers(app as unknown as FastifyInstance, proc, 30);
+
+  proc.emit("SIGTERM");
+  await flush();
+  assert.deepEqual(steps, ["closing"]);
+  // The watchdog is unref'd (it mustn't keep a closed server alive): hold the test open
+  const keepAlive = setTimeout(() => {}, 1_000);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  clearTimeout(keepAlive);
+  assert.deepEqual(steps, ["closing", "exit 1"]);
+});

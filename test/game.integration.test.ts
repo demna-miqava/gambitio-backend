@@ -764,6 +764,31 @@ describe("live games", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_
     const { rows } = await app.pg.query(`SELECT count(*)::int AS n FROM games`);
     assert.equal(rows[0].n, 2);
   });
+
+  test("a rematch withdraws the players' other challenges, and tells the other side", async () => {
+    const carol = await createUser(app, "carol");
+    const game = await newGame();
+    const { w, b } = await joinGame(game.id);
+    w.send({ type: "resign" });
+    await b.next("game_ended");
+
+    const nw = await open("/notifications", white.clerkId);
+    const nc = await open("/notifications", carol.clerkId);
+    await new Promise((r) => setTimeout(r, 100));
+    nw.send({ type: "challenge_sent", data: { challengedId: carol.id, color: "white", time: 300, increment: 0 } });
+    await nc.next("challenge_received");
+
+    w.send({ type: "rematch_request" });
+    await b.next("rematch_request");
+    b.send({ type: "rematch_response", data: { accepted: true } });
+    await Promise.all([w.next("match_found"), b.next("match_found")]);
+    assert.equal((await nc.next("challenge_cancelled")).data.challengerId, white.id);
+    // White is the one who went into a game: not told their challenge "expired"
+    const withdrawn = (await nw.next("challenge_declined")).data;
+    assert.equal(withdrawn.challengedId, carol.id);
+    assert.equal(withdrawn.reason, "playing");
+    assert.equal((await app.pg.query(`SELECT 1 FROM challenges`)).rowCount, 0);
+  });
 });
 
 describe("matchmaking and challenges", { skip: !integrationEnabled && "TEST_POSTGRES_URL / TEST_REDIS_URL not set" }, () => {

@@ -10,7 +10,7 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 /** Just what createJobs touches, with a counter for every database pass. */
 function fakeApp() {
-  const calls = { clockSweep: 0, challenges: 0, series: 0, chat: 0, matchmaking: 0, tournaments: 0, timed: 0 };
+  const calls = { clockSweep: 0, challenges: 0, series: 0, chat: 0, matchmaking: 0, tournaments: 0, timed: 0, duels: 0 };
   const state = {
     needsClockSweep: false,
     liveDeadlinesPending: false,
@@ -19,6 +19,7 @@ function fakeApp() {
     searching: 0,
     tournamentDue: false,
     timedMatchOn: false,
+    duelsOn: false,
   };
   const app = {
     log: { error: () => {} },
@@ -39,7 +40,8 @@ function fakeApp() {
         state.liveDeadlinesPending = false;
       },
       startDeadlineTimers: async () => {},
-      resolveDeadline: async () => {},
+      resolveDeadline: async (_id: number) => {},
+      forgetEndedGames: async () => {},
       stop: () => {},
     },
     hub: {
@@ -63,6 +65,14 @@ function fakeApp() {
       stop: () => {},
     },
     gameChat: { sweep: async () => void calls.chat++ },
+    puzzleDuels: {
+      startTimers: () => {},
+      stop: () => {},
+      get needsSweep() {
+        return state.duelsOn;
+      },
+      sweep: async () => void calls.duels++,
+    },
     tournaments: {
       loadOpen: async () => {},
       get needsTick() {
@@ -92,6 +102,7 @@ test("one idle tab doesn't make the sweeps query the database", async (t) => {
     assert.equal(calls.matchmaking, 0);
     assert.equal(calls.tournaments, 0, "no tournament tick");
     assert.equal(calls.timed, 0, "no timed match sweep");
+    assert.equal(calls.duels, 0, "no puzzle duel sweep");
     // 37 minutes in: once, at the half hour
     assert.equal(calls.series, 1, "the series sweep runs only every half hour");
 
@@ -105,6 +116,21 @@ test("one idle tab doesn't make the sweeps query the database", async (t) => {
     t.mock.timers.tick(10_000);
     await flush();
     assert.equal(calls.clockSweep, settled.clockSweep + 2);
+
+    // A puzzle duel or invite on this instance: its sweep runs, and stops
+    // with it (with another instance alive it runs too, as above: that
+    // instance's duels need ending if it goes away)
+    state.othersAlive = false;
+    const duelsBefore = calls.duels;
+    state.duelsOn = true;
+    t.mock.timers.tick(10_000);
+    await flush();
+    assert.equal(calls.duels, duelsBefore + 1);
+    state.duelsOn = false;
+    t.mock.timers.tick(60_000);
+    await flush();
+    assert.equal(calls.duels, duelsBefore + 1);
+    state.othersAlive = true;
 
     // A tournament running or about to start: its tick runs, and stops with it
     state.tournamentDue = true;
@@ -149,4 +175,49 @@ test("the clock sweep retries a failed startup read of the live games", async ()
   state.liveDeadlinesPending = true;
   await jobs.runClockSweep();
   assert.equal(state.liveDeadlinesPending, false, "armLiveDeadlines ran");
+});
+
+test("one game that fails to resolve doesn't hold up the rest of the clock sweep", async () => {
+  const { app } = fakeApp();
+  const resolved: number[] = [];
+  const fake = app as unknown as {
+    pg: { query: () => Promise<{ rows: { id: number }[] }> };
+    liveGames: { resolveDeadline: (id: number) => Promise<void> };
+  };
+  fake.pg.query = async () => ({ rows: [{ id: 1 }, { id: 2 }, { id: 3 }] });
+  fake.liveGames.resolveDeadline = async (id) => {
+    if (id === 1) throw new Error("lock timeout");
+    resolved.push(id);
+  };
+  await createJobs(app).runClockSweep();
+  assert.deepEqual(resolved, [2, 3]);
+});
+
+test("stop waits for a pass under way, and a second start starts nothing more", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const { app, state } = fakeApp();
+  let starts = 0;
+  let finish!: () => void;
+  const fake = app as unknown as {
+    liveGames: { startDeadlineTimers: () => Promise<void>; forgetEndedGames: () => Promise<void> };
+  };
+  fake.liveGames.startDeadlineTimers = async () => void starts++;
+  fake.liveGames.forgetEndedGames = () => new Promise<void>((resolve) => (finish = resolve));
+  const jobs = createJobs(app);
+  jobs.start();
+  jobs.start();
+  assert.equal(starts, 1);
+  try {
+    state.needsClockSweep = true;
+    t.mock.timers.tick(10_000);
+    let stopped = false;
+    const stopping = jobs.stop().then(() => (stopped = true));
+    await flush();
+    assert.equal(stopped, false, "the sweep is still running");
+    finish();
+    await stopping;
+    assert.equal(stopped, true);
+  } finally {
+    mock.timers.reset();
+  }
 });

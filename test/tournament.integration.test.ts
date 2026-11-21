@@ -7,6 +7,7 @@ import { createGame } from "../src/services/gameService.js";
 import {
   START_GRACE_MS,
   TOURNAMENTS_PER_DAY,
+  TournamentService,
   tournamentPresenceKey,
   tournamentTimings,
   type CreateTournamentInput,
@@ -401,6 +402,55 @@ describe("arena tournaments", { skip: !integrationEnabled && "TEST_POSTGRES_URL 
     await app.pg.query(`INSERT INTO matchmaking ("userId", rating, time, increment) VALUES ($1, 1500, 180, 0)`, [a.id]);
     assert.equal((await app.tournaments.pair(id)).length, 1);
     assert.equal((await app.pg.query(`SELECT 1 FROM matchmaking`)).rows.length, 0);
+  });
+
+  test("a player whose opponent can't be paired after all keeps their matchmaking search", async () => {
+    const { id } = await running([a, b]);
+    await app.pg.query(`INSERT INTO matchmaking ("userId", rating, time, increment) VALUES ($1, 1500, 180, 0)`, [a.id]);
+    // b's game with d is being created (b's row locked, the game not yet
+    // visible) while the pass pairs a with b
+    let pass: Promise<number[]> | undefined;
+    await app.pg.transact(async (tx) => {
+      await createGame(tx, { whiteId: b.id, blackId: d.id, time: 180, increment: 0 });
+      pass = app.tournaments.pair(id);
+      await sleep(200);
+    });
+    assert.deepEqual(await pass, []);
+    assert.equal((await app.pg.query(`SELECT 1 FROM matchmaking WHERE "userId" = $1`, [a.id])).rowCount, 1);
+    assert.equal((await row(id, a)).waiting, true);
+  });
+
+  test("joining again while in keeps the player's place in the queue", async () => {
+    const { id } = await running([a, b]);
+    const since = async () =>
+      (
+        await app.pg.query(`SELECT "waitingSince" FROM tournament_players WHERE "tournamentId" = $1 AND "userId" = $2`, [
+          id,
+          a.id,
+        ])
+      ).rows[0].waitingSince.getTime();
+    const before = await since();
+    await app.tournaments.join(id, a.id, new Date(Date.now() + 60_000));
+    assert.equal(await since(), before);
+    // A paused player who comes back starts waiting then
+    await app.tournaments.pause(id, a.id);
+    const back = new Date(Date.now() + 60_000);
+    await app.tournaments.join(id, a.id, back);
+    assert.equal(await since(), back.getTime());
+  });
+
+  test("an instance that didn't create a tournament finds it within its refresh", async () => {
+    const { tournament } = await app.tournaments.create(a.id, input());
+    await app.tournaments.join(tournament.id, b.id);
+    // Another instance: it knows of nothing yet, and has a socket attached
+    const other = new TournamentService(app, app.hub);
+    await open("/notifications", c);
+    assert.equal(other.needsTick, false);
+    await other.refreshOpen();
+    assert.equal(other.needsTick, true);
+    await other.tick();
+    other.stop();
+    assert.equal((await request(a, "GET", `/tournaments/${tournament.id}`)).body.tournament.status, "running");
   });
 
   test("not showing up loses the game, unrated, and pauses the absent player", async () => {

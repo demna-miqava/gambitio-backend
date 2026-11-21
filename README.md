@@ -45,7 +45,8 @@ never sends its solutions and checks every move on the server
 (`POST /api/puzzles/:id/check`); Rush, Survival and Calculate first serve the
 other half with solutions, to play locally (Calculate first is all in the
 browser: the player enters the whole line, which is then judged against the
-solution). See `RATED_POOL_SQL` in
+solution). Puzzle duels use that second half too, but check every move on
+the server like rated mode. See `RATED_POOL_SQL` in
 `src/services/puzzleService.ts`.
 
 Migration 005 seeds a handful of verified puzzles. Load the full Lichess set
@@ -111,6 +112,17 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
   tournament row's lock (`FOR NO KEY UPDATE SKIP LOCKED`; see "Lock order"
   in `TOURNAMENTS.md` for why not `FOR UPDATE`) decides which instance
   does a tick's work. A player can create 10 tournaments a day
+- `src/repositories/gameHistory.ts`, `GET /api/users/:userId/games` – game
+  history filters (migration 044): result, colour (from the profile
+  owner's side), timeControl, rated, kind (online, tournament, bot, table),
+  opponent (a username, looked up through the unique index on
+  lower(username) and matched by id) and since/before. They combine, are
+  validated in `src/schemas/gameHistorySchemas.ts` and bound as parameters.
+  Every column a filter reads is in `games_{white,black}_history_idx`, so a
+  filtered page or count is an index-only scan of the player's own entries;
+  keep it that way when adding one. Without filters the endpoint answers
+  as before. Opening names aren't stored with games (the browser works them
+  out from the moves), so there is no opening filter
 - `src/services/matchmakingService.ts` – queue pairing with `FOR UPDATE SKIP LOCKED`
 - `src/game/positionCache.ts` – parsed positions of live games, so a move
   doesn't replay the game from its PGN
@@ -183,6 +195,11 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
   to their game
 - `src/routes/endgames.ts` – endgame lab progress (the exercises run in the
   browser)
+- `src/routes/coordinates.ts` – coordinates trainer scores (migration 043):
+  the best per run length (30 s, 1 or 2 min) and side of the board, and the
+  latest 20 runs. The drill runs in the browser, so a score is the player's
+  claim: a personal record only, never ranked, and refused above 3 correct
+  squares (6 clicks) a second
 - `src/game/chatText.ts`, `src/services/gameChatService.ts` – chat between
   the two players of a live game, over the game socket (`{ type: "chat" }`).
   Text is cleaned (invisible and control characters, length) and stored as
@@ -191,6 +208,38 @@ Auth is faked in tests (no Clerk calls) via `buildApp(config, { authProvider })`
   Each player's `gameChatAllowedFrom` setting must allow the other; changing
   it during a game sends both players a `chat_status`, so the opponent sees
   that chat went off. Messages are deleted an hour after their game ends
+- `src/game/puzzleDuel.ts`, `src/services/puzzleDuelService.ts`,
+  `src/routes/puzzleDuels.ts` – puzzle duels (migration 046): two friends
+  race through the same puzzles, in the same order (easiest first), for
+  three minutes, by Puzzle Rush's rules (a wrong move is a strike and moves
+  on, three strikes and you're out; higher score wins, equal is a draw).
+  The server owns the clock and the score and checks every move
+  (`POST /api/puzzle-duels/:id/moves`); a puzzle's id and solution reach a
+  player only once they're done with it. Puzzles come from the unrated
+  half, so nothing rated mode would serve is shown or used up, and nothing
+  touches puzzle ratings, `puzzle_attempts` or `solved_puzzles`. Invites:
+  friends only, no block either way, 3 waiting and 20 an hour per sender,
+  lapse after 3 minutes; they arrive on the notifications socket and as a
+  push. Updates (scores, the end) go to both players' notifications topics
+  through the hub. The clock's end is a timer on the instance that started
+  the duel (`DeadlineTimers`), with a sweep in `src/jobs.ts` as the
+  backstop; a player who comes back gets the state with the server's time
+- `src/services/spectatorChatService.ts` – spectator chat (migration 045):
+  one chat for everyone watching a live game, over the game socket
+  (`{ type: "spectator_chat" }`). The two players never receive it, during
+  the game or after: only a non-player's socket is subscribed to its topic
+  (`hub.subscribe`, once the socket's state says who it is), every message
+  is published with both players in its exclude list, no history is sent
+  to them, and they can't write in it (integration tests over real sockets
+  in `test/spectatorChat.integration.test.ts`). Blocks: a message never
+  reaches anyone with a block either way with its author, live or in
+  history. Fan-out is one publish per message however many watch: the
+  exclude list travels in the Redis envelope (`hub.publishExcept`) and each
+  instance filters its own sockets. Text is cleaned like game chat, 5
+  messages per 10 s and 200 per viewer per game; writing closes 10 minutes
+  after the game and messages go an hour after it (the game chat sweep). A
+  spectator can report an author from it (`spectatorGameId` on
+  `POST /api/reports`), which keeps the spectator chat on the report
 - `src/services/challengeService.ts` – challenges. Who may challenge a player
   is their `challengesAllowedFrom` setting (anyone, friends, no one);
   challenges are limited per pair and have a cooldown after a decline, and

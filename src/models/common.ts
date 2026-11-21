@@ -8,6 +8,16 @@ export type PlayerColor = "white" | "black";
 /**
  * Helper to determine time control type from time in seconds
  */
+/**
+ * The base times (seconds) of each time control, [from, below); null is no
+ * upper bound. getTimeControl's rule as ranges, for filtering in SQL.
+ */
+export const TIME_CONTROL_SECONDS: Record<TimeControl, [number, number | null]> = {
+  bullet: [0, 180],
+  blitz: [180, 600],
+  rapid: [600, null],
+};
+
 export function getTimeControl(timeInSeconds: number): TimeControl {
   if (timeInSeconds < 180) return "bullet"; // < 3 minutes
   if (timeInSeconds < 600) return "blitz"; // < 10 minutes

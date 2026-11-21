@@ -248,6 +248,41 @@ describe("table mode: games at a real board", { skip }, () => {
     assert.equal((await save(rec, { kind: "guest", name: "G" }, { clientId: "has space in it" })).statusCode, 400);
   });
 
+  test("a save naming a friend doesn't deadlock with a game between the two starting", async () => {
+    await befriend(ann, ben);
+    const waitingForLock = async () => {
+      for (let i = 0; i < 300; i++) {
+        const { rows } = await app.pg.query(
+          `SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`
+        );
+        if (rows.length > 0) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error("The save never waited for the lock");
+    };
+    for (const clientId of [undefined, "deadlock-check-1"]) {
+      // Game creation's locks (gameService): both players' rows, lowest id
+      // first; Ann's id is the lower. Ben saves a game naming her in between
+      let next!: () => void;
+      const gate = new Promise<void>((resolve) => (next = resolve));
+      let annLocked!: () => void;
+      const locked = new Promise<void>((resolve) => (annLocked = resolve));
+      const starting = app.pg.transact(async (tx) => {
+        await tx.query(`SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, [ann.id]);
+        annLocked();
+        await gate;
+        await tx.query(`SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, [ben.id]);
+      });
+      await locked;
+      const saving = save(ben, { kind: "friend", userId: ann.id }, { color: "black", ...(clientId && { clientId }) });
+      await waitingForLock();
+      next();
+      await starting;
+      const saved = await saving;
+      assert.equal(saved.statusCode, 201, saved.body);
+    }
+  });
+
   test("a friend's rating goes on the game only once they confirm", async () => {
     // Another recorder: the route's per-minute limit is counted per user id
     const rec = await createUser(app, "rhea");

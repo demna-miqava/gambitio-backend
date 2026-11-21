@@ -27,7 +27,7 @@ export async function studyWebSocketRoute(fastify: FastifyInstance) {
       });
 
       const roomId = Number(request.params.id);
-      if (!Number.isSafeInteger(roomId) || roomId <= 0) {
+      if (!Number.isInteger(roomId) || roomId <= 0 || roomId > 2_147_483_647) {
         sendError(socket, "Study room not found", "STUDY_NOT_FOUND");
         socket.close();
         return;

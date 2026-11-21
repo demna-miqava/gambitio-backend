@@ -37,7 +37,7 @@ export async function tournamentWebSocketRoute(fastify: FastifyInstance) {
 
       const tournamentId = Number(request.params.id);
       const tournament =
-        Number.isSafeInteger(tournamentId) && tournamentId > 0
+        Number.isInteger(tournamentId) && tournamentId > 0 && tournamentId <= 2_147_483_647
           ? await tournamentRepository.find(fastify.pg, tournamentId).catch(() => null)
           : null;
       if (!tournament) {
