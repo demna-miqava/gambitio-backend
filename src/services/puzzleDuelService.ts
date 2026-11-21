@@ -215,6 +215,31 @@ export class PuzzleDuelService {
     return rows[0]?.id ?? null;
   }
 
+  /**
+   * The duel that keeps a player from starting another. One whose clock
+   * has run out doesn't: its timer (on the instance that started it) or the
+   * sweep may not have ended it yet, so it is ended here, and the players
+   * get their result, instead of the next invite being refused until then.
+   * `db`: the caller's transaction, to read what it has locked against;
+   * ending the duel is its own transaction (it takes the duel's row only).
+   */
+  private async duelInProgress(userId: number, db: Queryable = this.fastify.pg): Promise<number | null> {
+    // Twice at most: a player has one active duel, so the second read is
+    // normally empty
+    for (let attempt = 0; ; attempt++) {
+      const { rows } = await db.query<{ id: number; late: boolean }>(
+        `SELECT d.id, now() >= d."endsAt" AS late
+         FROM puzzle_duel_players p JOIN puzzle_duels d ON d.id = p."duelId"
+         WHERE p."userId" = $1 AND d.status = 'active' ORDER BY d.id DESC LIMIT 1`,
+        [userId]
+      );
+      const duel = rows[0];
+      if (!duel) return null;
+      if (!duel.late || attempt >= 2) return duel.id;
+      await this.finishIfOver(duel.id);
+    }
+  }
+
   async invite(senderId: number, recipientId: number, rematchOf?: number): Promise<DuelInvite> {
     if (senderId === recipientId) throw new AppError("You can't duel yourself", "SELF_DUEL", 400);
     await this.assertMayDuel(this.fastify.pg, senderId, recipientId);
@@ -227,7 +252,7 @@ export class PuzzleDuelService {
       );
       if (rows.length === 0) throw notFound();
     }
-    if ((await this.activeDuelId(senderId)) !== null) {
+    if ((await this.duelInProgress(senderId)) !== null) {
       throw new AppError("Finish your duel first", "IN_DUEL", 409);
     }
     // Nobody is invited away from a game being played (the invite would pop
@@ -356,7 +381,7 @@ export class PuzzleDuelService {
       }
       await this.assertMayDuel(tx, recipientId, senderId);
       for (const id of [senderId, recipientId]) {
-        if ((await this.activeDuelId(id, tx)) !== null) {
+        if ((await this.duelInProgress(id, tx)) !== null) {
           throw new AppError(
             id === recipientId ? "Finish your duel first" : "They're in another duel",
             "IN_DUEL",

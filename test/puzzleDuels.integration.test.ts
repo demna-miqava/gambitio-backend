@@ -349,6 +349,35 @@ describe("puzzle duels", { skip }, () => {
     }
   });
 
+  test("a duel whose clock has run out doesn't hold up the next one, before any timer or sweep ends it", async () => {
+    await befriend(alice.id, carol.id);
+    await befriend(bob.id, carol.id);
+    const aliceInbox = await notifications(alice);
+    const duelId = await startDuel();
+    // Carol's invite to Bob waits while he plays
+    const waiting = (await invite(carol, bob)).json().data;
+    assert.equal((await invite(alice, carol)).json().code, "IN_DUEL");
+    // The clock runs out; nothing has ended the duel yet
+    await app.pg.query(`UPDATE puzzle_duels SET "endsAt" = now() - interval '1 second' WHERE id = $1`, [duelId]);
+    assert.equal((await app.pg.query(`SELECT status FROM puzzle_duels WHERE id = $1`, [duelId])).rows[0].status, "active");
+
+    // Alice can invite at once: her duel is ended on the way, and she is told
+    const next = await invite(alice, carol);
+    assert.equal(next.statusCode, 201, next.body);
+    assert.equal((await aliceInbox.next("duel_ended")).data.duelId, duelId);
+    const ended = (await app.pg.query(`SELECT status, "endReason" FROM puzzle_duels WHERE id = $1`, [duelId])).rows[0];
+    assert.deepEqual(ended, { status: "finished", endReason: "time" });
+
+    // And so can an accept, for a duel that is still waiting to be ended
+    const second = await startDuel();
+    await app.pg.query(`UPDATE puzzle_duels SET "endsAt" = now() - interval '1 second' WHERE id = $1`, [second]);
+    const accepted = await request("POST", `/api/puzzle-duels/invites/${waiting.id}/accept`, bob);
+    assert.equal(accepted.statusCode, 200, accepted.body);
+    assert.equal((await app.pg.query(`SELECT status FROM puzzle_duels WHERE id = $1`, [second])).rows[0].status, "finished");
+    // A duel still on its clock does hold it up
+    assert.equal((await invite(bob, alice)).json().code, "IN_DUEL");
+  });
+
   test("a rematch is an invite the other side gets live", async () => {
     const bobInbox = await notifications(bob);
     const duelId = await startDuel();
